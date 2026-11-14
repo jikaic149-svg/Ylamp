@@ -2124,7 +2124,7 @@
 - 涉及文件：config/motor_config.h增加显式台架时长宏，Task/can_check.c/.h增加PREPARING/STREAMING阶段和MIT提交/失败、流反馈数/时长统计；tests/test_can_check.c补实际无动作假件场景。不改正常版控制所有者、双轴模型、原保护、总线映射、USB线格式或开机使能行为。
 - 快速验证：构建host/can_check_tests并执行通过；覆盖正常约100Hz/2s、活动中重复触发不重跑、结束冻结、不向其他电机发送、后续只读请求仍正常、初始失能无新确认不使能、流反馈丢失、MIT BUSY、最终失能回包丢失和初始高温。均为离线假件，不称实机已通信。
 - 部署计划：为本次新建arm-j3-neutral-check目录，不覆盖当前arm-usb-release的匹配ELF/BIN；实际部署前备份Flash并核对芯片与当前镜像。临时检查版开机空闲，不自动发测试，确认完成和失能后恢复既有USB正式版。当前未执行烧录或实物使能。
-- 后续授权与范围：用户明确追加“允许烧录测试”，并要求“全部电机测试通过后，上传本地git”。已完成本节实现、全五台实物通信与原镜像恢复，Git归档收尾中；不推送远程、不扩大为轨迹/五轴控制。其余四台采用请求2只读查询，只有J3执行请求6的短时使能流。
+- 后续授权与范围：用户明确追加“允许烧录测试”，并要求“全部电机测试通过后，上传本地git”。已完成本节实现、全五台实物通信、原镜像恢复及本地Git源码提交；不推送远程、不扩大为轨迹/五轴控制。其余四台采用请求2只读查询，只有J3执行请求6的短时使能流。
 - 完整离线验证：host Debug与host-usb-release Release各70/70通过。新建arm-j3-neutral-check为Debug、CAN_CHECK_ONLY=ON、CAN3_TELEMETRY/J5_TEST_ONLY=OFF，应用和全库链接通过；应用Flash196956B、DTCM34736B，BIN SHA256为13151C85CFE37DA246FDC95EBE234EE859AEFA8E5D44931D2F635435CD4C1E9C。首次配置因PowerShell拆分未引用的.cmake参数而失败，改为完整引用绝对toolchain路径后成功，未因此改动工具链或SDK。最终Python3.13执行usb_monitor与dm_monitor完整self-test均通过，后者包含USB实际RX/TX线程配合假CDC、五台诊断、GUI按钮/去重/清理以及原CAN/UART/38字段回归；均为离线测试。
 - 前检与工具问题：普通连接识别相同CPUID 0x411FC272、IDCODE 0x10016483及UID 00420030/31345106/38373332。备份即将涉及的前三个128KiB扇区共393216B；前266892B与原USB Release SHA256 EEA32778F596807CF3C9454C824975A49066FEFBD8AAD2BD7F251FBD0B01512B一致，其余全FF。前检错误使用verify_image时，目标配置work-area-backup=0，工具CRC占用0x20000000工作区破坏运行RAM：SystemCoreClock异常、任务不再递增，后续连接已在MemManage。此时四台USB初始反馈均state0、J3尚未发送任何命令；不将该现场当成应用源码故障。后续所有脚本配置work-area-backup=1，运行现场仅dump_image+主机哈希；烧录后按已授权执行SYSRESETREQ重建RAM。本次保留前检受影响DTCM，不冒称其为有效恢复快照。
 - 临时部署与启动：保留原arm-usb-release的ELF/BIN不重建，写入并verify检查ELF、完整196956B回读哈希一致；复位后480MHz，检查邮箱0、IDLE/序号2、RX0、故障记录152B全0，任务1839→2849、栈剩1791/2048 words。临时镜像没有开机查询或主动使能，USB只遥测。
@@ -2136,7 +2136,8 @@
 
 ## 2026-11-14（America/New_York）｜五台通信验收后建立本地Git归档
 
-- 需求与状态：用户要求全部电机测试通过后上传本地Git。上节五台通信已实测通过且原USB正式版已恢复；在原本没有Git仓库的code目录初始化main分支，源码及验收文档已暂存，提交收尾中。不初始化整个桌面Ylamp内的CAD/学习项目，不配置或推送远程。
+- 需求与状态：用户要求全部电机测试通过后上传本地Git。上节五台通信已实测通过且原USB正式版已恢复；在原本没有Git仓库的code目录初始化main分支并完成源码提交。不初始化整个桌面Ylamp内的CAD/学习项目，不配置或推送远程。
 - 归档范围：159份项目源码、测试、配置、README/process及现有历史源文件。Algorithm/ruckig基于既有99751e6ebc7c963bb80e99fbbe66f2c279d1db57，保留其当前四个头文件本地修改和LICENSE，以42份普通文件纳入父仓库；原嵌套.git未删改、不提交空gitlink或要求无法取得的子模块。不复制外部BSP_CUBE_ROOT，依赖路径仍按README配置。
 - 排除与检查：沿用/build/排除规则，补充__pycache__/、*.py[cod]及无关切片导出的/result.json；未删除文件。Flash备份、ELF/BIN、DTCM和JSONL仅留本机build中，不纳入提交。暂存差异检查通过，无160000类型gitlink，没有工作区未暂存源文件差异；敏感关键字检查仅命中Python标准库secrets会话随机数调用，未发现密钥文件。
-- 提交身份与验证：环境没有配置Git用户姓名/邮箱，提交将仅以单次命令的自动化身份Codex <codex@localhost>生成，不冒用用户身份或改全局/本地Git配置。实际提交结果随后补记；本节仅归档，不再访问或操控电机。
+- 提交身份与验证：环境没有配置Git用户姓名/邮箱，使用单次命令的自动化身份Codex <codex@localhost>提交，不冒用用户身份或改全局/本地Git配置。首个源码提交422f85b，消息Verify five-motor CAN communication and bounded legacy J3 feedback，159文件/34717行；提交后git status为空、remote为空，Git排除检查确认build原始采集/缓存/result.json未被跟踪。本条后续文档补记另作提交。本节仅归档，不再访问或操控电机。
+- 最终状态与剩余事项：本次代码、离线回归、ARM完整链接、全部五台通信、J3显式短时零力矩回包、最终失能、原普通USB镜像恢复及源码归档已完成。没有遗留本轮测试待办；普通版J3空闲被动、不自动周期使能的既有差异仍明确保留，不将通信验收扩称运动/长期可靠性验收。
