@@ -1,0 +1,5 @@
+/build/
+__pycache__/
+*.py[cod]
+# Unrelated slicer export, not firmware or a test result.
+/result.json

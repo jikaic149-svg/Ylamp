@@ -1,0 +1,617 @@
+"""Bounded single-joint J1/J2 diagnostic, not a production controller.
+
+Default: read-only inspection. --timeout-test verifies temporary motor timeout.
+--degrees 1 also runs the timeout check, then a slow negative 1-degree target.
+--direction 1 selects a positive target; -1 (default) selects negative.
+--motor 2 selects J2 and config/j2_test.json; default remains J1.
+Requires an inactive, disabled board and exclusive GS_USB ownership.
+--integrated selects the verified feedforward firmware (IDLE or locked FAULT).
+Never enables the other joint, zeroes encoders, saves Flash or clears unrelated faults.
+Probe selects only hash-verified C16CCCCF or integrated 89B112EC Debug layouts.
+Run --self-test before hardware use.
+"""
+# HISTORY ONLY: retired host MIT controller. Not a runnable entry point.
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+from pathlib import Path
+import socket
+import struct
+import subprocess
+import tempfile
+import time
+
+import dm_monitor as dm
+
+ROOT = Path(__file__).resolve().parents[1]
+OCD = "D:/OPENOCD/xpack-openocd-0.12.0-7"
+
+
+def packed_mit(position, velocity, kp, kd, torque, torque_limit=None):
+    values = ((position, -12.5, 12.5, 16), (velocity, -10, 10, 12),
+              (kp, 0, 500, 12), (kd, 0, 5, 12), (torque, -28, 28, 12))
+    codes = []
+    for value, lower, upper, bits in values:
+        if not math.isfinite(value) or not lower <= value <= upper:
+            raise ValueError("MIT value outside verified protocol range")
+        codes.append(int((value - lower) / (upper - lower) * ((1 << bits) - 1)))
+    p, v, k, d, t = codes
+    if torque_limit is not None:
+        if not math.isfinite(torque_limit) or not 0.01 <= torque_limit <= 3.0:
+            raise ValueError("Unsafe diagnostic torque limit")
+        lower = math.ceil((28 - torque_limit) / 56 * 4095)
+        upper = math.floor((28 + torque_limit) / 56 * 4095)
+        t = min(upper, max(lower, t))
+    result = bytes((p >> 8, p & 255, v >> 4, ((v & 15) << 4) | (k >> 8),
+                    k & 255, d >> 4, ((d & 15) << 4) | (t >> 8), t & 255))
+    if result[:7] == b"\xff" * 7:
+        raise ValueError("Reserved MIT command collision")
+    return result
+
+
+def effort(target, sample, config, feedforward=0.0):
+    # Position term is host-side, so the submitted torque can be explicitly bounded.
+    value = config["kp_nm_rad"] * (target - sample.position_rad) + feedforward
+    return max(-config["torque_command_limit_nm"],
+               min(config["torque_command_limit_nm"], value))
+
+
+def check(sample, origin, bounds, config):
+    if sample.state != 1 or max(sample.mos_c, sample.rotor_c) >= config["temperature_c"]:
+        raise RuntimeError(f"Unsafe motor state/temperature: {sample}")
+    if not bounds[0] <= sample.position_rad <= bounds[1]:
+        raise RuntimeError("Original absolute joint limit crossed")
+    if abs(sample.position_deg - math.degrees(origin)) >= config["max_displacement_deg"]:
+        raise RuntimeError("Authorized displacement limit reached")
+    if abs(math.degrees(sample.velocity_rad_s)) > config["measured_speed_deg_s"]:
+        raise RuntimeError("Measured speed limit exceeded")
+
+
+class Probe:
+    def __init__(self):
+        self.process = None
+        self.sock = None
+        self.output = None
+
+    def rpc(self, command):
+        self.sock.sendall(command.encode("ascii") + b"\x1a")
+        result = b""
+        while not result.endswith(b"\x1a"):
+            part = self.sock.recv(65536)
+            if not part:
+                raise RuntimeError("OpenOCD RPC disconnected")
+            result += part
+        text = result[:-1].decode("utf-8", "replace")
+        if "error" in text.lower():
+            raise RuntimeError(text)
+        return text
+
+    def read(self, address, width, count):
+        text = self.rpc(f"read_memory {address:#x} {width} {count}")
+        return [int(value, 0) for value in text.split()]
+
+    def start(self, motor=1, integrated=False, allow_fault=False):
+        resident = ROOT / ("build/arm/flash_readback_running_ff10_speed10_20261107.bin"
+                           if integrated else
+                           "build/arm/flash_readback_gains_20261107_160350Z.bin")
+        expected = ("89b112ecf4d5332727dd5d27da4c823e7cf0d3ef9e7923691301e33390bac64c"
+                    if integrated else
+                    "c16ccccfe3a4a361fc49ef13160189f374a8e515fcc8a401b58af574c76f413c")
+        if hashlib.sha256(resident.read_bytes()).hexdigest() != expected:
+            raise RuntimeError("Known resident image is missing or has changed")
+        # A long session must not block OpenOCD on an unread stdout pipe.
+        self.output = tempfile.TemporaryFile()
+        self.process = subprocess.Popen(
+            [f"{OCD}/bin/openocd.exe", "-s", f"{OCD}/openocd/scripts",
+             "-f", "interface/stlink.cfg", "-f", "target/stm32h7x.cfg",
+             "-c", "tcl_port 16666; gdb_port disabled; telnet_port disabled;"
+                   " stm32h7x.cpu0 configure -work-area-backup 1;"
+                   " adapter speed 4000; init"],
+            stdout=self.output, stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        deadline = time.perf_counter() + 4
+        while time.perf_counter() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError("OpenOCD startup failed")
+            try:
+                self.sock = socket.create_connection(("127.0.0.1", 16666), timeout=0.2)
+                self.sock.settimeout(30)
+                break
+            except OSError:
+                time.sleep(0.05)
+        if self.sock is None:
+            raise RuntimeError("No OpenOCD RPC")
+        self.rpc("halt")
+        if self.read(0x5C001000, 32, 1)[0] != 0x10016483:
+            raise RuntimeError("Unexpected MCU")
+        # verify_image can execute a checksum helper in DTCM 0x20000000.
+        # Read Flash to the host instead: live application RAM must not be used.
+        ram_before = self.read(0x20000000, 8, 224)
+        with tempfile.NamedTemporaryFile(prefix="probe_readback_", suffix=".bin",
+                                         dir=ROOT / "build/arm", delete=False) as temporary:
+            readback = Path(temporary.name)
+        try:
+            result = self.rpc(f"catch {{dump_image {{{readback.as_posix()}}}"
+                              f" 0x08000000 {resident.stat().st_size}}}")
+            if result.strip() != "0" or readback.read_bytes() != resident.read_bytes():
+                raise RuntimeError("Resident firmware differs; probe RAM layout is invalid")
+            if self.read(0x20000000, 8, 224) != ram_before:
+                raise RuntimeError("Flash inspection unexpectedly modified application RAM")
+        finally:
+            readback.unlink()
+        if integrated and self.read(0x20000010, 8, 1)[0] != 1:
+            raise RuntimeError("HAL tick-frequency RAM is invalid; do not enable motors")
+        if integrated and self.read(0x20000004, 32, 2) != [480000000, 240000000]:
+            raise RuntimeError("Clock globals are invalid; do not enable motors")
+        status_address = 0x200001E8 if integrated else 0x20000190
+        status = self.read(status_address, 8, 8)
+        accepted = [[0, 0, 1, 3]] if integrated else [[5, 8, 1, 3]]
+        if integrated and allow_fault and status[1] != 0:
+            accepted.append([5, status[1], 1, 3])
+        if status[:4] not in accepted:
+            raise RuntimeError(f"Unexpected board state for selected image: {status}")
+        if any(self.read(status_address + 20 + i * 24, 8, 1)[0] != 0
+               for i in range(2)):
+            raise RuntimeError("Board feedback is not disabled")
+        # Both layouts are verified against their respective ELF DWARF.
+        words = self.read(0x200000FC + (motor - 1) * (108 if integrated else 64), 32, 2)
+        bounds = struct.unpack("<ff", struct.pack("<II", *words))
+        if not (-5 < bounds[0] < bounds[1] <= 0):
+            raise RuntimeError(f"Unexpected J{motor} joint configuration")
+        print(f"BOARD_HALTED original_J{motor}_bounds_deg=", tuple(map(math.degrees, bounds)), flush=True)
+        return bounds
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                state = self.rpc("stm32h7x.cpu0 curstate").strip()
+                if state == "halted":
+                    self.rpc("resume")
+                elif state != "running":
+                    raise RuntimeError(f"Unexpected debugger exit state: {state}")
+                if self.rpc("stm32h7x.cpu0 curstate").strip() != "running":
+                    raise RuntimeError("Board running state was not confirmed")
+                print("BOARD_RUNNING_CONFIRMED", flush=True)
+                self.sock.sendall(b"shutdown\x1a")
+            finally:
+                self.sock.close()
+        if self.process is not None:
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                # Do not kill a debugger that may still own a halted target.
+                print("WARNING: OpenOCD still running; inspect target state", flush=True)
+            else:
+                self.output.seek(0)
+                output = self.output.read()
+                self.output.close()
+                print(output.decode("utf-8", "replace"), flush=True)
+
+
+class Bus:
+    def __init__(self, motor=1):
+        if motor not in (1, 2):
+            raise ValueError("Only J1/J2 are supported")
+        self.controlled_motor = motor
+        self.dev = None
+        self.claimed = self.started = False
+        self.core, self.util, self.backend = dm.usb_modules()
+        self.echo = 0
+        self.parameters = []
+        self.stale_rx_overflows = 0
+
+    def start(self, *, discard_stale_overflow=False):
+        adapters = dm.scan_adapters()
+        if len(adapters) != 1:
+            raise RuntimeError(f"Expected one GS_USB adapter: {adapters}")
+        adapter = adapters[0]
+        self.dev = self.core.find(idVendor=adapter["vendor"], idProduct=adapter["product"],
+                                  bus=adapter["bus"], address=adapter["address"],
+                                  backend=self.backend)
+        self.util.claim_interface(self.dev, 0)
+        self.claimed = True
+        caps = struct.unpack("<10I", bytes(self.dev.ctrl_transfer(0xC1, 4, 0, 0, 40, timeout=500)))
+        if caps[1] != 48_000_000 or not caps[0] & 8:
+            raise RuntimeError("Unverified GS_USB capabilities")
+        self.dev.ctrl_transfer(0x41, 2, 0, 0, struct.pack("<II", 0, 0), timeout=500)
+        self.dev.ctrl_transfer(0x41, 1, 0, 0, struct.pack("<5I", 1, 10, 4, 1, 3), timeout=500)
+        self.started = True
+        self.dev.ctrl_transfer(0x41, 2, 0, 0, struct.pack("<II", 1, 8), timeout=500)
+        self.drain(discard_stale_overflow=discard_stale_overflow)
+
+    def send(self, can_id, data):
+        packet = dm.FRAME.pack(self.echo, can_id, 8, 0, 0, 0, data)
+        if self.dev.write(2, packet, timeout=50) != len(packet):
+            raise RuntimeError("Incomplete USB transmission")
+        self.echo = (self.echo + 1) % 0xFFFFFFFF
+
+    def receive(self, timeout=5, *, discard_stale_overflow=False):
+        try:
+            packet = self.dev.read(0x81, 32, timeout=timeout)
+        except self.core.USBTimeoutError:
+            return None
+        echo, can_id, dlc, channel, data, flags = dm.unpack_frame(packet)
+        if flags == 1 and discard_stale_overflow and not can_id & 0x20000000:
+            # Only a caller with the MCU halted and both joints disabled may
+            # discard old USB RX-buffer overflow frames before a new test.
+            self.stale_rx_overflows += 1
+            return None
+        if flags or can_id & 0x20000000:
+            raise RuntimeError(f"CAN error/overflow id={can_id:#x} flags={flags:#x}"
+                               f" echo={echo:#x} data={data[:dlc].hex()}")
+        if echo == 0xFFFFFFFF and channel == 0:
+            return can_id, data[:dlc]
+        return None
+
+    def drain(self, *, discard_stale_overflow=False):
+        # Bounded: any continuing transmitter prevents safe exclusive operation.
+        deadline = time.perf_counter() + 0.1
+        while time.perf_counter() < deadline:
+            reply = self.receive(2, discard_stale_overflow=discard_stale_overflow)
+            if reply is not None:
+                print("DRAIN", reply[0], reply[1].hex(), flush=True)
+        if self.stale_rx_overflows:
+            print("PREFLIGHT_STALE_RX_OVERFLOWS", self.stale_rx_overflows, flush=True)
+
+    def transaction(self, motor, opcode, rid, raw=0):
+        request = struct.pack("<HBBI", motor, opcode, rid, raw)
+        self.send(0x7FF, request)
+        deadline = time.perf_counter() + 0.3
+        while time.perf_counter() < deadline:
+            reply = self.receive()
+            if reply and reply[0] == dm.MOTORS[motor] and len(reply[1]) == 8:
+                if reply[1][:4] == request[:4]:
+                    value = struct.unpack("<I", reply[1][4:])[0]
+                    self.parameters.append(reply[1])
+                    return value
+        raise RuntimeError(f"Parameter response timeout: {motor}/{opcode:#x}/{rid}")
+
+    def query(self, motor):
+        self.send(0x7FF, bytes((motor, 0, 0xCC, 0, 0, 0, 0, 0)))
+        started = time.perf_counter()
+        deadline = started + 0.05
+        latest = None
+        while time.perf_counter() < deadline:
+            reply = self.receive(2)
+            if reply and reply[0] == dm.MOTORS[motor] and len(reply[1]) == 8:
+                if reply[1] not in self.parameters:
+                    latest = dm.decode_sample(*reply, (12.5, 10, 28), 0, time.time())
+            # MIT/state commands also elicit replies. Drain the complete burst,
+            # not just its first (possibly pre-enable/pre-disable) sample.
+            if latest is not None and time.perf_counter() - started >= 0.006:
+                return latest
+        raise RuntimeError(f"Feedback timeout: J{motor}")
+
+    def state(self, motor, command):
+        if command not in (0xFC, 0xFD, 0xFB) or motor not in (1, 2) or (
+                motor != self.controlled_motor and command != 0xFD):
+            raise ValueError("Only selected joint enable/known-timeout clear allowed")
+        self.send(motor, b"\xff" * 7 + bytes((command,)))
+
+    def close(self):
+        if self.dev is not None:
+            try:
+                if self.started:
+                    self.dev.ctrl_transfer(0x41, 2, 0, 0, struct.pack("<II", 0, 0), timeout=500)
+            finally:
+                if self.claimed:
+                    self.util.release_interface(self.dev, 0)
+                self.util.dispose_resources(self.dev)
+
+
+def show(label, sample):
+    print(f"{label} J{sample.motor} state={sample.state} pos={sample.position_deg:.6f}"
+          f" vel={math.degrees(sample.velocity_rad_s):.3f} torque={sample.torque_nm:.6f}"
+          f" temp={sample.mos_c}/{sample.rotor_c} raw={sample.raw.hex()}", flush=True)
+
+
+def wait_disabled(bus, config):
+    deadline = time.perf_counter() + config["settle_timeout_s"]
+    stationary_since = None
+    while time.perf_counter() < deadline:
+        samples = [bus.query(motor) for motor in (1, 2)]
+        if any(sample.state != 0 for sample in samples):
+            raise RuntimeError("DISABLE NOT CONFIRMED; keeping temporary timeout")
+        if all(abs(math.degrees(sample.velocity_rad_s)) <= config["settle_speed_deg_s"]
+               for sample in samples):
+            now = time.perf_counter()
+            if stationary_since is None:
+                stationary_since = now
+            if now - stationary_since >= config["settle_s"]:
+                for sample in samples:
+                    show("SETTLED", sample)
+                return
+        else:
+            stationary_since = None
+        time.sleep(config["period_s"])
+    raise RuntimeError("Disabled but not stationary; keeping temporary timeout")
+
+
+def timeout_check(bus, sample, config, bounds):
+    motor = sample.motor
+    neutral = packed_mit(sample.position_rad, 0, 0, 0, 0)
+    bus.send(motor, neutral)
+    bus.state(motor, 0xFC)
+    last = time.perf_counter()
+    for _ in range(8):
+        bus.send(motor, neutral)
+        last = time.perf_counter()
+        fresh = bus.query(motor)
+        check(fresh, sample.position_rad, bounds, config)
+        if abs(fresh.position_deg - sample.position_deg) > 0.2:
+            raise RuntimeError("Non-neutral movement during timeout verification")
+        time.sleep(config["period_s"])
+    # No requests/control from either MCU or USB during this interval.
+    time.sleep(config["silence_s"])
+    fresh = bus.query(motor)
+    elapsed = time.perf_counter() - last
+    show(f"SILENCE {elapsed:.3f}s", fresh)
+    if fresh.state not in (0, 13) or abs(fresh.position_deg - sample.position_deg) > 0.2:
+        raise RuntimeError("Independent timeout disengagement NOT verified")
+    if fresh.state == 13:
+        # One explicit recovery from this diagnostic's own expected timeout only.
+        bus.state(motor, 0xFB)
+    bus.state(motor, 0xFD)
+    fresh = bus.query(motor)
+    if fresh.state != 0:
+        raise RuntimeError("Known timeout could not return to disabled")
+    print("TIMEOUT_DISENGAGEMENT_VERIFIED", flush=True)
+
+
+def motion(bus, initial, second_initial, bounds, degrees, config, direction=-1):
+    motor, other = initial.motor, second_initial.motor
+    if direction not in (-1, 1):
+        raise ValueError("Invalid test direction")
+    target_end = initial.position_rad + direction * math.radians(degrees)
+    if not bounds[0] < target_end < bounds[1]:
+        raise RuntimeError("Test target outside original absolute limit")
+    bus.send(motor, packed_mit(initial.position_rad, 0, 0, 0, 0))
+    bus.state(motor, 0xFC)
+    start = previous = time.perf_counter()
+    duration = degrees / config["speed_deg_s"]
+    sample = initial
+    positions, torques = [], []
+    while True:
+        now = time.perf_counter()
+        if now - previous > config["max_gap_s"]:
+            raise RuntimeError(f"Host control gap {now - previous:.3f}s")
+        elapsed = now - start
+        if elapsed >= duration + 1.0:
+            break
+        target = initial.position_rad + direction * math.radians(
+            min(degrees, elapsed * config["speed_deg_s"]))
+        if abs(math.degrees(target - sample.position_rad)) > config["tracking_error_deg"]:
+            raise RuntimeError("Original 5-degree tracking protection reached")
+        feedforward = direction * config.get("feedforward_nm", 0.0) * min(
+            1.0, elapsed / config.get("feedforward_ramp_s", 1.0))
+        torque = effort(target, sample, config, feedforward)
+        payload = packed_mit(sample.position_rad, 0, 0, config["kd_nm_s_rad"], torque,
+                             config["torque_command_limit_nm"])
+        bus.send(motor, payload)
+        previous = time.perf_counter()
+        sample = bus.query(motor)
+        try:
+            check(sample, initial.position_rad, bounds, config)
+        except RuntimeError:
+            show("TRIP", sample)
+            raise
+        second = bus.query(other)
+        if second.state != 0 or abs(second.position_deg - second_initial.position_deg) > config["j2_stationary_tolerance_deg"]:
+            raise RuntimeError(f"J{other} is no longer disabled/stationary")
+        positions.append(sample.position_deg)
+        torques.append(sample.torque_nm)
+        print(f"MOTION J{motor} t={elapsed:.3f} target={math.degrees(target):.6f}"
+              f" ff_nm={feedforward:.6f}"
+              f" command_nm={torque:.6f} pos={sample.position_deg:.6f}"
+              f" feedback_nm={sample.torque_nm:.6f} vel={math.degrees(sample.velocity_rad_s):.3f}"
+              f" state={sample.state} tx={payload.hex()}", flush=True)
+        if direction * (sample.position_deg - initial.position_deg) >= degrees:
+            print("REQUESTED_DISPLACEMENT_REACHED", flush=True)
+            break
+        time.sleep(max(0, config["period_s"] - (time.perf_counter() - previous)))
+    print("RESULT displacement_deg=", sample.position_deg - initial.position_deg,
+          "position_span_deg=", max(positions) - min(positions),
+          "feedback_torque_range_nm=", (min(torques), max(torques)), flush=True)
+
+
+def run(args, config):
+    motor, other = args.motor, 3 - args.motor
+    probe, bus = Probe(), Bus(motor)
+    original_timeout = None
+    changed = False
+    try:
+        bounds = probe.start(motor, integrated=args.integrated,
+                             allow_fault=args.integrated)
+        bus.start(discard_stale_overflow=True)
+        for item in (1, 2):
+            for rid, expected in ((10, 1), (21, 12.5), (22, 10), (23, 28)):
+                raw = bus.transaction(item, 0x33, rid)
+                value = raw if rid == 10 else struct.unpack("<f", struct.pack("<I", raw))[0]
+                if value != expected:
+                    raise RuntimeError(f"J{item} RID{rid}: {value}, expected {expected}")
+            sample = bus.query(item)
+            show("INITIAL", sample)
+            if sample.state != 0:
+                raise RuntimeError("Both motors must initially be disabled")
+            if abs(math.degrees(sample.velocity_rad_s)) > config["settle_speed_deg_s"]:
+                raise RuntimeError("Both motors must initially be stationary")
+        initial = bus.query(motor)
+        original_timeout = bus.transaction(motor, 0x33, 9)
+        print("ORIGINAL_TIMEOUT_RAW", original_timeout, flush=True)
+        if not args.timeout_test and args.degrees is None:
+            return
+        changed = True  # Include failed writes in cleanup/readback.
+        bus.transaction(motor, 0x55, 9, config["timeout_raw"])
+        if bus.transaction(motor, 0x33, 9) != config["timeout_raw"]:
+            raise RuntimeError("Timeout RAM write was not adopted")
+        timeout_check(bus, initial, config, bounds)
+        if args.degrees is not None:
+            motion(bus, bus.query(motor), bus.query(other), bounds, args.degrees, config,
+                   args.direction)
+    finally:
+        try:
+            if changed:
+                bus.state(motor, 0xFD)
+                final = bus.query(motor)
+                show("FINAL", final)
+                second = bus.query(other)
+                show("FINAL", second)
+                if final.state != 0 or second.state != 0:
+                    raise RuntimeError("DISABLE NOT CONFIRMED; keep timeout, cut 24V if necessary")
+                wait_disabled(bus, config)
+                bus.transaction(motor, 0x55, 9, original_timeout)
+                if bus.transaction(motor, 0x33, 9) != original_timeout:
+                    raise RuntimeError("Original timeout restore NOT confirmed")
+                print("ORIGINAL_TIMEOUT_RESTORED_RAM_ONLY", flush=True)
+                # Consume fresh state after parameter responses, before MCU resumes.
+                show("RESTORED", bus.query(motor))
+        finally:
+            try:
+                bus.close()
+            finally:
+                probe.close()
+
+
+def self_test(config):
+    assert packed_mit(0, 0, 0, 0, 0).hex() == "7fff7ff0000007ff"
+    for limit in (0.2, 0.5, 1.0, 1.2, 2.0, 3.0):
+        for torque in (-3, -2, -1.2, -1.0, -0.5, -0.2, 0, 0.2, 0.5, 1.0, 1.2, 2, 3):
+            payload = packed_mit(0, 0, 0, 0, torque, limit)
+            encoded = (((payload[6] & 15) << 8) | payload[7]) * 56 / 4095 - 28
+            assert abs(encoded) <= limit
+    for bad in (float("nan"), float("inf"), 13):
+        try:
+            packed_mit(bad, 0, 0, 0, 0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Unsafe MIT position accepted")
+    for bad in (float("nan"), float("inf"), 0, 3.01):
+        try:
+            packed_mit(0, 0, 0, 0, 0, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Unsafe diagnostic torque limit accepted")
+    sample = dm.decode_sample(0x11, bytes.fromhex("1175d27ff7ff201d"),
+                              (12.5, 10, 28), 0, 0)
+    assert abs(effort(-12, sample, config)) == config["torque_command_limit_nm"]
+    assert effort(sample.position_rad, sample, config, 0.1) == 0.1
+    assert effort(sample.position_rad, sample, config, -0.1) == -0.1
+    assert 0 < config["period_s"] < config["max_gap_s"] < config["silence_s"] < 0.5
+    assert 0 < config["max_displacement_deg"] <= 10
+    assert config["tracking_error_deg"] <= 5
+    assert 0 < config["torque_command_limit_nm"] <= 3.0
+    assert 0 < config["settle_s"] < config["settle_timeout_s"]
+    assert all(math.isfinite(value) and value > 0
+               for key, value in config.items() if key != "feedforward_nm")
+    assert 0 <= config.get("feedforward_nm", 0) <= config["torque_command_limit_nm"]
+    class FakeBus:
+        parameters = []
+        receive = lambda self, timeout: self.replies.pop(0) if self.replies else None
+        send = lambda self, *args: None
+        replies = [(0x11, bytes.fromhex("0175d27ff7ff201d")),
+                   (0x11, bytes.fromhex("1175d27ff7ff201d"))]
+    assert Bus.query(FakeBus(), 1).state == 1
+    # Exercise the actual trajectory path in both directions without USB.
+    from contextlib import redirect_stdout
+    from io import StringIO
+    class MotionBus:
+        def __init__(self):
+            self.outputs = []
+        state = send = lambda self, motor, *args: self.outputs.append(motor)
+        query = lambda self, motor: sample if motor == sample.motor else second
+    config_copy = dict(config, period_s=0.001, speed_deg_s=10_000)
+    config_copy["max_gap_s"] = 0.2
+    second = dm.decode_sample(0x12, bytes.fromhex("0275d27ff7ff201d"),
+                              (12.5, 10, 28), 0, 0)
+    # Keep this test short by intercepting sleep and supplying a finite clock.
+    from unittest.mock import patch
+    for motor in (1, 2):
+        sample = dm.decode_sample(dm.MOTORS[motor],
+            bytes((0x10 | motor,)) + bytes.fromhex("75d27ff7ff201d"), (12.5, 10, 28), 0, 0)
+        second = dm.decode_sample(dm.MOTORS[3 - motor],
+            bytes((3 - motor,)) + bytes.fromhex("75d27ff7ff201d"), (12.5, 10, 28), 0, 0)
+        for direction in (-1, 1):
+            fake_times = iter((0, 0.001, 0.002, 0.003, 2))
+            motion_bus = MotionBus()
+            with redirect_stdout(StringIO()) as output, \
+                    patch.object(time, "perf_counter", side_effect=lambda: next(fake_times)), \
+                    patch.object(time, "sleep"):
+                config_copy["max_gap_s"] = 10
+                motion(motion_bus, sample, second, (-12, 12), 0.01, config_copy, direction)
+            line = next(text for text in output.getvalue().splitlines() if text.startswith("MOTION"))
+            target = float(line.split("target=")[1].split()[0])
+            assert (target - sample.position_deg) * direction > 0
+            assert set(motion_bus.outputs) == {motor}
+            from dataclasses import replace
+            reached = replace(sample, position_rad=sample.position_rad +
+                              direction * math.radians(0.02))
+            motion_bus = MotionBus()
+            motion_bus.query = lambda selected: reached if selected == motor else second
+            with redirect_stdout(StringIO()) as output, \
+                    patch.object(time, "perf_counter", side_effect=(0, 0.001, 0.002)), \
+                    patch.object(time, "sleep"):
+                motion(motion_bus, sample, second, (-12, 12), 0.01, config_copy, direction)
+            assert "REQUESTED_DISPLACEMENT_REACHED" in output.getvalue()
+    class SelectionBus:
+        controlled_motor = 2
+        send = lambda self, *args: None
+    for command in (0xFC, 0xFB):
+        try:
+            Bus.state(SelectionBus(), 1, command)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Unselected J1 enable/clear was accepted")
+        Bus.state(SelectionBus(), 2, command)
+    class OverflowBus:
+        core = type("Core", (), {"USBTimeoutError": TimeoutError})
+        dev = type("Device", (), {"read": lambda self, *args, **kwargs:
+                   dm.FRAME.pack(0xFFFFFFFF, 0x11, 8, 0, 1, 0, b"\x01" * 8)})()
+        stale_rx_overflows = 0
+    overflow_bus = OverflowBus()
+    try:
+        Bus.receive(overflow_bus)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Live RX overflow must abort a test")
+    assert Bus.receive(overflow_bus, discard_stale_overflow=True) is None
+    assert overflow_bus.stale_rx_overflows == 1
+    class DisabledBus:
+        query = lambda self, motor: second
+    with redirect_stdout(StringIO()), \
+            patch.object(time, "perf_counter", side_effect=(0, 0, 0, 0.2, 0.2)), \
+            patch.object(time, "sleep"):
+        wait_disabled(DisabledBus(), config)
+    with patch.object(time, "perf_counter", side_effect=(0, 2)):
+        try:
+            wait_disabled(DisabledBus(), config)
+        except RuntimeError as error:
+            assert "not stationary" in str(error)
+        else:
+            raise AssertionError("Unconfirmed settling accepted")
+    print("SELF_TEST_OK")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--integrated", action="store_true")
+    parser.add_argument("--timeout-test", action="store_true")
+    parser.add_argument("--degrees", type=float)
+    parser.add_argument("--direction", type=int, choices=(-1, 1), default=-1)
+    parser.add_argument("--motor", type=int, choices=(1, 2), default=1)
+    args = parser.parse_args()
+    config = json.loads((ROOT / f"config/j{args.motor}_test.json").read_text(encoding="utf-8"))
+    self_test(config)
+    if args.degrees is not None and (
+            not math.isfinite(args.degrees) or
+            not 0 < args.degrees <= config["max_displacement_deg"]):
+        parser.error("Displacement must be finite and in (0, 10] degrees")
+    if not args.self_test:
+        run(args, config)

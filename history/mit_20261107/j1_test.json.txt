@@ -1,0 +1,21 @@
+{
+  "_history_only": "Retired MIT test profile, not accepted by current firmware",
+  "max_displacement_deg": 10.0,
+  "speed_deg_s": 0.5,
+  "kp_nm_rad": 20.0,
+  "kd_nm_s_rad": 5.0,
+  "feedforward_nm": 2.0,
+  "feedforward_ramp_s": 4.0,
+  "torque_command_limit_nm": 3.0,
+  "tracking_error_deg": 5.0,
+  "measured_speed_deg_s": 10.0,
+  "j2_stationary_tolerance_deg": 0.3,
+  "temperature_c": 50,
+  "settle_speed_deg_s": 1.0,
+  "settle_s": 0.15,
+  "settle_timeout_s": 1.0,
+  "period_s": 0.02,
+  "max_gap_s": 0.04,
+  "timeout_raw": 2000,
+  "silence_s": 0.25
+}

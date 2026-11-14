@@ -1,0 +1,28 @@
+/* Version 3: runtime SPEED protection removed. Old profiles/firmware are incompatible.
+ * scope(id, member, storage, unit, min, max, label, group); DEG on wire is degree.
+ * All fields must be staged; Task validates cross-field relationships atomically. */
+TUNE_JOINT(1, lower_rad, F32, DEG, -716, 716, "参考圈角度下限 °", "行程")
+TUNE_JOINT(2, upper_rad, F32, DEG, -716, 716, "参考圈角度上限 °", "行程")
+TUNE_JOINT(3, hold_kp, F32, RAW, 0.001, 500, "保持 Kp N·m/rad", "保持")
+TUNE_JOINT(4, hold_kd, F32, RAW, 0, 5, "保持 Kd N·m·s/rad", "保持")
+TUNE_JOINT(5, tracking_error_rad, F32, DEG, 0.01, 716, "停止/保持误差阈值 °", "保护")
+/* Joint field 6 is retired; do not reuse/renumber existing field IDs. */
+TUNE_JOINT(7, start_speed_rad_s, F32, DEG, 0.01, 570, "使能前静止阈值 °/s", "保护")
+TUNE_JOINT(8, temperature_c, U8, RAW, 1, 120, "软件过温阈值 °C", "保护")
+TUNE_JOINT(9, protection_flags, U8, RAW, 0, 6, "保护开关", "保护")
+TUNE_JOINT(10, drag_kd_low, F32, RAW, 0, 5, "低速 Kd N·m·s/rad", "拖动")
+TUNE_JOINT(11, drag_kd_high, F32, RAW, 0, 5, "高速 Kd N·m·s/rad", "拖动")
+TUNE_JOINT(12, drag_speed_low_rad_s, F32, DEG, 0, 570, "低速段上界 °/s", "拖动")
+TUNE_JOINT(13, drag_speed_high_rad_s, F32, DEG, 0.01, 570, "高速段下界 °/s", "拖动")
+TUNE_JOINT(14, drag_ff_limit_nm, F32, RAW, 0, 28, "前馈总限幅 N·m", "拖动")
+TUNE_JOINT(15, drag_kd_slew_per_s, F32, RAW, 0.001, 1000, "Kd 变化率 /s", "拖动")
+TUNE_GLOBAL(1, feedback_max_age_ms, U32, RAW, 10, 10000, "反馈过期 ms", "保护")
+TUNE_GLOBAL(2, enable_timeout_ms, U32, RAW, 10, 10000, "使能确认超时 ms", "保护")
+TUNE_GLOBAL(3, max_step_ms, U32, RAW, 5, 1000, "控制调度超时 ms", "保护")
+TUNE_GLOBAL(4, drag_j2_zero_rad, F32, DEG, -716, 716, "J2 朝上软件零点 °", "拖动")
+TUNE_GLOBAL(5, drag_reference_confirmed, U8, RAW, 0, 1, "沿用已确认朝上参考 0或1", "拖动")
+TUNE_GLOBAL(6, drag_gravity_scale, F32, RAW, 0, 1.2, "重力模型倍率", "拖动")
+TUNE_GLOBAL(7, drag_transition_ms, U32, RAW, 100, 10000, "支撑/保持过渡 ms", "拖动")
+TUNE_GLOBAL(8, drag_ff_slew_nm_s, F32, RAW, 0.001, 100, "重力前馈变化率 N·m/s", "拖动")
+TUNE_GLOBAL(9, drag_velocity_filter_ms, F32, RAW, 0, 1000, "速度滤波 ms", "拖动")
+TUNE_GLOBAL(10, drag_acceleration_filter_ms, F32, RAW, 1, 1000, "加速度滤波 ms", "拖动")

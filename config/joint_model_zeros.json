@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "units": "degree",
+  "formula": "model = raw - zero",
+  "created_at": "2026-11-08T03:47:57-05:00",
+  "j2_reference": "user_defined_pose",
+  "imu_up_axis": "unconfirmed",
+  "imu_vertical_verified": false,
+  "ram_only": true,
+  "auto_restore": false,
+  "firmware_sha256": "BAA06BBD51DFF5E9A381F1F60CA6B852B8D074A974BED63A2A94B13F49E7709F",
+  "recorded_mcu_tick_ms": 670184,
+  "joints": [
+    {
+      "joint": 1,
+      "can_id": 1,
+      "zero_deg": -104.99999950679661,
+      "raw_limits_deg": [-210.0, 0.0],
+      "source": "configured_midpoint"
+    },
+    {
+      "joint": 2,
+      "can_id": 2,
+      "zero_deg": -151.28280249271788,
+      "zero_rad": -2.640383005142212,
+      "zero_float32_bits": "0xC028FC09",
+      "raw_limits_deg": [-240.0, -50.0],
+      "source": "user_confirmed_manual_reference",
+      "screenshot_can_feedback_hex": "02 64 F6 7F F8 00 1E 1B"
+    }
+  ]
+}

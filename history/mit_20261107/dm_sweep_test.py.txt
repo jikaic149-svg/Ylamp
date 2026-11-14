@@ -1,0 +1,338 @@
+"""Observe the verified native two-joint Task; --run explicitly starts its KEY path.
+
+No host motion controller, encoder reset, motor Flash write or fault recovery.
+Only the existing neutral timeout verification and abnormal-stop disable transmit
+motor commands. The MCU owns the actual sweep. Requires exclusive GS_USB use.
+"""
+# HISTORY ONLY: retired sweep controller. Not a runnable entry point.
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import struct
+import time
+
+from dm_j1_test import Bus, Probe, ROOT, dm, packed_mit, show, timeout_check, wait_disabled
+
+STATUS = 0x200001E8
+KEY_PENDING = 0x200000E1
+
+
+def command_values(data):
+    p = (data[0] << 8) | data[1]
+    v = (data[2] << 4) | (data[3] >> 4)
+    kp = ((data[3] & 15) << 8) | data[4]
+    kd = (data[5] << 4) | (data[6] >> 4)
+    ff = ((data[6] & 15) << 8) | data[7]
+    return (math.degrees(p * 25 / 65535 - 12.5),
+            math.degrees(v * 20 / 4095 - 10),
+            kp * 500 / 4095, kd * 5 / 4095, ff * 56 / 4095 - 28)
+
+
+def inspect_sample(sample, command, config, was_enabled, startup=False):
+    lower, upper = config["bounds_deg"][sample.motor - 1]
+    if not lower <= sample.position_deg <= upper:
+        raise RuntimeError(f"J{sample.motor} actual angle outside original absolute bounds")
+    if sample.state > 1 or (was_enabled and sample.state != 1):
+        raise RuntimeError(f"J{sample.motor} disabled/fault state {sample.state}")
+    if max(sample.mos_c, sample.rotor_c) >= config["temperature_c"]:
+        raise RuntimeError(f"J{sample.motor} temperature protection")
+    limit = config["startup_speed_deg_s"] if startup else config["measured_speed_deg_s"]
+    if abs(math.degrees(sample.velocity_rad_s)) > limit:
+        raise RuntimeError(f"J{sample.motor} external measured-speed protection")
+    if command is not None and abs(command[0] - sample.position_deg) > config["tracking_error_deg"]:
+        raise RuntimeError(f"J{sample.motor} external tracking protection")
+
+
+def actual_motion(sample, origin, config):
+    displacement = abs(sample.position_deg - origin.position_deg)
+    return displacement >= config["motion_detect_deg"] or (
+        displacement >= math.degrees(50 / 65535) and  # Two position quanta, PMAX=12.5.
+        abs(math.degrees(sample.velocity_rad_s)) >= config["motion_detect_speed_deg_s"])
+
+
+def settle_running_receiver(bus, config):
+    """Keep USB draining while the MCU is still querying; no sleeps or halts."""
+    deadline = time.perf_counter() + config["settle_timeout_s"]
+    latest, arrivals, stationary_since = {}, {}, None
+    next_query = 0.0
+    while time.perf_counter() < deadline:
+        now = time.perf_counter()
+        if now >= next_query:
+            for motor in (1, 2):
+                bus.send(0x7FF, bytes((motor, 0, 0xCC, 0, 0, 0, 0, 0)))
+            next_query = now + config["period_s"]
+        reply = bus.receive(2)
+        if reply and reply[0] in dm.MOTORS.values() and len(reply[1]) == 8:
+            sample = dm.decode_sample(*reply, (12.5, 10, 28), 0, time.time())
+            latest[sample.motor] = sample
+            arrivals[sample.motor] = now
+        if len(latest) == 2 and all(s.state == 0 and
+                now - arrivals[s.motor] <= config["feedback_timeout_s"] and
+                abs(math.degrees(s.velocity_rad_s)) <= config["settle_speed_deg_s"]
+                for s in latest.values()):
+            if stationary_since is None:
+                stationary_since = now
+            if now - stationary_since >= config["settle_s"]:
+                for sample in latest.values():
+                    show("SETTLED_NATIVE_DISABLED", sample)
+                return
+        else:
+            stationary_since = None
+    raise RuntimeError("Native disabled/stationary not confirmed; retaining timeout")
+
+
+def decelerate_hold(bus, probe, config, initial, preview):
+    """Use the native KEY stop; drain USB between bounded status polls."""
+    probe.rpc(f"write_memory {KEY_PENDING:#x} 8 {{1}}")
+    deadline = time.perf_counter() + 3
+    next_status, stationary_since = 0.0, None
+    latest, arrivals, commands = {}, {}, {}
+    holding = False
+    while time.perf_counter() < deadline:
+        now = time.perf_counter()
+        reply = bus.receive(2)
+        if reply:
+            can_id, data = reply
+            if can_id in (1, 2) and len(data) == 8 and data[:7] != b"\xff" * 7:
+                commands[can_id] = command_values(data)
+            elif can_id in dm.MOTORS.values() and len(data) == 8 and data not in bus.parameters:
+                sample = dm.decode_sample(can_id, data, (12.5, 10, 28), 0, time.time())
+                inspect_sample(sample, commands.get(sample.motor), config, True)
+                if preview and abs(sample.position_deg - initial[sample.motor].position_deg) >= config["preview_max_deg"]:
+                    raise RuntimeError("Preview displacement protection during deceleration")
+                latest[sample.motor], arrivals[sample.motor] = sample, now
+        if now >= next_status:
+            status = probe.read(STATUS, 8, 2)
+            if status[0] == 5:
+                raise RuntimeError(f"Native fault while stopping: {status}")
+            holding = status == [4, 0]
+            next_status = now + 0.1
+        if holding and len(latest) == 2 and all(
+                now - arrivals[m] <= config["feedback_timeout_s"] and
+                abs(math.degrees(s.velocity_rad_s)) <= config["settle_speed_deg_s"]
+                for m, s in latest.items()):
+            if stationary_since is None:
+                stationary_since = now
+            if now - stationary_since >= config["settle_s"]:
+                for sample in latest.values():
+                    show("NATIVE_HOLDING_SETTLED", sample)
+                return
+        else:
+            stationary_since = None
+    raise RuntimeError("Native KEY deceleration/near-stationary HOLDING not confirmed")
+
+
+def monitor(bus, probe, config, initial, preview=False):
+    start = time.perf_counter()
+    arrivals = {m: start for m in (1, 2)}
+    latest, commands, enabled = dict(initial), {}, set()
+    extents = {m: [s.position_deg, s.position_deg] for m, s in initial.items()}
+    peaks = {m: 0.0 for m in (1, 2)}
+    moved_at = {m: None for m in (1, 2)}
+    released = set()
+    # From the initial pose, first visit the far endpoint, then the other, then return.
+    routes = {}
+    for motor, sample in initial.items():
+        lower, upper = config["bounds_deg"][motor - 1]
+        first = lower if sample.position_deg >= (lower + upper) / 2 else upper
+        routes[motor] = [first, upper if first == lower else lower, first]
+    next_log, last_loop = start, start
+    try:
+        while time.perf_counter() - start < config["maximum_duration_s"]:
+            now = time.perf_counter()
+            if now - last_loop > config["feedback_timeout_s"]:
+                raise RuntimeError("External monitor scheduling gap")
+            last_loop = now
+            reply = bus.receive(2)
+            if reply is not None:
+                can_id, data = reply
+                if can_id in (1, 2) and len(data) == 8 and data[:7] != b"\xff" * 7:
+                    previous = commands.get(can_id)
+                    commands[can_id] = command_values(data)
+                    if moved_at[can_id] is not None and can_id not in released and previous and (
+                            abs(previous[4]) - abs(commands[can_id][4]) > 0.05):
+                        released.add(can_id)
+                        show(f"STARTUP_FF_WITHDRAWN t={now-start:.3f} command={commands[can_id]}",
+                             latest[can_id])
+                elif can_id in dm.MOTORS.values() and len(data) == 8 and data not in bus.parameters:
+                    sample = dm.decode_sample(can_id, data, (12.5, 10, 28), now - start, time.time())
+                    motor = sample.motor
+                    latest[motor], arrivals[motor] = sample, now
+                    displacement = abs(sample.position_deg - initial[motor].position_deg)
+                    if moved_at[motor] is None and actual_motion(sample, initial[motor], config):
+                        moved_at[motor] = now
+                        show(f"ACTUAL_START_DETECTED t={now-start:.3f} command={commands.get(motor)}",
+                             sample)
+                    startup = moved_at[motor] is None or now - moved_at[motor] < config["startup_grace_s"]
+                    # Reversals retain the configured external running-speed check.
+                    extents[motor][0] = min(extents[motor][0], sample.position_deg)
+                    extents[motor][1] = max(extents[motor][1], sample.position_deg)
+                    peaks[motor] = max(peaks[motor], abs(math.degrees(sample.velocity_rad_s)))
+                    try:
+                        inspect_sample(sample, commands.get(motor), config, motor in enabled, startup)
+                        if preview and displacement >= config["preview_max_deg"]:
+                            raise RuntimeError("Preview actual displacement protection")
+                    except RuntimeError:
+                        show(f"NATIVE_TRIP command={commands.get(motor)}", sample)
+                        raise
+                    if sample.state == 1:
+                        enabled.add(motor)
+                    if routes[motor] and abs(sample.position_deg - routes[motor][0]) <= config["endpoint_tolerance_deg"]:
+                        print("ENDPOINT", motor, routes[motor].pop(0), flush=True)
+            if any(now - value > config["feedback_timeout_s"] for value in arrivals.values()):
+                raise RuntimeError("External feedback freshness protection")
+            if now - start > 0.6 and len(enabled) != 2:
+                raise RuntimeError("Native Task did not enable both joints")
+            if now >= next_log:
+                for motor in (1, 2):
+                    show(f"NATIVE t={now-start:.3f} command={commands.get(motor)}", latest[motor])
+                next_log = now + config["log_period_s"]
+            preview_done = preview and (now - start >= config["preview_duration_s"] or any(
+                abs(latest[m].position_deg - initial[m].position_deg) >= config["preview_stop_deg"]
+                for m in (1, 2)))
+            if preview_done or all(not route for route in routes.values()):
+                print("REQUEST_NATIVE_KEY_STOP", flush=True)
+                decelerate_hold(bus, probe, config, initial, preview)
+                print("PREVIEW_COMPLETED_AND_HOLDING" if preview else
+                      "FULL_SWEEP_COMPLETED_AND_HOLDING", flush=True)
+                return
+        raise RuntimeError("Full sweep duration limit reached")
+    finally:
+        for sample in latest.values():
+            show("LAST_OBSERVED", sample)
+        print("ACTUAL_EXTENTS_DEG", extents, "PEAK_SPEED_DEG_S", peaks, flush=True)
+
+
+def run(config, preview=False):
+    probe, bus = Probe(), Bus()
+    originals, changed = {}, set()
+    started = False
+    try:
+        probe.start(integrated=True)
+        for index in range(2):
+            base = 0x200000E4 + index * 108
+            words = probe.read(base + 24, 32, 2)
+            bounds = tuple(map(math.degrees, struct.unpack("<ff", struct.pack("<II", *words))))
+            if any(abs(a - b) > 0.001 for a, b in zip(bounds, config["bounds_deg"][index])):
+                raise RuntimeError(f"J{index+1} config/monitor bounds mismatch")
+            for offset, key in ((76, "motion_detect_deg"), (80, "motion_detect_speed_deg_s"),
+                                (84, "startup_speed_deg_s"), (92, "tracking_error_deg"),
+                                (96, "measured_speed_deg_s")):
+                value = math.degrees(struct.unpack("<f", struct.pack("<I",
+                    probe.read(base + offset, 32, 1)[0]))[0])
+                if abs(value - config[key]) > 0.001:
+                    raise RuntimeError(f"J{index+1} native/external protection mismatch: {key}")
+            if probe.read(base + 88, 32, 1)[0] != round(config["startup_grace_s"] * 1000):
+                raise RuntimeError("Native/external startup grace mismatch")
+        bus.start(discard_stale_overflow=True)
+        wait_disabled(bus, config)
+        for motor in (1, 2):
+            for rid, expected in ((10, 1), (21, 12.5), (22, 10), (23, 28)):
+                raw = bus.transaction(motor, 0x33, rid)
+                value = raw if rid == 10 else struct.unpack("<f", struct.pack("<I", raw))[0]
+                if value != expected:
+                    raise RuntimeError(f"J{motor} protocol range/mode mismatch: {rid}/{value}")
+            originals[motor] = bus.transaction(motor, 0x33, 9)
+            print("ORIGINAL_TIMEOUT_RAM", motor, originals[motor], flush=True)
+            changed.add(motor)  # Failed writes also require readback/cleanup.
+            bus.transaction(motor, 0x55, 9, config["timeout_raw"])
+            if bus.transaction(motor, 0x33, 9) != config["timeout_raw"]:
+                raise RuntimeError("Temporary timeout RAM write not confirmed")
+            bus.controlled_motor = motor
+            sample = bus.query(motor)
+            bounds = tuple(map(math.radians, config["bounds_deg"][motor - 1]))
+            timeout_check(bus, sample, config, bounds)
+        wait_disabled(bus, config)
+        # Let pending parameter responses pass before the native Task can be enabled.
+        probe.rpc("resume")
+        bus.drain()
+        probe.rpc("halt")
+        if probe.read(STATUS, 8, 4) != [0, 0, 1, 3]:
+            raise RuntimeError("Native Task not IDLE/ready")
+        if not probe.read(0x58020010, 32, 1)[0] & (1 << 15):
+            raise RuntimeError("Physical KEY is held; refusing a competing start event")
+        initial = {m: bus.query(m) for m in (1, 2)}
+        for sample in initial.values():
+            show("BEFORE_NATIVE_START", sample)
+            if sample.state != 0:
+                raise RuntimeError("Both joints must be disabled before native KEY start")
+        probe.rpc(f"write_memory {KEY_PENDING:#x} 8 {{1}}")
+        started = True
+        probe.rpc("resume")
+        monitor(bus, probe, config, initial, preview)
+    finally:
+        try:
+            if changed or started:
+                for motor in (1, 2):
+                    bus.state(motor, 0xFD)
+                # Native Task sees external disengagement and locks its existing FAULT.
+                settle_running_receiver(bus, config)
+                probe.rpc("halt")
+                status = probe.read(STATUS, 8, 8)
+                print("FINAL_NATIVE_STATUS", status, flush=True)
+                if status[0] not in (0, 5):
+                    raise RuntimeError("Native control not inactive; retaining temporary timeout")
+                words = probe.read(STATUS + 56, 32, 6)
+                print("FINAL_TARGET_POSITION_VELOCITY_FF",
+                      struct.unpack("<6f", struct.pack("<6I", *words)), flush=True)
+                for motor in changed:
+                    bus.transaction(motor, 0x55, 9, originals[motor])
+                    if bus.transaction(motor, 0x33, 9) != originals[motor]:
+                        raise RuntimeError("Original timeout restore not confirmed")
+                    show("RESTORED_TIMEOUT", bus.query(motor))
+                print("BOTH_TIMEOUTS_RESTORED_RAM_ONLY", originals, flush=True)
+        finally:
+            try:
+                bus.close()
+            finally:
+                probe.close()
+
+
+def self_test(config):
+    from dataclasses import replace
+    command = command_values(packed_mit(math.radians(-150), 0, 5, 5, 0.4))
+    assert abs(command[0] + 150) < 0.03 and command[3] == 5
+    sample = dm.decode_sample(0x12, bytes.fromhex("1264917ff7fd1f1d"), (12.5, 10, 28), 0, 0)
+    assert not actual_motion(replace(sample, velocity_rad_s=math.radians(0.7)), sample, config)
+    assert actual_motion(replace(sample, position_rad=sample.position_rad + math.radians(0.08),
+                                 velocity_rad_s=0), sample, config)
+    inspect_sample(sample, (sample.position_deg, 0, 5, 5, 0), config, True)
+    for bad in (replace(sample, state=0), replace(sample, state=13),
+                replace(sample, velocity_rad_s=math.radians(config["measured_speed_deg_s"] + 0.1)),
+                replace(sample, position_rad=math.radians(-241)),
+                replace(sample, mos_c=50)):
+        try:
+            inspect_sample(bad, None, config, True)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Unsafe sample accepted")
+    assert config["measured_speed_deg_s"] <= 10
+    assert config["startup_speed_deg_s"] <= 10
+    assert 0 < config["startup_grace_s"] <= 0.1
+    inspect_sample(replace(sample, velocity_rad_s=math.radians(8)), None, config, True, True)
+    try:
+        inspect_sample(replace(sample, velocity_rad_s=math.radians(11)), None, config, True, True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Unbounded startup speed accepted")
+    assert 0 < config["preview_stop_deg"] < config["preview_max_deg"] <= 3
+    assert config["tracking_error_deg"] <= 5
+    assert config["feedback_timeout_s"] <= 0.1
+    print("NATIVE_SWEEP_SELF_TEST_OK")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--run", action="store_true")
+    group.add_argument("--preview", action="store_true",
+                       help="Native Task preview: stop at 2 degrees or 30 seconds; hard cap 3 degrees")
+    args = parser.parse_args()
+    config = json.loads((ROOT / "config/sweep_test.json").read_text(encoding="utf-8"))
+    self_test(config)
+    if args.run or args.preview:
+        run(config, args.preview)

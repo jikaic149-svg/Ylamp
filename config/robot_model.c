@@ -1,0 +1,33 @@
+#include "robot_model.h"
+
+/* 刚体惯量保留CAD名义初值，附加输出侧等效惯量单列；J3视为固定负载。
+ * 2026-11-09重力sin项由双向运动/独立轨迹的电流估算力矩辨识，
+ * 不是独立力矩传感器标定；板/螺丝/线束的影响未分别辨识。 */
+const RobotModel_Parameters_t g_robot_model = {
+    .a0 = 0.0038885024790008614f,
+    .a_cos2 = -0.0034618948896653996f,
+    .a_sin2 = -1.0738749836377764e-7f,
+    .b_cos = 3.20325310476976e-5f,
+    .b_sin = -5.082928150940612e-10f,
+    .d = 0.007085919379490959f,
+    .gravity_sin_nm = -0.57955726216974f,
+    /* 积分力矩/动量辨识，0.25s窗口，独立轨迹验证；不是转子惯量实测。
+     * 0.15/0.4s窗口分别约J1 0.0231/0.0261、J2 0.0352/0.0370。
+     * 证据：build/identification/inertia_crosscheck_20261109.json。 */
+    .extra_inertia_kg_m2 = {0.027043715766847144f, 0.036718580660292634f}
+};
+
+/* 有效摩擦（输出轴SI单位），不是静止样本推断的最大静摩擦。
+ * 数据和独立验证：build/identification/identified_imu_20261109_v1.json。
+ * Stribeck未稳定改善留出误差，采用较小的库仑+黏性模型。
+ * 拟合bias仅作测量/模型残差，不当成恒定助推写入控制。 */
+const RobotModel_Friction_t g_robot_friction[ROBOT_MODEL_JOINT_COUNT] = {
+    {.coulomb_nm = 0.6080304649066542f, .viscous_nm_s = 0.2253885083751764f},
+    {.coulomb_nm = 0.48597053422368364f, .viscous_nm_s = 0.415710193143381f}
+};
+
+/* STEP的J3帧原点，不声称是实测握持点；装配偏置必须保留。 */
+const RobotModel_Point_t g_robot_tool_point = {
+    .j2_origin_m = {0.0f, -0.029125f, -0.0465f},
+    .point_from_j2_m = {0.0f, 0.0055f, 0.1435f}
+};
