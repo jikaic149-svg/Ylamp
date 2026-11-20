@@ -1,5 +1,6 @@
 /build/
 __pycache__/
 *.py[cod]
+/tools/urdf_collision/node_modules/
 # Unrelated slicer export, not firmware or a test result.
 /result.json

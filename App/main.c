@@ -1,7 +1,7 @@
 /* DM-MC-Board02 / STM32H723：FreeRTOS 应用入口，不调用参考工程旧业务。
  * 时钟/MPU 参数沿用 H7_BSP-HEAD 的 CubeMX main.c。
  * 参考生成代码 Copyright (c) 2026 STMicroelectronics，许可见原工程。
- * 启动只查询；策略获准后也须 KEY 和启动条件通过才会使能。 */
+ * 冷启动不自动使能；同一任务负责五轴重力、轨迹和 USB 请求。 */
 #include "main.h"
 #include "gpio.h"
 #include "spi.h"
@@ -10,28 +10,21 @@
 #include "bsp_power.h"
 #include "bsp_rgb.h"
 #include "bsp_uart.h"
-#include "motor_task.h"
-#include "motor_tuning.h"
-#include "motor_serial.h"
+#include "five_control.h"
+#include "bmi088_port.h"
 #include "motor_usb.h"
 #include "can3_telemetry.h"
 #include "usb_telemetry.h"
 #include "usb_config.h"
 #include "joint_calibration.h"
+#include "yummy_imu.h"
 #include "serial_config.h"
 #include "fault.h"
-#ifdef YLAMP_J5_TEST_ONLY
-#include "j5_test.h"
-#endif
-#ifdef YLAMP_CAN_CHECK_ONLY
-#include "can_check.h"
-#endif
-
 extern TIM_HandleTypeDef htim2;
 void Ylamp_StartScheduler(void);
 HAL_StatusTypeDef YlampSerialDMA_Init(void);
 
-/* J1..J5通信句柄；仅前两台交给双轴控制，其余接收反馈/支持时只读查询。 */
+/* Same order throughout: J1 and J2 on CAN2, J3..J5 on CAN1. */
 static DM_Motor_t *motors[MOTOR_CAN_JOINT_COUNT];
 
 static void configure_mpu(void)
@@ -99,78 +92,29 @@ static void configure_clock(void)
     if (HAL_RCCEx_PeriphCLKConfig(&peripheral) != HAL_OK) { Error_Handler(); }
 }
 
-#if !defined(YLAMP_J5_TEST_ONLY) && !defined(YLAMP_CAN_CHECK_ONLY)
-static void report_status(void)
+void Ylamp_ControlStep(uint32_t now)
 {
-    MotorTask_Status_t status;
-    if (MotorTask_GetStatus(&status) != BSP_CAN_OK) { return; }
-    /* USART1 is exclusively binary telemetry/RPC; do not interleave printf. */
-    if (status.state == MOTOR_TASK_FAULT) {
-        (void)BSP_RGB_Set(8U, 0U, 0U);
-    } else if (!status.policy_ready) {
-        (void)BSP_RGB_Set(4U, 0U, 4U);
-    } else if (status.state == MOTOR_TASK_RUNNING) {
-        (void)BSP_RGB_Set(0U, 6U, 0U);
-    } else {
-        (void)BSP_RGB_Set(0U, 0U, 6U);
-    }
-}
-#endif
-
-/* One application task owns all mutable Task/Device state. ISR callbacks only
- * deliver bounded feedback/transport events; no extra unsynchronized readers. */
-void Ylamp_ControlStep(uint32_t now_ms)
-{
-#ifdef YLAMP_CAN_CHECK_ONLY
-    g_fault_stage = YLAMP_STAGE_MOTOR;
-    CanCheck_Run(now_ms);
-    g_fault_stage = YLAMP_STAGE_WAIT;
-#elif defined(YLAMP_J5_TEST_ONLY)
-    /* Exclusive bench owner: no KEY, dual-axis Task/RPC or CAN2 TX. */
-    g_fault_stage = YLAMP_STAGE_MOTOR;
-    J5Test_Run(now_ms);
-    g_fault_stage = YLAMP_STAGE_WAIT;
-#else
-    static uint32_t last_report_ms;
-    static uint32_t last_monitor_query_ms;
-    g_fault_stage = YLAMP_STAGE_MOTOR;
-    (void)MotorTask_Run(now_ms);
-    /* Its CAN snapshot may include an IRQ newer than the loop's initial tick. */
-    now_ms = HAL_GetTick();
-    /* J1/J2 已由 Task 查询；J4/J5 仅只读查询，不发 MIT/使能/写参。
-     * J3旧协议由Device拒绝独立查询，只接收显式控制命令的应答；
-     * 不以反复失能/零MIT伪装只读。每轮最多两帧，FIFO忙时不补发。 */
-    if (now_ms - last_monitor_query_ms >= g_motor_config.query_period_ms) {
-        last_monitor_query_ms = now_ms;
-        for (unsigned i = MOTOR_TASK_JOINT_COUNT; i < MOTOR_CAN_JOINT_COUNT; ++i) {
-            (void)DM_Motor_RequestFeedback(motors[i]);
-        }
-    }
-    g_fault_stage = YLAMP_STAGE_IMU;
-    BMI088_Run(now_ms);
-    g_fault_stage = YLAMP_STAGE_CALIBRATION;
-    JointCalibration_Run(now_ms);
-    g_fault_stage = YLAMP_STAGE_TUNING;
-    (void)MotorTuning_Run(now_ms);
-    g_fault_stage = YLAMP_STAGE_SERIAL;
-    (void)MotorSerial_Run(now_ms);
-    if (now_ms - last_report_ms >= g_motor_config.status_period_ms) {
-        last_report_ms = now_ms;
-        g_fault_stage = YLAMP_STAGE_STATUS;
-        report_status();
-    }
-    g_fault_stage = YLAMP_STAGE_WAIT;
-#endif
-    /* Independent read-only output in normal AND exclusive bench builds.
-     * Does not change motor querying, enable policy or SWD test requests. */
+    static uint32_t report;
+    g_fault_stage=YLAMP_STAGE_MOTOR;
+    FiveControl_Tick(now);
+    if (BSP_KEY_Scan(now)==BSP_KEY_EVENT_PRESSED) { (void)FiveControl_KeyPress(); }
+    g_fault_stage=YLAMP_STAGE_IMU;
+    BMI088_Run(now);
+    YummyIMU_Run();
+    g_fault_stage=YLAMP_STAGE_CALIBRATION;
+    JointCalibration_Run(now);
+    if (MotorUSB_Run()) { USBTelemetry_Run(HAL_GetTick()); }
 #ifdef YLAMP_CAN3_TELEMETRY
     CAN3Telemetry_Run(HAL_GetTick());
 #endif
-#if !defined(YLAMP_J5_TEST_ONLY) && !defined(YLAMP_CAN_CHECK_ONLY)
-    if (MotorUSB_Run()) { USBTelemetry_Run(HAL_GetTick()); }
-#else
-    USBTelemetry_Run(HAL_GetTick()); /* No control dispatcher linked into bench. */
-#endif
+    if (now-report>=500U) {
+        report=now;
+        const FiveControl_Status *s=FiveControl_StatusNow();
+        (void)BSP_RGB_Set(s->fault?8U:s->phase==FIVE_IMPEDANCE || s->phase==FIVE_REVERSE_J3?5U:0U,
+                          s->phase==FIVE_GRAVITY || s->phase==FIVE_POSITION || s->phase==FIVE_IMPEDANCE?5U:0U,
+                          s->phase==FIVE_MOTION || s->phase==FIVE_WAIT?5U:0U);
+    }
+    g_fault_stage=YLAMP_STAGE_WAIT;
 }
 
 int main(void)
@@ -184,9 +128,11 @@ int main(void)
     configure_clock();
     MX_GPIO_Init();
     if (BSP_POWER_Init() != HAL_OK ||
-        BSP_KEY_Init(g_motor_config.key_debounce_ms) != HAL_OK) {
+        BSP_KEY_Init(20U) != HAL_OK) {
         Error_Handler();
     }
+    /* 用户确认：UART10/YummyIMU所接共享对外5V开机常开，独立于电机电源。 */
+    if (BSP_POWER_Set(BSP_POWER_EXT_5V, true) != HAL_OK) { Error_Handler(); }
     MX_SPI6_Init();
     MX_USART1_UART_Init();
     /* Apply project baud before registering UART RX/TX; keep the SDK unchanged. */
@@ -198,11 +144,18 @@ int main(void)
      * IMU acquisition uses SPI interrupts only, no DMA buffers/cache changes.
      * All blocking sensor setup happens while motor power is still OFF. */
     __HAL_RCC_DMA1_CLK_ENABLE();
+    /* UART10: PE2 RX / PE3 TX, YummyIMU factory 921600/8N1 USE output.
+     * Receive only via BSP IT; no commands or changes to the module's flash. */
+    MX_USART10_UART_Init();
+    huart10.Init.BaudRate = 921600U;
+    if (HAL_UART_Init(&huart10) == HAL_OK) {
+        (void)YummyIMU_Init(&huart10, YUMMY_IMU_USE);
+    }
     g_fault_stage = YLAMP_STAGE_IMU_INIT;
     MX_SPI2_Init();
     /* IMU is optional for the saved-reference drag mode. Failure leaves it
      * unavailable (calibration status/op10), not a successful zero capture. */
-    if (BSP_IMU_Init() == HAL_OK) { (void)BMI088_Init(); }
+    if (BMI088_Port_Init() == HAL_OK) { (void)BMI088_Init(); }
     g_fault_stage = YLAMP_STAGE_CAN_INIT;
     MX_FDCAN1_Init();
     if (BSP_CAN_Init(&hfdcan1) != BSP_CAN_OK) { Error_Handler(); }
@@ -242,35 +195,16 @@ int main(void)
     (void)USBTelemetry_Init(usb_sources, MOTOR_CAN_JOINT_COUNT,
         USB_TELEMETRY_PERIOD_MS, USB_TELEMETRY_MAX_AGE_MS, HAL_GetTick());
     /* 用户确认：CAN1/PC14（VCC_OUT0）、CAN2/PC13（VCC_OUT1）电源联动。
-     * 两路 EN 同次置高，对外 5V/PC15 保持关闭。
+     * 两路 EN 同次置高，不改变前面已开启的对外5V/PC15。
      * 上电先只读角度，Task 不因收到反馈就使能，不自动拉回区间外的关节。 */
     if (BSP_POWER_SetMotorPower(true) != HAL_OK) { Error_Handler(); }
     const uint32_t powered_at_ms = HAL_GetTick();
-    while (HAL_GetTick() - powered_at_ms < g_motor_config.power_settle_ms) {
+    while (HAL_GetTick() - powered_at_ms < 1000U) {
         (void)BSP_KEY_Scan(HAL_GetTick()); /* 丢弃供电稳定阶段的按键动作。 */
         HAL_Delay(1U);
     }
-#ifdef YLAMP_CAN_CHECK_ONLY
-    CanCheck_Init(motors, HAL_GetTick());
-    (void)BSP_RGB_Set(4U, 0U, 4U);
-#elif defined(YLAMP_J5_TEST_ONLY)
-    J5Test_Init(motors[4], HAL_GetTick());
-    (void)BSP_RGB_Set(4U, 0U, 4U);
-#else
-    if (MotorTask_Init(&g_motor_config, motors, HAL_GetTick()) != BSP_CAN_OK) {
-        Error_Handler();
-    }
-    /* Native USB quick control, CAN/UART full editors dispatch in one task.
-     * Only one host/transport may own
-     * a configuration transaction. Neither host queries the motors directly.
-     * The CAN endpoint follows J1/J2 on CAN2; attach the existing PC tool there. */
-    if (MotorTuning_Init(g_motor_config.joint[0].device.bus) != BSP_CAN_OK) {
-        Error_Handler();
-    }
-    if (JointCalibration_Init() != BSP_CAN_OK) { Error_Handler(); }
-    if (MotorSerial_Init(&huart1) != HAL_OK) { Error_Handler(); }
-    MotorUSB_Init(); /* USB controls J1/J2 only; bench builds stay telemetry-only. */
-#endif
+    if (!FiveControl_Init(motors,HAL_GetTick()) || JointCalibration_Init()!=BSP_CAN_OK) { Error_Handler(); }
+    MotorUSB_Init();
     g_fault_stage = YLAMP_STAGE_SCHEDULER;
     Ylamp_StartScheduler();
     Error_Handler();
@@ -295,7 +229,7 @@ void USART6_IRQHandler(void) { HAL_UART_IRQHandler(&huart6); }
 void UART7_IRQHandler(void) { HAL_UART_IRQHandler(&huart7); }
 void USART10_IRQHandler(void) { HAL_UART_IRQHandler(&huart10); }
 void SPI2_IRQHandler(void) { HAL_SPI_IRQHandler(&hspi2); }
-void HAL_GPIO_EXTI_Callback(uint16_t pin) { BSP_IMU_NotifyReady(pin); }
+void HAL_GPIO_EXTI_Callback(uint16_t pin) { BMI088_Port_NotifyReady(pin); }
 void EXTI15_10_IRQHandler(void)
 {
     HAL_GPIO_EXTI_IRQHandler(BMI088_ACCEL__INTERRUPT_Pin);

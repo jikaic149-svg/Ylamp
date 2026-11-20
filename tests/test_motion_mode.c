@@ -43,7 +43,7 @@ static void check_encoder_friction(void)
     DM_Motor_Feedback_t fb[2] = {
         {.position_rad = -1.0f, .received_at_ms = UINT32_MAX - 200U,
          .received_count = UINT32_MAX - 100U},
-        {.position_rad = -2.6f, .received_at_ms = UINT32_MAX - 200U,
+        {.position_rad = g_motor_config.drag_j2_zero_rad + .04f, .received_at_ms = UINT32_MAX - 200U,
          .received_count = UINT32_MAX - 100U}
     };
     MotionMode_State_t state = {0};
@@ -178,7 +178,7 @@ static void check_stop_margin(void)
     for (unsigned side = 0; side < 2; ++side) {
         for (unsigned cut = 0; cut <= 40; ++cut) {
             DM_Motor_Feedback_t fb[2] = {
-                {.position_rad = -1.8f}, {.position_rad = -2.6f}
+                {.position_rad = -1.8f}, {.position_rad = g_motor_config.drag_j2_zero_rad + .04f}
             };
             MotionMode_State_t state = {0};
             MotionMode_Status_t status;
@@ -218,7 +218,7 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--replay") == 0) { return replay(); }
     assert(argc == 1);
     DM_Motor_Feedback_t fb[2] = {
-        {.position_rad = -1.0f}, {.position_rad = -2.6f}
+        {.position_rad = -1.0f}, {.position_rad = g_motor_config.drag_j2_zero_rad + .04f}
     };
     MotionMode_State_t state = {0};
     MotionMode_Status_t status;
@@ -235,7 +235,7 @@ int main(int argc, char **argv)
     assert(cmd[0].position_rad == fb[0].position_rad);
     assert(cmd[1].position_rad == fb[1].position_rad);
     MotionMode_Request_t request = {
-        .target_rad = {-1.2f, -2.3f},
+        .target_rad = {-1.2f, g_motor_config.drag_j2_zero_rad + .34f},
         .velocity_rad_s = {.2f, .3f},
         .acceleration_rad_s2 = {.4f, .6f},
         .jerk_rad_s3 = {1.0f, 1.5f}
@@ -281,7 +281,8 @@ int main(int argc, char **argv)
     fb[0].velocity_rad_s = 0.0f;
 
     /* Brake mid-move, including positive acceleration, without jumping p/v/a. */
-    request.target_rad[0] = -1.6f; request.target_rad[1] = -2.8f;
+    request.target_rad[0] = -1.6f;
+    request.target_rad[1] = g_motor_config.drag_j2_zero_rad - .16f;
     assert(MotionMode_Move(&g_motor_config, &request, &state));
     for (unsigned n = 0; n < 65; ++n) { step(fb, &state, &status, cmd); }
     JointTrajectory_Sample_t before = state.reference;

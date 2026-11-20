@@ -1,0 +1,13 @@
+{
+  "name": "ylamp-offline-collision-check",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "self-test": "node check.mjs --self-test"
+  },
+  "dependencies": {
+    "fast-xml-parser": "5.12.1",
+    "three": "0.187.0",
+    "three-mesh-bvh": "0.9.18"
+  }
+}

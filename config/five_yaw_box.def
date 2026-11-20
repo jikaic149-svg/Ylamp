@@ -1,0 +1,5 @@
+/* Historical offline evidence only, NOT the active motion admission policy.
+ * Nominal software-angle half-widths [deg], centered at zero.
+ * see tools/urdf_collision/check_yaw_box.py. J1 travel inset >1 degree.
+ * Model geometry only; does not certify cable, payload or external obstacles. */
+FIVE_YAW_BOX(200.0, 5.0, 5.0, 5.0, 5.0)

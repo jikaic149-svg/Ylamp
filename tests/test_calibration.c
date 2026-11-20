@@ -1,4 +1,5 @@
 #include "joint_calibration.h"
+#include "motor_config.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -6,6 +7,7 @@
 
 #define DEG(x) ((x) * 0.01745329251994329577f)
 uint32_t test_ipsr, test_primask, test_tick;
+FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 static MotorTask_Config_t config;
 static MotorTask_Status_t motor;
 static BMI088_Sample_t sample;
@@ -66,13 +68,15 @@ int main(int argc, char **argv)
     }
     motor.state = MOTOR_TASK_IDLE;
     motor.feedback_valid_mask = 3U;
-    motor.feedback[0].position_rad = DEG(-100);
+    motor.feedback[0].position_rad = DEG(260); /* Calibration preserves raw turns. */
     motor.feedback[1].position_rad = DEG(210); /* Same posture, +360 wire branch. */
     motor.reference_rad[0] = DEG(-100);
     motor.reference_rad[1] = DEG(-150);
     JointCalibration_Status_t status;
     assert(JointCalibration_Init() == BSP_CAN_OK);
     assert(JointCalibration_GetStatus(0U, &status) == BSP_CAN_OK);
+    assert(status.zero_rad[0] == g_joint_reference_config[0].zero_rad);
+    assert(status.raw_rad[0] == DEG(260) && status.reference_rad[0] == status.raw_rad[0]);
     if (saved) {
         assert(status.valid_mask == 3U && status.axis == 0U);
         assert(status.zero_rad[1] == config.drag_j2_zero_rad);
@@ -100,7 +104,6 @@ int main(int argc, char **argv)
         return 0;
     }
     assert(status.valid_mask == 1U && isnan(status.zero_rad[1]));
-    assert(fabsf(status.zero_rad[0] - DEG(-105)) < 1e-6f);
     assert(!(status.flags & CAL_IMU_ACTIVE) && starts == 0U);
     assert(JointCalibration_Mark(2U, 5U, 0U) == BSP_CAN_NOT_READY);
     motor.state = MOTOR_TASK_RUNNING;
@@ -151,10 +154,10 @@ int main(int argc, char **argv)
     assert(!(status.flags & (CAL_IMU_FRESH | CAL_STABLE)));
     config.joint[0].lower_rad = DEG(-200);
     assert(JointCalibration_GetStatus(16000U, &status) == BSP_CAN_OK);
-    assert(fabsf(status.zero_rad[0] - DEG(-105)) < 1e-6f);
+    assert(status.zero_rad[0] == g_joint_reference_config[0].zero_rad);
     assert(JointCalibration_Mark(1U, 0U, 16000U) == BSP_CAN_OK);
     JointCalibration_GetStatus(16000U, &status);
-    assert(fabsf(status.zero_rad[0] - DEG(-100)) < 1e-6f);
+    assert(status.zero_rad[0] == g_joint_reference_config[0].zero_rad);
     test_ipsr = 1U;
     assert(JointCalibration_SetIMU(true, 16000U) == BSP_CAN_INVALID_ARG);
     assert(JointCalibration_Mark(1U, 0U, 16000U) == BSP_CAN_INVALID_ARG);

@@ -186,12 +186,13 @@ static uint32_t snapshot_feedback(void)
         if (DM_Motor_GetFeedback(task.motor[i], &task.status.feedback[i]) == BSP_CAN_OK) {
             task.status.feedback_valid_mask |= (uint8_t)(1U << i);
             const MotorTask_JointConfig_t *cfg = &task.config.joint[i];
-            const float anchor = active() && isfinite(task.status.reference_rad[i]) ?
-                task.status.reference_rad[i] : 0.5f * (cfg->lower_rad + cfg->upper_rad);
             const float raw = task.status.feedback[i].position_rad;
-            const float offset = JointCoordinates_Offset(raw, anchor);
-            task.status.reference_offset_rad[i] = offset;
-            task.status.reference_rad[i] = raw + offset;
+            const float reference = active() && isfinite(task.status.reference_rad[i]) ?
+                raw + JointCoordinates_Offset(raw, task.status.reference_rad[i]) :
+                JointCoordinates_Reference(raw, cfg->lower_rad, cfg->upper_rad);
+            /* Use the SAME branch inverse for the actual MIT position target. */
+            task.status.reference_offset_rad[i] = reference - raw;
+            task.status.reference_rad[i] = reference;
             task.reference_feedback[i] = task.status.feedback[i];
             task.reference_feedback[i].position_rad = task.status.reference_rad[i];
         }

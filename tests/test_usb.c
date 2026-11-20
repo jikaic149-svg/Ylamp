@@ -4,6 +4,8 @@
 #include "motor_usb.h"
 #include "motor_tuning.h"
 #include "motor_telemetry.h"
+#include "motor_config.h"
+#include "yummy_imu.h"
 
 #include <assert.h>
 #include <math.h>
@@ -12,6 +14,7 @@
 #include <string.h>
 
 uint32_t test_ipsr, test_primask, test_tick;
+FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 PCD_HandleTypeDef hpcd_USB_OTG_HS;
 USBD_ClassTypeDef USBD_CDC;
 USBD_DescriptorsTypeDef HS_Desc;
@@ -24,6 +27,11 @@ static uint8_t tokens[MOTOR_SNAPSHOT_MAX_JOINTS];
 static DM_Motor_Feedback_t samples[MOTOR_SNAPSHOT_MAX_JOINTS];
 static bool received[MOTOR_SNAPSHOT_MAX_JOINTS];
 static unsigned rpc_calls, actions;
+static unsigned j3_enables, j3_disables, j3_mits;
+static bool j3_reply = true;
+static YummyIMU_Status_t external_imu;
+
+void YummyIMU_GetStatus(YummyIMU_Status_t *status) { *status = external_imu; }
 
 BSP_CAN_Status_t MotorTuning_HandleRequest(const uint8_t request[8],
     uint32_t arrived_ms, uint32_t now_ms, uint8_t response[8])
@@ -104,6 +112,32 @@ BSP_CAN_Status_t DM_Motor_GetFeedback(const DM_Motor_t *motor, DM_Motor_Feedback
     assert(false); return BSP_CAN_INVALID_ARG;
 }
 
+static BSP_CAN_Status_t j3_command(DM_Motor_t *motor, uint8_t state)
+{
+    assert(motor == (DM_Motor_t *)&tokens[2] && test_ipsr == 0U && test_primask == 0U);
+    if (j3_reply) {
+        received[2] = true;
+        samples[2].state = state;
+        samples[2].received_at_ms = test_tick;
+        ++samples[2].received_count;
+    }
+    return BSP_CAN_OK;
+}
+BSP_CAN_Status_t DM_Motor_Enable(DM_Motor_t *motor)
+{
+    ++j3_enables; return j3_command(motor, 1U);
+}
+BSP_CAN_Status_t DM_Motor_Disable(DM_Motor_t *motor)
+{
+    ++j3_disables; return j3_command(motor, 0U);
+}
+BSP_CAN_Status_t DM_Motor_SendMIT(DM_Motor_t *motor, const DM_Motor_MIT_Command_t *command)
+{
+    assert(command->kp == 0.0f && command->kd == 0.0f &&
+        command->velocity_rad_s == 0.0f && command->torque_ff_nm == 0.0f);
+    ++j3_mits; return j3_command(motor, samples[2].state);
+}
+
 static void enumerate(void)
 {
     memset(&cdc, 0, sizeof(cdc));
@@ -157,7 +191,7 @@ static void usb_control_test(void)
     test_tick = 1000U;
     /* Uninitialized/bench endpoint cannot act even on valid traffic. */
     assert(MotorUSB_Run() && actions == 0U);
-    MotorUSB_Init();
+    MotorUSB_Init((DM_Motor_t *)&tokens[2]);
     unsigned size = make_frame(frame, 0x12U, p, 8U);
     input(frame, 7U); service(); assert(cdc.TxState == 0U);
     input(frame + 7, size - 7U); service();
@@ -199,6 +233,207 @@ static void usb_control_test(void)
     input(frame, size); service();
     assert(actions == 2U && cdc.TxBuffer[18] == BSP_CAN_NOT_READY); complete();
     puts("USB quick-control CRC/fragmentation/allowlist/dedup/busy/expiry/overflow/DTR: PASS");
+}
+
+static void usb_j3_test(void)
+{
+    uint8_t frame[31], p[24] = {11,12,13,14,15,16,17,18};
+    unsigned size = make_frame(frame, 0x12U, p, 8U);
+    input(frame, size); service(); complete();
+    assert(j3_enables == 0U && j3_disables == 0U && j3_mits == 0U);
+    p[8] = 1U; p[12] = (uint8_t)test_tick; p[13] = (uint8_t)(test_tick >> 8);
+    p[16] = 1U; p[17] = 13U; p[18] = 3U; p[19] = 255U;
+    size = make_frame(frame, 0x11U, p, 24U);
+    input(frame, size); service();
+    assert(get32(cdc.TxBuffer+21) == MOTOR_J3_FEEDBACK_VERSION); complete();
+    p[8] = 2U; p[19] = 1U;
+    make_frame(frame, 0x11U, p, 24U); input(frame, size); service();
+    assert(cdc.TxBuffer[18] == BSP_CAN_OK); complete();
+    service();
+    assert(j3_enables == 1U && j3_disables == 1U && j3_mits == 1U);
+    input(frame, size); service(); complete(); /* same envelope cannot re-enable */
+    assert(j3_enables == 1U && j3_disables == 1U);
+    for (unsigned i = 0U; i < 250U; ++i) { test_tick += 10U; service(); }
+    assert(j3_mits == 251U); /* >2s, exactly 100Hz, no other motor commands */
+
+    p[8] = 3U; p[19] = 0U;
+    make_frame(frame, 0x11U, p, 24U); input(frame, size); service();
+    assert(cdc.TxBuffer[21] == 4U && cdc.TxBuffer[23] == 1U); complete();
+    p[8] = 4U; p[19] = 2U;
+    p[12] = (uint8_t)test_tick; p[13] = (uint8_t)(test_tick >> 8);
+    make_frame(frame, 0x11U, p, 24U); input(frame, size); service(); complete();
+    service(); assert(j3_disables == 2U);
+    test_tick += 1000U; service();
+    assert(j3_mits == 251U && j3_enables == 1U);
+
+    p[8] = 5U; p[19] = 1U; /* expired start, no action */
+    make_frame(frame, 0x11U, p, 24U); input(frame, size); service();
+    assert(cdc.TxBuffer[18] == BSP_CAN_NOT_READY); complete();
+    assert(j3_enables == 1U);
+    p[8] = 6U; p[12] = (uint8_t)test_tick; p[13] = (uint8_t)(test_tick >> 8);
+    make_frame(frame, 0x11U, p, 24U); input(frame, size); service(); complete(); service();
+    assert(j3_enables == 2U);
+    /* A busy USB IN must not block session-loss cleanup. */
+    const uint8_t telemetry[] = {'Y','L',1U};
+    assert(BSP_USB_Send(telemetry, 3U) == BSP_USB_OK);
+    j3_reply = false;
+    dtr(false); service();
+    assert(j3_disables == 4U && j3_enables == 2U);
+    test_tick += 500U; service(); /* missing disable ACK stays unknown */
+    dtr(true); complete(); service();
+    assert(j3_disables == 4U && j3_enables == 2U);
+    j3_reply = true;
+    size = make_frame(frame, 0x12U, p, 8U);
+    input(frame, size); service(); complete();
+    p[8] = 1U; p[19] = 0U;
+    size = make_frame(frame, 0x11U, p, 24U);
+    input(frame, size); service();
+    assert(cdc.TxBuffer[21] == 6U && cdc.TxBuffer[22] == 6U); complete();
+    p[8] = 2U; p[19] = 2U;
+    p[12] = (uint8_t)test_tick; p[13] = (uint8_t)(test_tick >> 8);
+    make_frame(frame, 0x11U, p, 24U); input(frame, size); service(); complete(); service();
+    assert(j3_disables == 5U); /* explicit stop retries, never reconnect itself */
+    p[8] = 3U; p[19] = 1U;
+    make_frame(frame, 0x11U, p, 24U); input(frame, size); service(); complete(); service();
+    assert(j3_enables == 3U);
+    /* A different reliable session ends the old stream; same cookie is only
+     * an ACK retry and cannot disrupt it. */
+    size = make_frame(frame, 0x12U, p, 8U);
+    input(frame, size); service(); complete();
+    assert(j3_disables == 6U);
+    ++p[0];
+    size = make_frame(frame, 0x12U, p, 8U);
+    input(frame, size); service(); complete(); service();
+    assert(j3_disables == 7U && j3_enables == 3U);
+    p[8] = 1U; p[19] = 1U;
+    size = make_frame(frame, 0x11U, p, 24U);
+    input(frame, size); service(); complete(); service();
+    assert(j3_enables == 4U);
+    const uint8_t garbage[64] = {0};
+    for (unsigned i = 0U; i < 5U; ++i) { input(garbage, 64U); }
+    service(); /* RX overflow invalidates session and ends its active stream. */
+    assert(j3_disables == 9U && j3_enables == 4U);
+    puts("USB J3 capability/dedup/continuous MIT/manual stop/expiry/DTR/busy/unknown cleanup: PASS");
+}
+
+static void usb_imu_test(void)
+{
+    uint8_t frame[31], p[24] = {21,22,23,24,25,26,27,28};
+    unsigned size = make_frame(frame, 0x12U, p, 8U);
+    input(frame, size); service(); complete();
+    const unsigned before_actions = actions, before_calls = rpc_calls;
+    p[12] = (uint8_t)test_tick; p[13] = (uint8_t)(test_tick >> 8);
+    p[16] = 1U;
+    const uint8_t permitted[][3] = {{8,0,255}, {8,0,0}, {8,0,7}, {8,0,9}, {10,0,1}, {10,0,0}};
+    for (unsigned i = 0U; i < sizeof(permitted) / sizeof(permitted[0]); ++i) {
+        ++p[8];
+        memcpy(&p[17], permitted[i], 3U);
+        size = make_frame(frame, 0x11U, p, 24U);
+        input(frame, size); service();
+        assert(cdc.TxBuffer[18] == BSP_CAN_OK);
+        complete();
+    }
+    assert(rpc_calls == before_calls + 6U && actions == before_actions);
+    /* USB sensor access does not open zero capture, joint config or other scopes. */
+    const uint8_t rejected[][3] = {{9,1,0}, {8,1,1}, {8,0,10}, {10,1,1}, {10,0,2}};
+    for (unsigned i = 0U; i < sizeof(rejected) / sizeof(rejected[0]); ++i) {
+        ++p[8];
+        memcpy(&p[17], rejected[i], 3U);
+        size = make_frame(frame, 0x11U, p, 24U);
+        input(frame, size); service();
+        assert(cdc.TxBuffer[18] == BSP_CAN_INVALID_ARG);
+        complete();
+    }
+    assert(rpc_calls == before_calls + 6U && actions == before_actions);
+    external_imu = (YummyIMU_Status_t){.rx_running = true, .sequence = 3U,
+        .received_at_ms = test_tick - 10U, .pitch_deg = 12.345f, .roll_deg = -45.5f,
+        .yaw_deg = 179.99f, .rx_bytes = 96U, .uart_error = HAL_UART_ERROR_FE};
+    const uint8_t fields[] = {255U, 1U, 0U, 1U, 2U, 3U, 6U, 9U, 10U};
+    for (unsigned i = 0U; i < sizeof(fields); ++i) {
+        ++p[8]; p[17] = 14U; p[18] = 0U; p[19] = fields[i];
+        size = make_frame(frame, 0x11U, p, 24U);
+        input(frame, size); service();
+        const uint8_t expected = i == 1U ? BSP_CAN_NOT_READY :
+            fields[i] == 10U ? BSP_CAN_INVALID_ARG : BSP_CAN_OK;
+        assert(cdc.TxBuffer[18] == expected);
+        if (i == 0U) { assert(get32(cdc.TxBuffer + 21U) == MOTOR_UART_IMU_VERSION); }
+        if (i == 2U) {
+            assert(get32(cdc.TxBuffer + 21U) == 0xB1000007UL);
+            external_imu.pitch_deg = 90.0f; /* later fields must stay frozen */
+        }
+        if (i == 3U) { assert(get32(cdc.TxBuffer + 21U) == 10U); }
+        if (i == 4U) { assert(get32(cdc.TxBuffer + 21U) == 3U); }
+        if (i == 5U) { assert(get_float(cdc.TxBuffer + 21U) == 12.345f); }
+        if (i == 6U) { assert(get32(cdc.TxBuffer + 21U) == 96U); }
+        if (i == 7U) { assert(get32(cdc.TxBuffer + 21U) == HAL_UART_ERROR_FE); }
+        complete();
+    }
+    test_tick += 1001U; /* expired frozen snapshot, fresh transport envelope */
+    p[12] = (uint8_t)test_tick; p[13] = (uint8_t)(test_tick >> 8);
+    ++p[8]; p[19] = 3U;
+    size = make_frame(frame, 0x11U, p, 24U);
+    input(frame, size); service();
+    assert(cdc.TxBuffer[18] == BSP_CAN_NOT_READY); complete();
+    assert(rpc_calls == before_calls + 6U && actions == before_actions);
+    puts("USB IMU read/session allowlist without motor/zero/config side effects: PASS");
+}
+
+static void usb_joint_reference_test(void)
+{
+    uint8_t frame[31], p[24] = {31,32,33,34,35,36,37,38};
+    unsigned size = make_frame(frame, 0x12U, p, 8U);
+    input(frame, size); service(); complete();
+    const unsigned before_actions = actions, before_calls = rpc_calls;
+    const unsigned before_enable = j3_enables, before_disable = j3_disables, before_mit = j3_mits;
+    for (unsigned i = 0U; i < 4U; ++i) { p[12U+i] = (uint8_t)(test_tick >> (8U*i)); }
+    p[16] = 1U; p[17] = 15U;
+    ++p[8]; p[19] = 255U;
+    size = make_frame(frame, 0x11U, p, 24U);
+    input(frame, size); service();
+    assert(cdc.TxBuffer[18] == BSP_CAN_OK);
+    assert(get32(cdc.TxBuffer + 21U) == MOTOR_JOINT_REFERENCE_VERSION);
+    uint8_t saved[27]; memcpy(saved, cdc.TxBuffer, sizeof(saved));
+    complete();
+    input(frame, size); service(); /* Identical reliable retry remains read-only. */
+    assert(memcmp(saved, cdc.TxBuffer, sizeof(saved)) == 0); complete();
+    for (uint8_t joint = 1U; joint <= 5U; ++joint) {
+        const MotorJointReference_Config_t *r = &g_joint_reference_config[joint - 1U];
+        const float values[] = {r->zero_rad, r->observed_lower_rad, r->observed_upper_rad};
+        p[18] = joint;
+        for (uint8_t field = 0U; field <= 3U; ++field) {
+            ++p[8]; p[19] = field;
+            size = make_frame(frame, 0x11U, p, 24U);
+            input(frame, size); service();
+            assert(cdc.TxBuffer[18] == BSP_CAN_OK);
+            if (field == 0U) { assert(get32(cdc.TxBuffer + 21U) == r->kind); }
+            else { assert(get_float(cdc.TxBuffer + 21U) == values[field - 1U]); }
+            complete();
+        }
+    }
+    const uint8_t invalid[][3] = {{1,4,0}, {6,0,0}, {0,0,0}, {2,4,0}, {0,255,1}, {1,1,1}};
+    for (unsigned i = 0U; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        ++p[8]; p[18] = invalid[i][0]; p[19] = invalid[i][1]; p[20] = invalid[i][2];
+        size = make_frame(frame, 0x11U, p, 24U);
+        input(frame, size); service();
+        assert(cdc.TxBuffer[18] == BSP_CAN_INVALID_ARG); complete();
+    }
+    assert(actions == before_actions && rpc_calls == before_calls);
+    assert(j3_enables == before_enable && j3_disables == before_disable && j3_mits == before_mit);
+    puts("USB joint references: actual configuration/read-only/retry/invalid requests PASS");
+}
+
+static void usb_j3_only_test(void)
+{
+    MotorUSB_InitJ3Only((DM_Motor_t *)&tokens[2]);
+    usb_joint_reference_test();
+    uint8_t frame[31], p[24]={41,42,43,44,45,46,47,48};
+    unsigned size=make_frame(frame,0x12U,p,8U);
+    input(frame,size);service();complete();
+    unsigned before=rpc_calls;
+    p[8]=1;p[16]=1;p[17]=7;p[19]=3;
+    size=make_frame(frame,0x11U,p,24U);
+    input(frame,size);service();
+    assert(cdc.TxBuffer[18]==BSP_CAN_INVALID_ARG && rpc_calls==before);complete();
 }
 
 int main(int argc, char **argv)
@@ -333,6 +568,10 @@ int main(int argc, char **argv)
     assert(get32(cdc.TxBuffer+4) == 7U && cdc.TxBuffer[15] == 0U);
     complete();
     usb_control_test();
+    usb_imu_test();
+    usb_joint_reference_test();
+    usb_j3_only_test();
+    usb_j3_test();
     puts("USB ownership/DTR/backpressure/disconnect/snapshot/wrap/golden: PASS");
     return 0;
 }

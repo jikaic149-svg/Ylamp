@@ -64,6 +64,7 @@ typedef struct {
 #define HAL_UART_STATE_BUSY_TX 1U
 #define HAL_UART_STATE_BUSY_RX 2U
 #define HAL_UART_ERROR_NONE 0U
+#define HAL_UART_ERROR_FE 4U
 #define HAL_UART_ERROR_ORE 8U
 #define USART_CR3_DMAR (1U << 6)
 extern UART_HandleTypeDef huart1, huart2, huart3, huart4, huart5;

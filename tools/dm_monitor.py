@@ -1,4 +1,4 @@
-"""Five-motor monitoring: native board USB CDC; explicit J1/J2 quick controls.
+"""Five-motor USB CDC monitoring; explicit J1/J2 controls and J3 MIT acquisition.
 
 Run: python dm_monitor.py
 Checks: python dm_monitor.py --self-test
@@ -25,6 +25,7 @@ import csv
 import json
 import math
 import queue
+import re
 import struct
 import sys
 import threading
@@ -47,7 +48,7 @@ LEGACY_MOTORS = frozenset({3})  # J3 5011/007: command replies only, no CC/regis
 BUS_LABELS = {2: "CAN2 · J1/J2 · 操作与监控", 1: "CAN1 · J3/J4/J5 · 仅查看"}
 LIMIT_REGISTERS = {21: "PMAX", 22: "VMAX", 23: "TMAX"}
 FRAME = struct.Struct("<IIBBBB8s")
-MAX_RECORDS = 120_000
+MAX_RECORDS = 300_000  # Ten minutes at five motors x 100 Hz; CSV has no row limit.
 COLORS = {1: "#52d6e8", 2: "#ffb35b"}
 PALETTE = (*COLORS.values(), "#a4dc83", "#c3a0ff", "#fb8faa", "#f1dd77")
 BG, PANEL, TEXT, MUTED = "#101723", "#192334", "#e8eff9", "#9aaec6"
@@ -66,6 +67,91 @@ STATES = {
     13: "通信丢失",
     14: "过载",
 }
+
+
+def joint_reference_offset(raw_rad, anchor_rad):
+    """Equivalent whole turns only; match MCU roundf (ties away from zero)."""
+    turns = (anchor_rad - raw_rad) / math.tau
+    return math.copysign(math.floor(abs(turns) + .5), turns) * math.tau
+
+
+@dataclass(frozen=True, slots=True)
+class JointReference:
+    zero_rad: float
+    raw_lower_rad: float
+    raw_upper_rad: float
+    kind: str
+    source: str
+
+    def __post_init__(self):
+        # An approved travel window need not contain the retained coordinate datum.
+        if (self.kind not in ("CANDIDATE", "MIDPOINT", "USER_APPROVED")
+                or not all(math.isfinite(v) for v in
+                           (self.zero_rad, self.raw_lower_rad, self.raw_upper_rad))
+                or not self.raw_lower_rad < self.raw_upper_rad
+                or (self.kind != "USER_APPROVED"
+                    and not self.raw_lower_rad < self.zero_rad < self.raw_upper_rad)):
+            raise ValueError("Invalid joint reference")
+        if self.kind == "MIDPOINT" and abs(
+                self.zero_rad - (self.raw_lower_rad + self.raw_upper_rad) / 2) > 1e-6:
+            raise ValueError("Joint midpoint reference mismatch")
+
+    @property
+    def lower_rad(self):
+        return self.raw_lower_rad - self.zero_rad
+
+    @property
+    def upper_rad(self):
+        return self.raw_upper_rad - self.zero_rad
+
+    def angle(self, raw_rad):
+        if not math.isfinite(raw_rad):
+            return None
+        if self.raw_upper_rad - self.raw_lower_rad < math.tau:
+            raw_rad += joint_reference_offset(
+                raw_rad, (self.raw_lower_rad + self.raw_upper_rad) / 2)
+        return raw_rad - self.zero_rad
+
+
+def load_joint_references():
+    """Same declaration as firmware; local profiles are NOT device readback."""
+    path = Path(__file__).resolve().parents[1] / "config/joint_references.def"
+    references = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(r"JOINT_REFERENCE\((.*)\)", line.strip())
+        if match:
+            joint, zero, lower, upper, kind = next(csv.reader([match[1]], skipinitialspace=True))
+            joint = int(joint)
+            if joint in references:
+                raise ValueError("Duplicate joint reference")
+            references[joint] = JointReference(
+                *map(lambda value: math.radians(float(value)), (zero, lower, upper)),
+                kind, "local_config")
+    if set(references) != {1, 2, 3, 4, 5}:
+        raise ValueError("Joint reference definitions missing or incompatible")
+    return references
+
+
+JOINT_REFERENCES = load_joint_references()
+
+
+def read_joint_references(client):
+    """USB op 15 is read-only; never substitute local values for older firmware."""
+    if client.rpc(15, field=255) != dm_tuning.JOINT_REFERENCE_VERSION:
+        raise ValueError("Joint reference protocol version mismatch")
+    references = {}
+    for joint in JOINT_REFERENCES:
+        try:
+            code = client.rpc(15, joint, 0)
+        except dm_tuning.RpcRejected as exc:
+            if joint == 1 and exc.status == 1:  # Earlier op 15 allowed J2–J5 only.
+                continue
+            raise
+        kind = {1: "CANDIDATE", 2: "MIDPOINT", 3: "USER_APPROVED"}[code]
+        references[joint] = JointReference(
+            *(client.rpc(15, joint, field, floating=True) for field in (1, 2, 3)),
+            kind, "MCU")
+    return references
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,10 +191,22 @@ class Sample:
     command_raw: bytes = b""
     can_bus: int | None = None
     limits_source: str | None = None
+    joint_reference: JointReference | None = None
 
     @property
     def position_deg(self):
         return math.degrees(self.position_rad)
+
+    @property
+    def joint_angle_rad(self):
+        if self.joint_reference is None or not math.isfinite(self.position_rad):
+            return None
+        return self.joint_reference.angle(self.position_rad)
+
+    @property
+    def joint_angle_deg(self):
+        angle = self.joint_angle_rad
+        return None if angle is None else math.degrees(angle)
 
 
 def joint_color(motor):
@@ -154,7 +252,8 @@ def decode_sample(can_id, data, limits, elapsed_s, unix_s):
                   pos * (2 * pmax) / 65535 - pmax,
                   vel * (2 * vmax) / 4095 - vmax,
                   torque * (2 * tmax) / 4095 - tmax,
-                  data[6], data[7], data[0] >> 4, bytes(data))
+                  data[6], data[7], data[0] >> 4, bytes(data),
+                  joint_reference=JOINT_REFERENCES.get(motor))
 
 
 def decode_mit(data, limits):
@@ -317,9 +416,7 @@ class Reader(threading.Thread):
             values = values["values"]
             anchor = (self.references[motor] if sample.state == 1 and motor in self.references
                       else math.radians((values[f"{motor}.1"] + values[f"{motor}.2"]) / 2))
-            turns = (anchor - sample.position_rad) / math.tau
-            # Same nearest-turn convention as MCU roundf (ties away from zero).
-            offset = math.copysign(math.floor(abs(turns) + .5), turns) * math.tau
+            offset = joint_reference_offset(sample.position_rad, anchor)
             reference = sample.position_rad + offset
             self.references[motor], self.offsets[motor] = reference, offset
         fields = dict(can_id=motor, feedback_id=can_id, reference=reference,
@@ -687,7 +784,8 @@ class SerialReader(threading.Thread):
                             kp=joint["kp"], kd=joint["kd"], ff=joint["ff"],
                             task_state=status["state"], task_reason=status["reason"],
                             mode=status["mode"], phase=status["phase"],
-                            source="UART", reference_source="MCU")
+                            source="UART", reference_source="MCU",
+                            joint_reference=JOINT_REFERENCES.get(motor))
             self.counts[motor] += 1
             if age_s > 0.5:
                 self.arrivals[motor].clear()
@@ -765,6 +863,7 @@ class USBReader(threading.Thread):
         self.direct = False
         self.tuning = dm_tuning.Client(self.send_tuning, events, self.stop_requested)
         self.tuning.poll_details = False
+        self.tuning.poll_imu = True
         self.dev = None
         self.reliable = dm_serial.ReliableRPC(self.write_serial, self.stop_requested)
         self.parser, self.collector = usb_monitor.Stream(), usb_monitor.Collector()
@@ -775,6 +874,7 @@ class USBReader(threading.Thread):
         self.bytes_received = self.snapshots = 0
         self.started_at = time.perf_counter()
         self.identity = None
+        self.joint_references = {}
 
     write_serial = SerialReader.write_serial
     send_tuning = SerialReader.send_tuning
@@ -790,6 +890,25 @@ class USBReader(threading.Thread):
                 raise RuntimeError("USB控制协议版本不匹配")
             self.tuning.capture_supported = self.tuning.rpc(12, field=255) == dm_tuning.MOTION_VERSION
             self.tuning.motion_supported = self.tuning.capture_supported
+            try:
+                self.tuning.j3_feedback_supported = (
+                    self.tuning.rpc(13, scope=3, field=255) == dm_tuning.J3_FEEDBACK_VERSION)
+            except Exception:
+                self.tuning.j3_feedback_supported = False  # older firmware: no bare enable fallback
+            try:
+                self.tuning.calibration_supported = (
+                    self.tuning.rpc(8, field=255) == dm_tuning.CALIBRATION_VERSION)
+            except Exception:
+                self.tuning.calibration_supported = False  # older USB allowlist: monitor only
+            try:
+                self.tuning.uart_imu_supported = (
+                    self.tuning.rpc(14, field=255) == dm_tuning.UART_IMU_VERSION)
+            except Exception:
+                self.tuning.uart_imu_supported = False
+            try:
+                self.joint_references = read_joint_references(self.tuning)
+            except Exception:
+                self.joint_references = {}  # Old/invalid firmware: raw angles only.
             self.tuning.supported = self.tuning.online = True
             self.events.put(("tuning_supported", True))
             while not self.stop_requested.is_set():
@@ -831,7 +950,8 @@ class USBReader(threading.Thread):
                             can_id=joint["command_id"], feedback_id=joint["feedback_id"],
                             tick_ms=snapshot["tick_ms"], feedback_ms=joint["received_tick_ms"],
                             sequence=snapshot["sequence"], source="USB",
-                            can_bus=joint["bus"], limits_source="MCU decoded; no motor register read")
+                            can_bus=joint["bus"], limits_source="MCU decoded; no motor register read",
+                            joint_reference=self.joint_references.get(motor))
             self.counts[motor] += 1
             if joint["fresh"]:
                 self.arrivals[motor].append(now)
@@ -947,27 +1067,156 @@ CSV_FIELDS = ("time_utc", "elapsed_s", "motor_can_id", "feedback_can_id",
               "target_reference_rad", "tracking_error_rad", "kp", "kd", "torque_ff_nm",
               "task_state", "task_reason", "mode", "phase", "raw_hex",
               "data_source", "reference_source", "command_elapsed_s", "command_age_ms",
-              "status_age_ms", "command_raw_hex", "can_bus", "limits_source")
+              "status_age_ms", "command_raw_hex", "can_bus", "limits_source",
+              "joint_angle_rad", "joint_angle_deg", "joint_zero_rad",
+              "joint_observed_lower_rad", "joint_observed_upper_rad",
+              "joint_reference_kind", "joint_reference_source")
+
+
+def csv_row(s):
+    ref = s.joint_reference
+    return (
+        datetime.fromtimestamp(s.unix_s, timezone.utc).isoformat(timespec="milliseconds"),
+        f"{s.elapsed_s:.6f}", f"0x{(s.can_id if s.can_id is not None else s.motor):02X}",
+        (f"0x{s.feedback_id:02X}" if s.feedback_id is not None
+         else f"0x{MOTORS[s.motor]:02X}" if s.motor in MOTORS else ""),
+        f"{s.position_rad:.8f}", f"{s.position_deg:.6f}", f"{s.velocity_rad_s:.8f}",
+        f"{s.torque_nm:.8f}", s.mos_c, s.rotor_c, s.state, s.motor,
+        s.tick_ms, s.feedback_ms, s.sequence, s.reference, s.target,
+        s.target_velocity, s.target_reference, s.tracking_error, s.kp, s.kd, s.ff,
+        s.task_state, s.task_reason, s.mode, s.phase, s.raw.hex(" ").upper(),
+        s.source, s.reference_source, s.command_elapsed_s, s.command_age_ms,
+        s.status_age_ms, s.command_raw.hex(" ").upper(),
+        f"CAN{s.can_bus}" if s.can_bus is not None else "", s.limits_source,
+        s.joint_angle_rad, s.joint_angle_deg,
+        ref.zero_rad if ref else None, ref.lower_rad if ref else None,
+        ref.upper_rad if ref else None, ref.kind if ref else None, ref.source if ref else None)
 
 
 def write_csv(path, records):
     with open(path, "w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.writer(stream)
         writer.writerow(CSV_FIELDS)
-        for s in records:
-            writer.writerow((
-                datetime.fromtimestamp(s.unix_s, timezone.utc).isoformat(timespec="milliseconds"),
-                f"{s.elapsed_s:.6f}", f"0x{(s.can_id if s.can_id is not None else s.motor):02X}",
-                (f"0x{s.feedback_id:02X}" if s.feedback_id is not None
-                 else f"0x{MOTORS[s.motor]:02X}" if s.motor in MOTORS else ""),
-                f"{s.position_rad:.8f}", f"{s.position_deg:.6f}", f"{s.velocity_rad_s:.8f}",
-                f"{s.torque_nm:.8f}", s.mos_c, s.rotor_c, s.state, s.motor,
-                s.tick_ms, s.feedback_ms, s.sequence, s.reference, s.target,
-                s.target_velocity, s.target_reference, s.tracking_error, s.kp, s.kd, s.ff,
-                s.task_state, s.task_reason, s.mode, s.phase, s.raw.hex(" ").upper(),
-                s.source, s.reference_source, s.command_elapsed_s, s.command_age_ms,
-                s.status_age_ms, s.command_raw.hex(" ").upper(),
-                f"CAN{s.can_bus}" if s.can_bus is not None else "", s.limits_source))
+        writer.writerows(csv_row(s) for s in records)
+
+
+class CSVRecorder:
+    """One RX producer, one disk thread; never block RX on disk or silently drop."""
+    def __init__(self, capacity=8192):
+        self.capacity = capacity
+        self.lock = threading.Lock()
+        self.thread = None
+        self.accepting = False
+        self.path = None
+        self.written = self.accepted = 0
+        self.error = ""
+        self.first_sample_s = self.last_sample_s = None
+        self.joint_counts = {}
+
+    def running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self, path):
+        if self.running():
+            raise RuntimeError("上一份记录尚未收尾")
+        # Open before publishing the session; no filesystem operation holds the RX lock.
+        try:
+            stream = open(path, "x", newline="", encoding="utf-8-sig")
+        except Exception as exc:
+            self.path, self.error = Path(path), f"无法开始记录：{exc}"
+            self.written = self.accepted = 0
+            self.first_sample_s = self.last_sample_s = None
+            self.joint_counts = {}
+            raise
+        with self.lock:
+            self.pending = queue.Queue(maxsize=self.capacity)
+            self.stopping = threading.Event()
+            self.path, self.error = Path(path), ""
+            self.written = self.accepted = 0
+            self.first_sample_s = self.last_sample_s = None
+            self.joint_counts = {}
+            self.accepting = True
+        self.thread = threading.Thread(target=self.run, args=(stream,),
+                                       name="csv-recording", daemon=False)
+        try:
+            self.thread.start()
+        except Exception as exc:
+            self.stop()
+            self.error = f"记录线程未启动：{exc}"
+            stream.close()
+            raise
+
+    def start_desktop(self):
+        self.start(Path.home() / "Desktop" /
+                   datetime.now().strftime("dm_session_%Y%m%d_%H%M%S_%f.csv"))
+
+    @property
+    def duration_s(self):
+        with self.lock:
+            if self.first_sample_s is None:
+                return 0.
+            return self.last_sample_s - self.first_sample_s
+
+    def submit(self, sample):
+        with self.lock:
+            if not self.accepting:
+                return
+            try:
+                self.pending.put_nowait(sample)
+                self.accepted += 1
+            except queue.Full:
+                self.error = "写盘队列已满：记录不完整，已停止接收；请另开文件"
+                self.accepting = False
+                self.stopping.set()
+
+    def stop(self):
+        with self.lock:
+            self.accepting = False
+            if self.thread is not None:
+                self.stopping.set()
+
+    def run(self, stream):
+        try:
+            with stream:
+                writer = csv.writer(stream)
+                writer.writerow(CSV_FIELDS)
+                flushed_at = time.perf_counter()
+                while not self.stopping.is_set() or not self.pending.empty():
+                    try:
+                        sample = self.pending.get(timeout=.1)
+                    except queue.Empty:
+                        sample = None
+                    if sample is not None:
+                        writer.writerow(csv_row(sample))
+                        with self.lock:
+                            self.written += 1
+                            if self.first_sample_s is None:
+                                self.first_sample_s = self.last_sample_s = sample.elapsed_s
+                            else:
+                                self.first_sample_s = min(self.first_sample_s, sample.elapsed_s)
+                                self.last_sample_s = max(self.last_sample_s, sample.elapsed_s)
+                            self.joint_counts[sample.motor] = self.joint_counts.get(sample.motor, 0) + 1
+                    if time.perf_counter() - flushed_at >= 1:
+                        stream.flush()
+                        flushed_at = time.perf_counter()
+                stream.flush()
+        except Exception as exc:
+            with self.lock:
+                self.error = f"写盘失败，记录不完整：{exc}"
+        finally:
+            with self.lock:
+                self.accepting = False
+
+
+class RecordingQueue(queue.Queue):
+    """Record before the bounded UI queue; UI loss must not become CSV loss."""
+    def __init__(self, recorder, maxsize=8192):
+        super().__init__(maxsize=maxsize)
+        self.recorder = recorder
+
+    def put_nowait(self, sample):
+        self.recorder.submit(sample)
+        super().put_nowait(sample)
 
 
 class Monitor:
@@ -981,7 +1230,8 @@ class Monitor:
         self.can_bus = can_bus
         self.plot_font = tkfont.Font(root=root, family="Consolas", size=9)
         self.origin = time.perf_counter()
-        self.samples, self.events = queue.Queue(maxsize=8192), queue.SimpleQueue()
+        self.recorder = CSVRecorder()
+        self.samples, self.events = RecordingQueue(self.recorder), queue.SimpleQueue()
         self.records = deque(maxlen=MAX_RECORDS)
         self.history = {m: deque() for m in MOTORS}
         self.latest, self.limits, self.stats = {}, {}, {}
@@ -994,6 +1244,12 @@ class Monitor:
         self.tuning_panel = None
         self.tuning_snapshot = None
         self.quick_busy = False
+        self.j3_busy = False
+        self.imu_busy = False
+        self.imu_snapshot = None
+        self.imu_error = ""
+        self.uart_imu_snapshot = None
+        self.uart_imu_error = ""
         self.detail_widgets = []
         self.show_details = tk.BooleanVar(value=False)
         self.received = 0
@@ -1031,7 +1287,7 @@ class Monitor:
         title = ttk.Frame(outer)
         title.pack(fill="x")
         ttk.Label(title, text="Ylamp / 电机控制台", font=("Microsoft YaHei UI", 21, "bold")).pack(side="left")
-        ttk.Label(title, text="板载 USB CDC · 五电机遥测 · J1/J2 简单控制" if usb else
+        ttk.Label(title, text="板载 USB CDC · 五电机遥测 · J1/J2控制 / J3采集" if usb else
                   "USB-CAN · Classic CAN 1 Mbps" if can
                   else f"USART1 {dm_serial.BAUDRATE} · MCU→电机 CAN",
                   style="Muted.TLabel").pack(side="right")
@@ -1058,10 +1314,14 @@ class Monitor:
         self.connect_button.pack(side="left", padx=3)
         self.disconnect_button = ttk.Button(toolbar, text="断开", command=self.disconnect, state="disabled")
         self.disconnect_button.pack(side="left", padx=3)
-        self.export_button = ttk.Button(toolbar, text="导出记录", command=self.export)
+        self.export_button = ttk.Button(toolbar, text="导出缓存", command=self.export)
         self.export_button.pack(side="right")
         self.tuning_button = ttk.Button(toolbar, text="高级设置…", command=self.open_tuning)
         self.tuning_button.pack(side="right", padx=8)
+        self.record_button = ttk.Button(toolbar, text="开始记录 CSV",
+                                        command=self.toggle_recording)
+        self.record_button.pack(side="right", padx=(0, 3))
+        self.record_var = tk.StringVar(value="连接后自动保存到桌面；持续记录不设5分钟截断，不会使能电机。")
         controls = ttk.Frame(outer)
         controls.pack(fill="x", pady=(10, 6))
         ttk.Label(controls, text="J1 / J2：").pack(side="left")
@@ -1076,11 +1336,52 @@ class Monitor:
         self.release_button.pack(side="left", padx=3)
         ttk.Checkbutton(controls, text="诊断详情", variable=self.show_details,
                         command=self.toggle_details).pack(side="right")
+        ttk.Button(controls, text="IMU读数…", command=self.open_imu).pack(side="right", padx=8)
         ttk.Label(controls, text="曲线 / 秒").pack(side="left", padx=(15, 5))
         self.span_var = tk.StringVar(value="10")
         ttk.Combobox(controls, textvariable=self.span_var, values=("5", "10", "30", "60"),
                      width=4, state="readonly").pack(side="left")
-        ttk.Label(outer, text="锁定会出力保持，推开后会回拉；释放力矩会失去支撑，请托住负载。断开连接不会停机。",
+        if usb:
+            j3_controls = ttk.Frame(outer)
+            j3_controls.pack(fill="x", pady=(0, 6))
+            ttk.Label(j3_controls, text="J3：").pack(side="left")
+            self.j3_start_button = ttk.Button(j3_controls, text="开始采集（使能）",
+                command=lambda: self.j3_command(True), state="disabled")
+            self.j3_start_button.pack(side="left", padx=3)
+            self.j3_stop_button = ttk.Button(j3_controls, text="停止采集（失能）",
+                command=lambda: self.j3_command(False), state="disabled")
+            self.j3_stop_button.pack(side="left", padx=3)
+            self.j3_var = tk.StringVar(value="等待配套固件；连接不自动采集")
+            ttk.Label(j3_controls, textvariable=self.j3_var).pack(side="left", padx=8)
+        # Separate sensor window keeps the motor charts usable on 780px screens.
+        self.imu_window = tk.Toplevel(root)
+        self.imu_window.withdraw()
+        self.imu_window.title("Ylamp · 板载 BMI088 / UART10 YummyIMU")
+        self.imu_window.geometry(f"{min(width, 1120)}x280")
+        self.imu_window.protocol("WM_DELETE_WINDOW", self.imu_window.withdraw)
+        imu_panel = ttk.Frame(self.imu_window, padding=18)
+        imu_panel.pack(fill="both", expand=True)
+        imu_row = ttk.Frame(imu_panel)
+        imu_row.pack(fill="x", pady=(0, 6))
+        self.imu_start_button = ttk.Button(imu_row, text="开启板载 BMI088",
+                                           command=lambda: self.imu_command(True), state="disabled")
+        self.imu_start_button.pack(side="left")
+        self.imu_stop_button = ttk.Button(imu_row, text="关闭 IMU",
+                                          command=lambda: self.imu_command(False), state="disabled")
+        self.imu_stop_button.pack(side="left", padx=6)
+        self.imu_var = tk.StringVar(value="板载 BMI088 未连接；默认休眠，不参与电机控制。")
+        ttk.Label(imu_row, textvariable=self.imu_var, style="Muted.TLabel").pack(side="left", padx=4)
+        self.imu_values = tk.StringVar(value="板载 ω XYZ（°/s）：— / — / —")
+        ttk.Label(imu_panel, textvariable=self.imu_values, wraplength=min(width, 1120) - 50).pack(
+            anchor="w", pady=(0, 12))
+        self.uart_imu_var = tk.StringVar(value="外接 YummyIMU / UART10：未连接")
+        ttk.Label(imu_panel, textvariable=self.uart_imu_var, wraplength=min(width, 1120) - 50).pack(
+            anchor="w", pady=(0, 12))
+        ttk.Label(imu_panel, text="只读取传感器，不标零、不使能电机；关闭窗口不等于关闭板载采样。",
+                  style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(outer, text=("J1/J2锁定会回拉、释放会失去支撑，断开不会停机；"
+                  "J3采集不保持位置，停止/断开USB尝试失能J3。" if usb else
+                  "锁定会出力保持，推开后会回拉；释放力矩会失去支撑，请托住负载。断开连接不会停机。"),
                   style="Muted.TLabel").pack(anchor="w", pady=(0, 6))
         self.status_var = tk.StringVar(value="未连接；选择开发板原生 USB CDC 串口。" if usb else
                                        "未连接；先选总线，再点连接。" if can
@@ -1088,7 +1389,7 @@ class Monitor:
         self.status_label = ttk.Label(outer, textvariable=self.status_var, foreground=COLORS[1],
                                       wraplength=width - 50)
         self.status_label.pack(anchor="w", pady=(0, 10))
-        self.task_var = tk.StringVar(value="J1/J2 状态：未连接；J3～J5 仅查看反馈。")
+        self.task_var = tk.StringVar(value="J1/J2 状态：未连接；J3手动采集，J4/J5仅查看。")
         ttk.Label(outer, textvariable=self.task_var).pack(anchor="w", pady=(0, 6))
         self.diagnostics = ttk.Frame(outer)
         self.serial_var = tk.StringVar(value="MCU 状态：未连接")
@@ -1108,7 +1409,7 @@ class Monitor:
             charts.rowconfigure(n, weight=1)
         self.canvases = []
         for i, (heading, unit) in enumerate((
-                ("反馈位置", "°"), ("速度", "rad/s"), ("估算力矩 · 非外部力传感器", "N·m"),
+                ("原始编码器角度", "°"), ("速度", "rad/s"), ("估算力矩 · 非外部力传感器", "N·m"),
                 ("温度 · 实线 MOS / 虚线绕组", "°C"))):
             canvas = tk.Canvas(charts, background=PANEL, highlightthickness=0, height=200)
             canvas.grid(row=i // 2, column=i % 2, sticky="nsew", padx=(0, 8) if i % 2 == 0 else (0, 0),
@@ -1117,8 +1418,12 @@ class Monitor:
         self.count_var = tk.StringVar(value="尚无数据")
         ttk.Label(self.diagnostics, textvariable=self.count_var, style="Muted.TLabel",
                   wraplength=width - 50).pack(anchor="w")
-        self.buffer_var = tk.StringVar(value="内存最多保留 120,000 条；超出覆盖最旧数据。CSV 仅导出当前保留数据。")
+        self.buffer_var = tk.StringVar(
+            value=f"内存保留 {MAX_RECORDS:,} 条（五电机100Hz约10分钟）；自动CSV不受缓存覆盖影响。")
         ttk.Label(outer, textvariable=self.buffer_var, style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+        self.record_label = ttk.Label(outer, textvariable=self.record_var,
+                                     style="Muted.TLabel", wraplength=width - 50)
+        self.record_label.pack(anchor="w")
         self.last_plot = 0
         for key in ("F5", "F6"):
             root.bind(f"<KeyPress-{key}>", self.hotkey)
@@ -1139,7 +1444,7 @@ class Monitor:
         self.bus_hint.set(
             ("适配器接 CAN2 H/L；J1/J2 配 VCC_OUT1 / PC13。" if self.can_bus == 2 else
              "适配器接 CAN1 H/L；J3～J5 配 VCC_OUT0 / PC14；ID、量程待核对。")
-            if self.is_can else "板载 USB：汇总 CAN1/2；仅 J1/J2 原位锁定、保持、释放，连接不自动动作。"
+            if self.is_can else "板载 USB：汇总 CAN1/2；J1/J2控制、J3手动100Hz采集，连接不自动动作。"
             if self.is_usb else "USART1 备用链路；当前固件只回传 J1/J2。")
         self.tuning_button.configure(
             state="normal" if not self.is_usb and (not self.is_can or self.can_bus == 2) else "disabled")
@@ -1173,6 +1478,104 @@ class Monitor:
         self.capture_button.configure(state="normal" if allowed else "disabled")
         for button in (self.hold_button, self.release_button):
             button.configure(state="normal" if connected else "disabled")
+        if self.is_usb:
+            supported = bool(connected and client.j3_feedback_supported)
+            status = client.j3_feedback_status if supported else None
+            fresh = bool(supported and client.online and status is not None and
+                         time.perf_counter() - client.j3_feedback_at < 1.5)
+            start = fresh and status[0] == 0 and not self.j3_busy
+            self.j3_start_button.configure(state="normal" if start else "disabled")
+            self.j3_stop_button.configure(state="normal" if supported else "disabled")
+            self.j3_var.set(
+                f"MCU：{dm_tuning.J3_FEEDBACK_PHASES[status[0]]} · "
+                f"{dm_tuning.J3_FEEDBACK_REASONS[status[1]]}" if fresh else
+                "采集状态未知；不据此认定已失能" if supported else "配套J3采集功能尚不可用")
+        self.update_imu()
+
+    def update_imu(self):
+        connected = self.control_connected()
+        client = self.worker.tuning if connected else None
+        supported = bool(connected and client.calibration_supported)
+        snapshot = self.imu_snapshot
+        fresh = bool(supported and snapshot and time.perf_counter() - snapshot["at"] < 1.5)
+        flags = snapshot["flags"] if fresh else 0
+        idle = bool(supported and client.online and client.task_status and
+                    time.perf_counter() - client.task_status_at < 1.5 and client.task_status[0] in (0, 5))
+        self.imu_start_button.configure(
+            state="normal" if idle and fresh and not flags & 112 and not self.imu_busy else "disabled")
+        self.imu_stop_button.configure(state="normal" if supported and not self.imu_busy else "disabled")
+        state = ("休眠未确认/不可用" if flags & 64 else "关闭中" if flags & 32 else
+                 "采样中（显示约 2Hz）" if flags & 16 else "休眠")
+        self.imu_var.set("板载 BMI088：" + (
+            "操作未确认：" + self.imu_error if self.imu_error else state if fresh else
+            "状态过期/未知" if supported else
+            "当前固件/链路不支持读数" if connected else "未连接，默认休眠"))
+        live = fresh and flags & 17 == 17 and not flags & 96
+        if live:
+            def shown(value):
+                return f"{value:+.3f}" if math.isfinite(value) else "—"
+            roll, pitch, _ = dm_tuning.gravity_angles(snapshot["accel"])
+            self.imu_values.set(
+                f"板载 ω XYZ（°/s）：{' / '.join(shown(x) for x in snapshot['gyro'])}    "
+                f"a XYZ（m/s²）：{' / '.join(shown(x) for x in snapshot['accel'])}    "
+                f"重力倾角 Roll / Pitch（°）：{shown(roll)} / {shown(pitch)}")
+        else:
+            self.imu_values.set("板载 ω XYZ（°/s）：— / — / —    a XYZ（m/s²）：— / — / —")
+        external = self.uart_imu_snapshot
+        ext_supported = bool(connected and client.uart_imu_supported)
+        ext_fresh = bool(ext_supported and external and
+                         time.perf_counter() - external["at"] < 1.5)
+        prefix = "外接 YummyIMU / UART10："
+        if self.uart_imu_error:
+            text = "读取未确认：" + self.uart_imu_error
+        elif not ext_supported:
+            text = "当前固件/链路不支持" if connected else "未连接"
+        elif not ext_fresh:
+            text = "状态过期/未知；Pitch / Roll / Yaw（°）：— / — / —"
+        else:
+            flags = external["flags"]
+            text = ("RX 已停止/续接失败" if not flags & 1 else "等待模块输出（921600/USE）"
+                    if not flags & 2 else f"读数过期（{external['age_ms']}ms）" if not flags & 4 else
+                    "Pitch / Roll / Yaw（°）：" +
+                    " / ".join(f"{v:+.3f}" for v in external["angles"]))
+            text += (f" · 帧 {external['count']} · RX {external['rx_bytes']} B"
+                     f" · 坏帧 {external['bad_frames']} · 溢出 {external['overflows']}"
+                     f" · UART历史错误 0x{external['uart_error']:X}（界面约2Hz）")
+        self.uart_imu_var.set(prefix + text)
+
+    def open_imu(self):
+        self.imu_window.deiconify()
+        self.imu_window.lift()
+
+    def imu_command(self, enabled):
+        self.update_imu()
+        button = self.imu_start_button if enabled else self.imu_stop_button
+        if str(button["state"]) == "disabled":
+            return
+        reason = self.worker.tuning.request("imu", enabled)
+        if reason:
+            self.status_var.set(reason)
+            return
+        self.imu_busy, self.imu_error = True, ""
+        self.status_var.set("IMU 请求已排队；只改变传感器采样，不标零、不使能电机。")
+        self.update_imu()
+
+    def j3_command(self, enabled):
+        if not self.is_usb or not self.control_connected():
+            self.status_var.set("请先连接配套板载USB固件。")
+            return
+        self.update_quick_buttons()
+        button = self.j3_start_button if enabled else self.j3_stop_button
+        if str(button["state"]) == "disabled":
+            self.status_var.set("J3采集状态尚不允许此操作；等待新状态，或先停止采集。")
+            return
+        reason = self.worker.tuning.request("j3_feedback", enabled)
+        if reason:
+            self.status_var.set(reason)
+            return
+        self.j3_busy = True
+        self.status_var.set("J3请求已排队；使能/失能是否完成以新反馈和采集阶段为准。")
+        self.update_quick_buttons()
 
     def quick_command(self, action):
         if not self.control_connected():
@@ -1293,6 +1696,17 @@ class Monitor:
                                  "请先插入并选择 USB-CAN。" if self.is_can
                                  else "请先插入并选择 USART1 的 USB-TTL 串口。", parent=self.root)
             return
+        if self.recorder.running() and not self.recorder.accepting:
+            messagebox.showinfo("记录收尾中", "上一份记录尚在保存，请稍后连接。", parent=self.root)
+            return
+        if not self.recorder.running():
+            try:
+                self.recorder.start_desktop()
+            except Exception as exc:
+                messagebox.showerror(
+                    "桌面自动记录失败",
+                    f"监控仍可连接，但数据尚未自动保存；请用“开始记录 CSV”另选可写位置。\n{exc}",
+                    parent=self.root)
         self.error_text = ""
         self.pressed_keys.clear()
         self.latest, self.limits, self.stats = {}, {}, {}
@@ -1300,6 +1714,9 @@ class Monitor:
         self.usb_status = None
         self.tuning_snapshot = None
         self.quick_busy = False
+        self.j3_busy = False
+        self.imu_busy, self.imu_snapshot, self.imu_error = False, None, ""
+        self.uart_imu_snapshot, self.uart_imu_error = None, ""
         if self.tuning_panel:
             self.tuning_panel.snapshot = None
             self.tuning_panel.calibration = None
@@ -1325,11 +1742,29 @@ class Monitor:
         self.worker.start()
 
     def disconnect(self):
+        self.recorder.stop()
         if self.worker is not None:
             self.worker.stop_requested.set()
             self.disconnect_button.configure(state="disabled")
             self.update_quick_buttons()
-            self.status_var.set("正在关闭监控连接；不改变电机状态……")
+            self.status_var.set("正在关闭USB；固件会尝试停止J3采集，J1/J2状态不变……" if self.is_usb else
+                                "正在关闭监控连接；不改变电机状态……")
+
+    def toggle_recording(self):
+        from tkinter import filedialog, messagebox
+        if self.recorder.running():
+            self.recorder.stop()
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="新建持续记录（不覆盖已有文件）", defaultextension=".csv",
+            filetypes=[("CSV 数据", "*.csv")],
+            initialdir=str(Path.home() / "Desktop"),
+            initialfile=datetime.now().strftime("dm_session_%Y%m%d_%H%M%S.csv"))
+        if path:
+            try:
+                self.recorder.start(path)
+            except Exception as exc:
+                messagebox.showerror("开始记录失败", f"请使用新的文件名。\n{exc}", parent=self.root)
 
     def export(self):
         from tkinter import filedialog, messagebox
@@ -1341,6 +1776,9 @@ class Monitor:
             filetypes=[("CSV 数据", "*.csv")],
             initialfile=datetime.now().strftime("dm_motors_%Y%m%d_%H%M%S.csv"))
         if not path:
+            return
+        if self.recorder.running() and Path(path).resolve() == self.recorder.path.resolve():
+            messagebox.showerror("导出", "不能覆盖正在写入的持续记录，请另选文件。", parent=self.root)
             return
         snapshot = tuple(self.records)
         self.exporting = True
@@ -1369,9 +1807,24 @@ class Monitor:
                                   else "MCU 配置回读，非电机寄存器")
                         self.card_vars[m]["limits"].set(
                             f"{source}：P ±{p:g} / V ±{v:g} / T ±{t:g}（非安全限位）")
+            elif kind == "uart_imu_status":
+                self.uart_imu_snapshot, self.uart_imu_error = value, ""
+            elif kind == "uart_imu_error":
+                self.uart_imu_snapshot, self.uart_imu_error = None, value
             elif kind in ("tuning_readback", "tuning_applied", "tuning_error", "task_status", "task_ack",
                           "tuning_supported", "calibration_status", "calibration_ack", "calibration_error",
-                          "drag_status", "drag_error", "motion_status", "motion_ack", "motion_error"):
+                          "drag_status", "drag_error", "motion_status", "motion_ack", "motion_error",
+                          "j3_feedback_status", "j3_feedback_ack", "j3_feedback_error"):
+                if kind == "calibration_status":
+                    self.imu_snapshot, self.imu_error = value, ""
+                elif kind in ("calibration_ack", "calibration_error"):
+                    self.imu_busy = False
+                    if kind == "calibration_error":
+                        self.imu_snapshot, self.imu_error = None, value
+                if kind in ("j3_feedback_ack", "j3_feedback_error"):
+                    self.j3_busy = False
+                    self.status_var.set(f"J3操作未确认：{value}" if kind.endswith("error") else
+                                        "J3请求已接受；等待新反馈确认，不代表已经完成。")
                 if kind in ("tuning_readback", "tuning_applied"):
                     self.tuning_snapshot = value
                 elif kind == "task_status" and self.tuning_snapshot and self.tuning_snapshot["revision"] != value[4]:
@@ -1388,7 +1841,7 @@ class Monitor:
                     self.tuning_panel.event(kind, value)
             elif kind == "connected":
                 self.status_var.set(
-                    "板载USB遥测已连接；控制握手后可手动锁定、保持、释放 J1/J2，不自动动作。" if self.is_usb else
+                    "USB已连接；J1/J2控制、J3开始/停止采集均须手动操作。" if self.is_usb else
                     ("CAN2 已连接：查看 J1/J2；可手动锁定、保持或释放力矩。"
                      if self.can_bus == 2 else
                      "CAN1 仅监听：J3旧协议随命令回包，空闲无连续反馈；解码量程为配置值。") if self.is_can
@@ -1407,26 +1860,34 @@ class Monitor:
                 self.status_var.set(value)
             elif kind == "error":
                 self.quick_busy = False
+                self.j3_busy = False
                 self.error_text = value
                 self.status_var.set(value)
                 self.status_label.configure(foreground="#ff7b87")
                 for variables in self.card_vars.values():
-                    variables["control"].set("通信失败；电机实际状态未确认，不会自动重发或失能")
+                    variables["control"].set("通信失败；电机状态未确认，J3采集将尝试失能" if self.is_usb else
+                                             "通信失败；电机实际状态未确认，不会自动重发或失能")
             elif kind == "stopped":
                 if self.worker is not None and self.worker.is_alive():
                     self.events.put((kind, value))
                     break
+                self.recorder.stop()
                 self.worker = None
                 self.quick_busy = False
+                self.j3_busy = False
                 self.adapter_box.configure(state="readonly")
                 self.bus_box.configure(state="readonly")
                 self.refresh_button.configure(state="normal")
                 self.connect_button.configure(state="normal")
                 self.disconnect_button.configure(state="disabled")
                 for variables in self.card_vars.values():
-                    variables["control"].set("已断开；未确认状态仅供参考，断开不会自动失能")
+                    variables["control"].set("已断开；J3采集尝试失能，未确认前不能视为已停机"
+                                             if self.is_usb and variables is self.card_vars.get(3) else
+                                             "已断开；未确认状态仅供参考，断开不会自动失能")
                 if not self.error_text:
-                    self.status_var.set("监控已断开；曲线与数据保留，未改变 MCU 或电机状态。")
+                    self.status_var.set("USB已断开；J3采集结束/失能尚需复核，J1/J2状态不变。"
+                                        if self.is_usb else
+                                        "监控已断开；曲线与数据保留，未改变 MCU 或电机状态。")
             elif kind in ("export", "export_error"):
                 self.exporting = False
                 self.export_button.configure(state="normal")
@@ -1474,7 +1935,9 @@ class Monitor:
                     "旧协议：等待命令回包，不支持独立查询"
                     if (self.is_can or self.is_usb) and motor in LEGACY_MOTORS else "状态：未收到本次连接反馈")
                 variables["raw"].set("RAW —")
-                variables["control"].set("USB反馈未知 · 控制应答不代表已执行" if self.is_usb else
+                variables["control"].set("点击“开始采集”使能J3；不保持位置"
+                                         if self.is_usb and motor == 3 else
+                                         "USB反馈未知 · 控制应答不代表已执行" if self.is_usb else
                                          "仅查看 · 量程未核对" if self.is_can and self.can_bus == 1
                                          else "不会自动启动")
                 continue
@@ -1482,7 +1945,12 @@ class Monitor:
             max_age_s = self.usb_status[0]["max_age_ms"] / 1000 if self.is_usb and self.usb_status else .5
             stale = age > max_age_s or self.worker is None
             rate = self.stats.get("hz", {}).get(motor, 0) if not stale else 0
-            variables["position"].set(f"{sample.position_deg:+.3f}°   {sample.position_rad:+.5f} rad")
+            ref = sample.joint_reference
+            angle = sample.joint_angle_deg
+            variables["position"].set(
+                f"{'候选关节' if ref.kind == 'CANDIDATE' else '关节'} {angle:+.3f}°\n"
+                f"原始 {sample.position_deg:+.3f}°" if ref and angle is not None else
+                f"原始 {sample.position_deg:+.3f}°\n{sample.position_rad:+.5f} rad")
             variables["motion"].set(f"速度 {sample.velocity_rad_s:+.4f} rad/s    估算力矩 {sample.torque_nm:+.4f} N·m")
             variables["temperature"].set(f"MOS {sample.mos_c}°C    绕组 {sample.rotor_c}°C    上位机采样 {rate} Hz")
             state = STATES.get(sample.state, f"未知 0x{sample.state:X}")
@@ -1492,6 +1960,15 @@ class Monitor:
                 foreground="#ff7b87" if sample.state > 1 else "#ffcf7a" if sample.state == 1 else MUTED if stale else "#8ed5b0")
             variables["raw"].set(f"RAW {sample.raw.hex(' ').upper()}" if sample.raw
                                  else "MCU 解码回传（无原始 CAN 帧）")
+            if ref:
+                variables["raw"].set(
+                    variables["raw"].get()
+                    + f"\n{'MCU基准' if ref.source == 'MCU' else '本地配置基准（非回读）'}"
+                    + f" · 零点 {math.degrees(ref.zero_rad):+.3f}°"
+                    + f"\n实测 {math.degrees(ref.lower_rad):+.3f}.."
+                    + f"{math.degrees(ref.upper_rad):+.3f}°（非避碰限位）")
+            elif self.is_usb:
+                variables["raw"].set(variables["raw"].get() + "\n未取得MCU关节基准，仅显示原始角")
             if self.is_can:
                 variables["control"].set(
                     f"CAN MIT：Kp {sample.kp:.3g} / Kd {sample.kd:.3g}"
@@ -1581,12 +2058,26 @@ class Monitor:
         if not self.exporting and not self.buffer_var.get().startswith("已导出"):
             overwritten = max(0, self.received - MAX_RECORDS)
             self.buffer_var.set(f"缓存 {len(self.records):,} / {MAX_RECORDS:,} 条，已覆盖最旧 {overwritten:,} 条；"
-                                "CSV 仅导出当前保留数据。显示队列丢弃不计入 CSV。"
+                                "约10分钟@五电机100Hz；完整会话请用自动CSV（手动停止后不再写盘）。"
                                 + ("曲线≤50Hz抽样，接收/CSV不降采样。" if self.is_usb else ""))
         if now - self.last_plot >= (.1 if self.is_usb else 1 / 30):
             self.draw_plots()
             self.last_plot = now
-        if self.closing and self.worker is None and not self.exporting:
+        recording = self.recorder.running()
+        self.record_button.configure(text="停止记录" if self.recorder.accepting else
+                                     "记录收尾中…" if recording else "开始记录 CSV",
+                                     state="disabled" if recording and not self.recorder.accepting else "normal")
+        if self.recorder.path is not None:
+            state = ("记录不完整：" + self.recorder.error if self.recorder.error else
+                     "记录中" if self.recorder.accepting else "收尾中" if recording else "记录已保存")
+            seconds = int(self.recorder.duration_s)
+            missing = [f"J{m}" for m in self.card_vars if not self.recorder.joint_counts.get(m)]
+            coverage = f" · 未收到 {','.join(missing)}" if missing else " · 各关节已有记录"
+            self.record_var.set(f"{state} · 已写数据 {seconds // 60:02d}:{seconds % 60:02d}"
+                                f" · {self.recorder.written:,} / {self.recorder.accepted:,} 条{coverage}"
+                                f" → {self.recorder.path}")
+            self.record_label.configure(foreground="#ff7b87" if self.recorder.error else MUTED)
+        if self.closing and self.worker is None and not self.exporting and not recording:
             self.root.destroy()
             return
         self.root.after(100 if self.is_usb else 33, self.tick)
@@ -1665,8 +2156,95 @@ class Monitor:
     def close(self):
         self.closing = True
         self.disconnect()
-        if self.worker is None and not self.exporting:
+        if self.worker is None and not self.exporting and not self.recorder.running():
             self.root.destroy()
+
+
+def joint_reference_self_test():
+    expected = {
+        1: (-88.7282485, -201.6521075, 201.6521075),
+        2: (146.18099179755507, -35.37722379755507, 46.56437820244493),
+        3: (17.291374640739114, -86.61066364073912, 115.45676735926089),
+        4: (55.7024265, -555.7024265, -45.7024265),
+        5: (-57.024737, -22.632856, 22.632856),
+    }
+    base = Sample(1, 0., 1_700_000_000., .1, 0., 0., 25, 26, 0, b"", source="USB")
+    assert base.joint_angle_rad is None
+    for joint, (zero, lower, upper) in expected.items():
+        ref = JOINT_REFERENCES[joint]
+        assert ref.source == "local_config"
+        assert ref.kind == ("USER_APPROVED" if joint in (2, 3, 4) else "MIDPOINT")
+        for measured, degrees in ((ref.zero_rad, zero), (ref.lower_rad, lower), (ref.upper_rad, upper)):
+            assert math.isclose(math.degrees(measured), degrees, abs_tol=1e-10)
+        sample = replace(base, motor=joint, position_rad=ref.zero_rad, joint_reference=ref)
+        assert sample.joint_angle_rad == 0.
+        for raw, angle in ((ref.raw_lower_rad, lower), (ref.raw_upper_rad, upper)):
+            s = replace(sample, position_rad=raw)
+            assert math.isclose(s.joint_angle_deg, angle, abs_tol=1e-10)
+            row = dict(zip(CSV_FIELDS, csv_row(s)))
+            assert row["position_rad"] == f"{raw:.8f}"  # old columns stay raw
+            assert row["joint_angle_rad"] == raw - ref.zero_rad
+            assert row["joint_reference_kind"] == ref.kind
+        assert replace(sample, position_rad=ref.raw_upper_rad + 1).joint_angle_rad > ref.upper_rad
+        assert replace(sample, position_rad=math.nan).joint_angle_rad is None
+        # USB must not silently apply local values when the device lacks op 15.
+        assert replace(sample, joint_reference=None).joint_angle_rad is None
+        if ref.kind == "MIDPOINT":
+            assert abs(ref.lower_rad + ref.upper_rad) < 1e-12
+        if joint not in (1, 4):
+            # Startup on either wire branch, and subsequent whole-turn jumps.
+            for raw in (ref.zero_rad, ref.raw_lower_rad, ref.raw_upper_rad):
+                for turns in (-2, -1, 0, 1, 2):
+                    assert math.isclose(ref.angle(raw + turns * math.tau),
+                                        raw - ref.zero_rad, abs_tol=1e-12)
+            # A non-integer-turn reset remains a changed reading, not "fixed".
+            assert math.isclose(ref.angle(ref.zero_rad + .1), .1, abs_tol=1e-12)
+        else:
+            assert math.isclose(ref.angle(ref.zero_rad + math.tau), math.tau)
+    j2 = JOINT_REFERENCES[2]
+    assert abs(j2.angle(math.pi - .001) - j2.angle(-math.pi + .001)) < .003
+    assert all(JOINT_REFERENCES[j].upper_rad - JOINT_REFERENCES[j].lower_rad > math.tau
+               for j in (1, 4))
+    j4 = JOINT_REFERENCES[4]
+    assert j4.zero_rad > j4.raw_upper_rad  # Preserved datum, not a new midpoint.
+    for raw in (-500., -179.56567327963523, 10.):
+        assert math.isclose(j4.angle(math.radians(raw)), math.radians(raw-55.7024265),
+                            abs_tol=1e-12)  # No clamp, whole-turn shift or recenter.
+    assert all(value is None for value in csv_row(base)[-7:])
+    for values in ((0., -1., 1., "BAD", "MCU"),
+                   (math.nan, -1., 1., "CANDIDATE", "MCU"),
+                   (0., 1., -1., "CANDIDATE", "MCU"),
+                   (2., -1., 1., "CANDIDATE", "MCU"),
+                   (0., 1., -1., "USER_APPROVED", "MCU"),
+                   (.5, -1., 1., "MIDPOINT", "MCU")):
+        try:
+            JointReference(*values)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Invalid joint reference accepted")
+    class BrokenReadback:
+        def __init__(self, broken_field):
+            self.broken_field = broken_field
+
+        def rpc(self, op, scope=0, field=0, floating=False):
+            assert op == 15
+            if scope == 0:
+                return dm_tuning.JOINT_REFERENCE_VERSION
+            if field == self.broken_field:
+                return math.nan if floating else 99
+            ref = JOINT_REFERENCES[scope]
+            return {"CANDIDATE": 1, "MIDPOINT": 2, "USER_APPROVED": 3}[ref.kind] if field == 0 else (
+                ref.zero_rad, ref.raw_lower_rad, ref.raw_upper_rad)[field - 1]
+    assert set(read_joint_references(BrokenReadback(None))) == {1, 2, 3, 4, 5}
+    for field in (0, 1):
+        try:
+            read_joint_references(BrokenReadback(field))
+        except (KeyError, ValueError):
+            pass
+        else:
+            raise AssertionError("Invalid MCU reference accepted")
+    print("Joint references: endpoints/zero/midpoint/multiturn/raw CSV/invalid readback: PASS")
 
 
 def usb_self_test():
@@ -1677,12 +2255,18 @@ def usb_self_test():
     import tkinter as tk
 
     class Port:
-        def __init__(self):
+        def __init__(self, j3_supported=True, imu_supported=True, reference_supported=True,
+                     j1_reference_supported=True):
             self.lock, self.pending = threading.Lock(), bytearray()
             self.parser, self.seq, self.actions = dm_serial.Parser(), 0, []
             self.cached, self.last_session, self.dropped = {}, None, False
             self.requests = []
             self.closed = False
+            self.j3_supported, self.j3_phase, self.j3_count = j3_supported, 0, 0
+            self.j3_tick, self.j3_dropped = 0, False
+            self.imu_supported, self.imu_active = imu_supported, False
+            self.reference_supported = reference_supported
+            self.j1_reference_supported = j1_reference_supported
 
         @property
         def in_waiting(self):
@@ -1694,15 +2278,22 @@ def usb_self_test():
                 if not self.pending:
                     self.seq += 1
                     tick = int(time.perf_counter() * 1000) & 0xFFFFFFFF
+                    if self.j3_phase == 4 and (tick - self.j3_tick) & 0xFFFFFFFF >= 10:
+                        self.j3_count += 1
+                        self.j3_tick = tick
                     for j in range(1, 6):
-                        valid = j != 3  # Legacy J3 has no unsolicited samples.
+                        valid = j != 3 or self.j3_count != 0
+                        sample_tick = self.j3_tick if j == 3 else tick
+                        count = self.j3_count if j == 3 else self.seq
+                        state = int(self.j3_phase == 4) if j == 3 else 0
+                        flags = (1 | (2 if ((tick-sample_tick) & 0xFFFFFFFF) <= 100 else 0)) if valid else 0
                         self.pending.extend(usb_monitor.HEADER.pack(
                             b"YL", 1, 5, self.seq, tick, 100, 32, j-1)
                             + usb_monitor.RECORD.pack(j, 2 if j <= 2 else 1, int(j == 3),
-                                3 if valid else 0, j, 0x10+j, tick if valid else 0,
-                                self.seq if valid else 0, .1 if valid else math.nan,
+                                flags, j, 0x10+j, sample_tick if valid else 0,
+                                count if valid else 0, .1 if valid else math.nan,
                                 0. if valid else math.nan, 0. if valid else math.nan,
-                                0 if valid else 255, 25, 25, 0))
+                                state if valid else 255, 25, 25, 0))
                 result = bytes(self.pending[:min(length, 97)])
                 del self.pending[:len(result)]
                 return result
@@ -1720,17 +2311,63 @@ def usb_self_test():
                     self.requests.append((op, scope, field))
                     key = data[:12]
                     if key not in self.cached:
+                        if op == 13 and field in (1, 2):
+                            self.j3_phase = 4 if field == 1 else 0
+                            self.j3_count += 1
+                            self.j3_tick = int(time.perf_counter()*1000) & 0xFFFFFFFF
+                        if op == 10:
+                            self.imu_active = field == 1
                         value = (dm_tuning.VERSION if op == 0 else
                             dm_tuning.MOTION_VERSION if op == 12 and field == 255 else
+                            dm_tuning.J3_FEEDBACK_VERSION if op == 13 and field == 255 else
+                            0xA3000000 | (int(self.j3_phase == 4) << 16) | self.j3_phase
+                            if op == 13 else
                             0x03010000 if op == 6 and field == 0 else
                             0xE1010001 if op == 12 and field == 5 else 1)
-                        if (op == 12 and field == 8) or op == 7:
+                        floating = False
+                        if op == 8:
+                            if field == 255:
+                                value = dm_tuning.CALIBRATION_VERSION
+                            elif field == 0:
+                                value = 0xC1000008 | (17 if self.imu_active else 0)
+                            elif field in (3, 4, 5, 6, 7, 8, 9):
+                                floating = True
+                                value = {3: 2., 4: 0., 5: 0., 6: 9.81,
+                                         7: 1.25, 8: -2.5, 9: 3.75}[field]
+                        if op == 14:
+                            if field == 255:
+                                value = dm_tuning.UART_IMU_VERSION
+                            elif field == 0:
+                                value = 0xB1000007
+                            elif field in (3, 4, 5):
+                                floating = True
+                                value = {3: 12.34, 4: -45.67, 5: 90.}[field]
+                            else:
+                                value = {1: 10, 2: 50, 6: 1024, 7: 0, 8: 0, 9: 0}[field]
+                        if op == 15:
+                            if scope == 0 and field == 255:
+                                value = dm_tuning.JOINT_REFERENCE_VERSION
+                            else:
+                                ref = JOINT_REFERENCES[scope]
+                                floating = field != 0
+                                value = {"CANDIDATE": 1, "MIDPOINT": 2, "USER_APPROVED": 3}[ref.kind] if field == 0 else (
+                                    ref.zero_rad, ref.raw_lower_rad, ref.raw_upper_rad)[field - 1]
+                        if ((op == 12 and field == 8) or op in (7, 10)
+                                or op == 13 and field in (1, 2)):
                             self.actions.append((op, field))
-                        reply = data[:12] + bytes((data[16], 0, scope, field)) + struct.pack("<I", value)
+                        status = int(op == 13 and not self.j3_supported or
+                                     op in (8, 10, 14) and not self.imu_supported or
+                                     op == 15 and (not self.reference_supported or
+                                                   scope == 1 and not self.j1_reference_supported))
+                        reply = (data[:12] + bytes((data[16], status, scope, field))
+                                 + struct.pack("<f" if floating else "<I", value))
                         self.cached[key] = dm_serial.encode(dm_serial.RELIABLE_RESPONSE, reply)
                         if op == 12 and field == 8 and not self.dropped:
                             self.dropped = True
                             continue  # First action reply lost: identical retry only.
+                        if op == 13 and field == 1 and not self.j3_dropped:
+                            self.j3_dropped = True
+                            continue
                     self.pending.extend(self.cached[key])
             return len(packet)
 
@@ -1757,6 +2394,8 @@ def usb_self_test():
             until(lambda: reader.tuning.task_status is not None)
             assert reader.tuning.supported and reader.ready.is_set() and not port.actions
             assert set(reader.motors) == {1,2,3,4,5} and reader.counts[3] == 0
+            assert set(reader.joint_references) == {1, 2, 3, 4, 5}
+            assert all(r.source == "MCU" for r in reader.joint_references.values())
             root = tk.Tk()
             root.withdraw()
             with patch.dict(globals(), scan_serial_ports=lambda: [{"port":"FAKE", "label":"fake"}]):
@@ -1764,6 +2403,17 @@ def usb_self_test():
             gui.worker, gui.samples, gui.events = reader, samples, events
             gui.tick()
             assert len(gui.card_vars) == 5 and gui.control_connected()
+            until(lambda: not samples.empty())
+            gui.tick()
+            assert "关节" in gui.card_vars[2]["position"].get()
+            assert "候选" not in gui.card_vars[2]["position"].get()
+            assert "关节" in gui.card_vars[4]["position"].get()
+            assert "原始" in gui.card_vars[1]["position"].get()
+            for joint in (1, 2, 4, 5):
+                sample = gui.latest[joint]
+                assert sample.joint_reference.source == "MCU"
+                assert math.isclose(sample.joint_angle_rad,
+                                    sample.joint_reference.angle(sample.position_rad))
             assert str(gui.capture_button["state"]) == "normal"
             gui.quick_command("impedance")
             until(lambda: not reader.tuning.jobs.qsize() and reader.tuning.motion is not None)
@@ -1772,6 +2422,54 @@ def usb_self_test():
                 gui.quick_command(action)
                 until(lambda: (7,action) in port.actions)
             assert port.actions == [(12,8), (7,2), (7,3)]
+            until(lambda: reader.tuning.j3_feedback_status is not None)
+            gui.tick()
+            assert str(gui.j3_start_button["state"]) == "normal"
+            def imu_ready(active):
+                gui.handle_events()
+                return bool(gui.imu_snapshot and gui.uart_imu_snapshot and not gui.imu_busy
+                            and bool(gui.imu_snapshot["flags"] & 16) == active)
+            until(lambda: imu_ready(False))
+            gui.tick()
+            assert str(gui.imu_start_button["state"]) == "normal"
+            assert "12.340" in gui.uart_imu_var.get() and "-45.670" in gui.uart_imu_var.get()
+            external = gui.uart_imu_snapshot
+            gui.uart_imu_snapshot = {**external, "uart_error": 4}
+            gui.update_imu()
+            assert "12.340" in gui.uart_imu_var.get() and "历史错误 0x4" in gui.uart_imu_var.get()
+            gui.uart_imu_snapshot = {**external, "flags": 3, "age_ms": 2000}
+            gui.update_imu()
+            assert "读数过期（2000ms）" in gui.uart_imu_var.get()
+            assert "12.340" not in gui.uart_imu_var.get()
+            gui.uart_imu_snapshot = {**external, "flags": 2}
+            gui.update_imu()
+            assert "RX 已停止" in gui.uart_imu_var.get() and "12.340" not in gui.uart_imu_var.get()
+            gui.uart_imu_snapshot = external
+            assert "—" in gui.imu_values.get(), "Suspended BMI088 must not show fabricated rates"
+            gui.imu_command(True)
+            until(lambda: (10, 1) in port.actions)
+            until(lambda: imu_ready(True))
+            gui.tick()
+            assert "1.250" in gui.imu_values.get() and "-2.500" in gui.imu_values.get()
+            gui.imu_command(False)
+            until(lambda: (10, 0) in port.actions)
+            until(lambda: imu_ready(False))
+            assert port.actions.count((10, 1)) == port.actions.count((10, 0)) == 1
+            gui.uart_imu_snapshot = {**gui.uart_imu_snapshot, "at": time.perf_counter() - 2}
+            gui.update_imu()
+            assert "状态过期" in gui.uart_imu_var.get() and "12.340" not in gui.uart_imu_var.get()
+            gui.j3_command(True)
+            until(lambda: reader.tuning.j3_feedback_status[0] == 4 and reader.counts[3] > 2)
+            gui.tick()
+            assert str(gui.j3_start_button["state"]) == "disabled"
+            assert port.actions.count((13,1)) == 1 and port.j3_dropped
+            assert gui.latest[3].state == 1  # real unique source sample, not action ACK
+            gui.j3_command(False)
+            until(lambda: reader.tuning.j3_feedback_status[0] == 0)
+            gui.tick()
+            assert port.actions.count((13,2)) == 1
+            assert gui.latest[3].state == 0
+            assert str(gui.j3_start_button["state"]) == "normal"
             # Repeated cache snapshots are not new encoder data.
             reader.stop_requested.set()
             reader.join(2)
@@ -1784,7 +2482,8 @@ def usb_self_test():
             reader.stop_requested.set()
             reader.join(2)
     assert not reader.is_alive() and port.closed
-    assert all(item[0] in (0,6,7,12) for item in port.requests)
+    assert all(item[0] in (0,6,7,8,10,12,13,14,15) for item in port.requests)
+    assert all(scope == 0 for op, scope, _ in port.requests if op in (8, 10, 14))
     assert reader.last_stats["ui_drops"] == 0 and reader.last_stats["invalid"] == 0
     # USB reports protocol capability from MCU metadata, just like CAN:
     # passive legacy is unverified, not a transport failure or an online pass.
@@ -1797,7 +2496,34 @@ def usb_self_test():
     assert report["legacy_passive_motors"] == [3]
     assert report["per_motor_feedback"]["3"]["status"] == "WAITING_COMMAND_REPLY"
     assert all(report["per_motor_feedback"][str(m)]["status"] == "FRESH" for m in (1,2,4,5))
+    assert set(report["software_joint_references"]) == {"1", "2", "3", "4", "5"}
+    assert report["software_joint_references"]["4"]["source"] == "MCU"
     assert report["errors"] == [] and not port.actions and port.closed
+    # Earlier op 15 reports the same version but rejects scope=1.
+    port, output = Port(j1_reference_supported=False), StringIO()
+    with patch.object(usb_monitor, "serial_port", open_fake), patch.dict(
+            globals(), scan_serial_ports=lambda: [{"port": "FAKE"}]), redirect_stdout(output):
+        probe(100, .5, can=False, port="FAKE", usb=True)
+    report = json.loads(output.getvalue())
+    assert set(report["software_joint_references"]) == {"2", "3", "4", "5"}
+    assert report["errors"] == [] and not port.actions and port.closed
+    # Old ordinary image can keep J1/J2 controls without a J3 bare-enable fallback.
+    port = Port(j3_supported=False, imu_supported=False, reference_supported=False)
+    reader = USBReader({"port":"FAKE"}, queue.Queue(maxsize=8192),
+                       queue.SimpleQueue(), time.perf_counter())
+    with patch.object(usb_monitor, "serial_port", open_fake):
+        reader.start()
+        try:
+            until(lambda: reader.tuning.task_status is not None)
+            assert reader.tuning.supported and not reader.tuning.j3_feedback_supported
+            assert not reader.tuning.calibration_supported and not reader.tuning.uart_imu_supported
+            assert not reader.joint_references
+            assert all(s.joint_angle_rad is None for s in list(reader.samples.queue))
+            assert not port.actions
+        finally:
+            reader.stop_requested.set()
+            reader.join(2)
+    assert not reader.is_alive() and port.closed
     # One second of target payload, not a USB speed measurement. Keep all 5000
     # unique source records off-screen; repeating a snapshot creates no sample.
     bulk = USBReader({"port":"FAKE"}, queue.Queue(maxsize=8192), queue.SimpleQueue(), time.perf_counter())
@@ -1810,10 +2536,102 @@ def usb_self_test():
             if snapshot:
                 bulk.accept_snapshot(snapshot, time.perf_counter())
     assert bulk.snapshots == 1000 and bulk.samples.qsize() == 5000 and bulk.ui_drops == 0
-    print("USB GUI/RX+TX/5 joints/explicit quick commands/deduplicated retry/cleanup: PASS")
+    print("USB GUI/RX+TX/5 joints/J3 start-stop+old firmware/deduplicated retry/cleanup: PASS")
+
+def recording_self_test():
+    import tempfile
+    from io import StringIO
+    from unittest.mock import patch
+
+    sample = Sample(1, 0., 1_700_000_000., .1, .2, .3, 25, 26, 0, b"", source="USB")
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "session.csv"
+        recorder = CSVRecorder(capacity=MAX_RECORDS + 5)
+        samples = RecordingQueue(recorder, maxsize=1)
+        recorder.start(path)
+        count = MAX_RECORDS + 5  # larger than the GUI's entire rolling history
+        for index in range(count):
+            elapsed = index // 5 * .01  # Five motors at 100 Hz, without a ten-minute sleep.
+            try:
+                samples.put_nowait(replace(sample, motor=index % 5 + 1, sequence=index,
+                                          elapsed_s=elapsed, unix_s=sample.unix_s + elapsed))
+            except queue.Full:
+                pass
+        recorder.stop()
+        recorder.submit(sample)  # the explicit session boundary must hold
+        recorder.thread.join(30)
+        assert not recorder.running() and not recorder.error
+        assert recorder.accepted == recorder.written == count and samples.qsize() == 1
+        assert recorder.duration_s == (count - 1) // 5 * .01 >= 300
+        assert recorder.joint_counts == {m: count // 5 for m in MOTORS}
+        with path.open(encoding="utf-8-sig", newline="") as stream:
+            rows = csv.DictReader(stream)
+            assert rows.fieldnames == list(CSV_FIELDS)
+            read_count = 0
+            for index, row in enumerate(rows):
+                assert int(row["telemetry_sequence"]) == index
+                assert int(row["logical_joint"]) == index % 5 + 1
+                assert math.isclose(float(row["elapsed_s"]), index // 5 * .01, abs_tol=1e-6)
+                read_count += 1
+            assert read_count == count
+        before = path.stat().st_size
+        try:
+            recorder.start(path)
+            raise AssertionError("Existing recording was overwritten")
+        except FileExistsError:
+            assert path.stat().st_size == before
+        # Auto-save uses an existing Desktop, never a real user's Desktop in tests.
+        desktop = Path(directory) / "Desktop"
+        desktop.mkdir()
+        automatic = CSVRecorder()
+        with patch.object(Path, "home", return_value=Path(directory)):
+            automatic.start_desktop()
+            first_path = automatic.path
+            assert first_path.parent == desktop and automatic.duration_s == 0.
+            for elapsed, motor in ((0., 1), (301., 5), (299., 1)):
+                automatic.submit(replace(sample, elapsed_s=elapsed, motor=motor))
+            automatic.stop()
+            automatic.thread.join(2)
+            assert not automatic.running() and not automatic.error
+            assert automatic.written == 3 and automatic.duration_s == 301.
+            assert automatic.joint_counts == {1: 2, 5: 1}
+            automatic.start_desktop()
+            assert automatic.path != first_path and first_path.is_file()
+            assert automatic.duration_s == 0. and not automatic.joint_counts
+            automatic.stop()
+            automatic.thread.join(2)
+            with patch("builtins.open", side_effect=PermissionError("desktop read-only")):
+                try:
+                    automatic.start_desktop()
+                    raise AssertionError("Desktop write failure was hidden")
+                except PermissionError:
+                    assert "desktop read-only" in automatic.error
+                    assert not automatic.running() and not automatic.accepting
+        # Deterministic slow disk: hold the consumer, fill the bounded queue.
+        full = CSVRecorder(capacity=1)
+        with patch.object(threading.Thread, "start"):
+            full.start(Path(directory) / "full.csv")
+        full.submit(sample); full.submit(sample); full.submit(sample)
+        assert not full.accepting and full.error and full.accepted == 1
+        full.thread.run()  # drain accepted rows before reporting the incomplete file
+        assert full.written == 1 and full.error
+
+        class BrokenDisk(StringIO):
+            def flush(self):
+                raise OSError("simulated disk full")
+
+        failed = CSVRecorder()
+        with patch("builtins.open", return_value=BrokenDisk()):
+            failed.start(Path(directory) / "failed.csv")
+        failed.submit(sample); failed.stop(); failed.thread.join(2)
+        assert not failed.running() and "simulated disk full" in failed.error
+    print("CSV continuous >300k/600s/5 joints/desktop auto-save/duration/coverage/"
+          "UI overflow/session stop/exclusive file/disk failure: PASS")
 
 
 def self_test():
+    joint_reference_self_test()
+    recording_self_test()
     usb_self_test()
     import tempfile
     dm_serial.self_test()
@@ -2224,18 +3042,43 @@ def self_test():
     assert set(report["readback_limits"]) == {"4", "5"}
     # Keep the small host mirror honest against the production five-motor table.
     import re
-    config = (Path(__file__).resolve().parents[1] / "config" / "motor_config.c").read_text(encoding="utf-8")
-    devices = re.findall(
-        r"\.model\s*=\s*DM_MOTOR_DM(\d+),\s*\.bus\s*=\s*&hfdcan(\d),\s*\\?\s*"
-        r"\.can_id\s*=\s*(0x[\dA-Fa-f]+)U,\s*\.master_id\s*=\s*(0x[\dA-Fa-f]+)U,\s*\\?\s*"
-        r"\.pmax\s*=\s*([\d.]+)f,\s*\.vmax\s*=\s*([\d.]+)f,\s*\.tmax\s*=\s*([\d.]+)f", config)
+    repo = Path(__file__).resolve().parents[1]
+    config = (repo / "config" / "motor_config.c").read_text(encoding="utf-8")
+    # Model/version defaults now live with their drivers; expand only their
+    # object-like configuration macros, without requiring a C compiler here.
+    sources = [config] + [p.read_text(encoding="utf-8")
+                          for p in (repo / "Device" / "DM_Motor").rglob("*.h")]
+    macros = {}
+    for source in sources:
+        source = re.sub(r"\\\r?\n", "", source)
+        macros.update(re.findall(
+            r"(?m)^#define\s+(\w+(?:_CONFIG_FIELDS|_DEVICE_CONFIG))\s+([^\n]+)", source))
+    table = config.split("g_motor_can_config[MOTOR_CAN_JOINT_COUNT] = {", 1)[1].split("};", 1)[0]
+    for _ in range(len(macros) + 1):
+        expanded = re.sub(r"\b\w+\b", lambda m: macros.get(m[0], m[0]), table)
+        if expanded == table:
+            break
+        table = expanded
+    devices = re.findall(r"\{([^{}]+)\}", table)
     assert len(devices) == len(MOTORS)
-    for motor, (model, bus, command_id, feedback_id, *limits) in enumerate(devices, 1):
+    protocols = []
+    for motor, device in enumerate(devices, 1):
+        def field(name, pattern):
+            match = re.search(r"\." + name + r"\s*=\s*" + pattern, device)
+            assert match is not None, (motor, name, device)
+            return match[1]
+        model = field("model", r"DM_MOTOR_DM(\d+)")
+        bus = field("bus", r"&hfdcan(\d)")
+        command_id = field("can_id", r"(0x[\dA-Fa-f]+)U")
+        feedback_id = field("master_id", r"(0x[\dA-Fa-f]+)U")
+        limits = [field(name, r"([\d.]+)f") for name in ("pmax", "vmax", "tmax")]
+        protocols.append(field("protocol", r"(DM_MOTOR_PROTOCOL_\w+)"))
         assert model == MOTOR_MODELS[motor].removesuffix("P")
         assert int(bus) == MOTOR_BUSES[motor]
         assert int(command_id, 16) == motor and int(feedback_id, 16) == MOTORS[motor]
         assert tuple(map(float, limits)) == CONFIG_LIMITS[motor]
-    assert config.count(".protocol = DM_MOTOR_PROTOCOL_LEGACY_MIT") == 1
+    assert protocols == ["DM_MOTOR_PROTOCOL_LEGACY_MIT" if m in LEGACY_MOTORS
+                         else "DM_MOTOR_PROTOCOL_V13" for m in MOTORS]
     assert LEGACY_MOTORS == {3}
 
     # Exercise the actual UART worker/RPC, without opening COM or USB-CAN.
@@ -2622,16 +3465,25 @@ def self_test():
                                  ready=threading.Event(), stop_requested=threading.Event())
     with patch.dict(globals(), scan_adapters=lambda: [dict(adapter, label="offline CAN")],
                     scan_serial_ports=lambda: (_ for _ in ()).throw(AssertionError("CAN scanned UART")),
-                    Reader=lambda *args, **kwargs: can_worker):
+                    Reader=lambda *args, **kwargs: can_worker), \
+            patch.object(CSVRecorder, "start_desktop") as auto_recording:
         can_ui = Monitor(can_root)
         assert can_ui.is_can and can_ui.can_bus == 2
         assert set(can_ui.card_vars) == set(MOTORS) and len(can_ui.cards.winfo_children()) == 5
         assert can_ui.tuning_panel is None and not can_ui.diagnostics.winfo_manager()
         can_ui.connect()
+        auto_recording.assert_called_once_with()
         assert can_ui.worker is can_worker
+        assert can_ui.records.maxlen == MAX_RECORDS >= 5 * 100 * 300
         assert str(can_ui.bus_box["state"]) == "disabled"
         can_ui.samples.put(active)
         can_ui.tick()
+        can_ui.recorder.path = Path("offline-test-no-file.csv")
+        can_ui.recorder.first_sample_s, can_ui.recorder.last_sample_s = 0., 301.
+        can_ui.recorder.joint_counts = {1: 1}
+        can_ui.tick()
+        assert "05:01" in can_ui.record_var.get()
+        assert "未收到 J2,J3,J4,J5" in can_ui.record_var.get()
         assert can_ui.latest[1].command_raw == wire_command
         assert "CAN MIT" in can_ui.card_vars[1]["control"].get()
         assert "CAN1" in can_ui.card_vars[3]["position"].get()
@@ -2682,7 +3534,8 @@ def self_test():
                        if canvas.type(item) == "text"
                        and re.fullmatch(r"J[1-5]", canvas.itemcget(item, "text"))}
             assert legends == {"J3", "J4", "J5"}, "Chart included another bus's legend"
-        for widget in (can_ui.capture_button, can_ui.hold_button, can_ui.release_button, can_ui.export_button):
+        for widget in (can_ui.capture_button, can_ui.hold_button, can_ui.release_button,
+                       can_ui.export_button, can_ui.record_button):
             assert widget.winfo_ismapped()
             assert widget.winfo_rootx() + widget.winfo_width() < can_root.winfo_rootx() + can_root.winfo_width()
             assert widget.winfo_rooty() + widget.winfo_height() < can_root.winfo_rooty() + can_root.winfo_height()
@@ -2780,7 +3633,15 @@ def probe(hz, seconds, direct=False, can=True, port=None, can_bus=2, usb=False):
         "stats": reader.last_stats,
         "mcu_tuning": tuning,
         "serial_status": None if can else reader.telemetry,
+        "software_joint_references": {
+            joint: {"zero_rad": ref.zero_rad, "raw_lower_rad": ref.raw_lower_rad,
+                    "raw_upper_rad": ref.raw_upper_rad, "joint_lower_rad": ref.lower_rad,
+                    "joint_upper_rad": ref.upper_rad, "kind": ref.kind, "source": ref.source}
+            for joint, ref in (reader.joint_references if usb else JOINT_REFERENCES).items()},
         "latest": {m: {"position_deg": s.position_deg, "position_rad": s.position_rad,
+                       "joint_angle_deg": s.joint_angle_deg, "joint_angle_rad": s.joint_angle_rad,
+                       "joint_reference_kind": s.joint_reference.kind if s.joint_reference else None,
+                       "joint_reference_source": s.joint_reference.source if s.joint_reference else None,
                        "velocity_rad_s": s.velocity_rad_s, "estimated_torque_nm": s.torque_nm,
                        "state": s.state, "mos_c": s.mos_c, "rotor_c": s.rotor_c,
                        "raw": s.raw.hex(" ").upper()} for m, s in latest.items()},

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import itertools
 import json
 import math
@@ -244,8 +245,12 @@ def inertia_check(train_paths, validation_paths, model):
     return result
 
 
-def impulse_windows(paths, model, window_s=.25):
+def impulse_windows(paths, model, window_s=.25, *, smooth_speed=None, stribeck_speeds=()):
     """Integral Lagrange equation: subtract CAD momentum, no differentiated v."""
+    if not math.isfinite(window_s) or window_s <= 0 or any(
+            not math.isfinite(s) or s <= 0 for s in
+            (*stribeck_speeds, *((smooth_speed,) if smooth_speed is not None else ()))):
+        raise ValueError("Window and friction speeds must be finite and positive")
     windows = {1: [], 2: []}
     for path in paths:
         path = Path(path)
@@ -256,11 +261,19 @@ def impulse_windows(paths, model, window_s=.25):
         with (path/"samples.csv").open(encoding="utf-8-sig", newline="") as stream:
             pairs = {}
             for row in csv.DictReader(stream):
-                pairs.setdefault(row["telemetry_sequence"], {})[
-                    int(row["logical_joint"])] = row
-        rows = sorted((p for p in pairs.values() if 1 in p and 2 in p),
-                      key=lambda p: float(p[1]["feedback_ms"]))
+                pair = pairs.setdefault(row["telemetry_sequence"], {})
+                axis = int(row["logical_joint"])
+                if axis in pair:
+                    raise ValueError(f"Repeated sequence/joint in {path}")
+                pair[axis] = row
+        rows = [p for p in pairs.values() if 1 in p and 2 in p]
+        if not rows:
+            continue
         t = np.array([float(p[1]["feedback_ms"])*.001 for p in rows])
+        t2 = np.array([float(p[2]["feedback_ms"])*.001 for p in rows])
+        if (not np.isfinite([t, t2]).all() or np.any(np.diff(t) < 0) or
+                np.any(np.diff(t2) < 0)):
+            raise ValueError(f"Invalid/discontinuous feedback clock in {path}")
         q = np.array([float(p[2]["reference_rad"])-zero for p in rows])
         v = np.array([[float(p[j]["velocity_rad_s"]) for j in (1, 2)] for p in rows])
         tau = np.array([[float(p[j]["estimated_torque_nm"]) for j in (1, 2)]
@@ -268,6 +281,12 @@ def impulse_windows(paths, model, window_s=.25):
         valid = np.array([all(int(p[j]["state"]) == 1 and int(p[j]["mode"]) == 1
                               and int(p[j]["task_state"]) in (2, 3, 4)
                               for j in (1, 2)) for p in rows])
+        valid &= ((np.abs(t-t2) <= .005) & np.isfinite(q) &
+                  np.isfinite(v).all(axis=1) & np.isfinite(tau).all(axis=1))
+        sin_q = np.sin(q)
+        sign = np.sign(v)
+        coulomb = sign if smooth_speed is None else np.tanh(v/smooth_speed)
+        stribeck = [coulomb*np.exp(-(v/s)**2) for s in stribeck_speeds]
         a = model["a0"]+model["a_cos2"]*np.cos(2*q)+model["a_sin2"]*np.sin(2*q)
         b = model["b_cos"]*np.cos(q)+model["b_sin"]*np.sin(q)
         ap = -2*model["a_cos2"]*np.sin(2*q)+2*model["a_sin2"]*np.cos(2*q)
@@ -281,7 +300,9 @@ def impulse_windows(paths, model, window_s=.25):
                 continue
             at = slice(low, high+1)
             dt = np.diff(t[at])
-            if not valid[at].all() or np.max(dt) > .06 or np.min(dt) <= 0:
+            dt2 = np.diff(t2[at])
+            if (not valid[at].all() or max(dt.max(), dt2.max()) > .06 or
+                    min(dt.min(), dt2.min()) <= 0):
                 continue
             duration = t[high]-t[low]
 
@@ -292,17 +313,18 @@ def impulse_windows(paths, model, window_s=.25):
             for joint in (1, 2):
                 j = joint-1
                 # Exclude stick and reversals: sign(v) is not static friction.
-                if np.min(np.abs(v[at, j])) < .025 or np.ptp(np.sign(v[at, j])) > 0:
+                if np.min(np.abs(v[at, j])) < .025 or np.ptp(sign[at, j]) > 0:
                     continue
-                x = ([mean_integral(np.sin(q))] if joint == 2 else []) + [
-                    mean_integral(np.sign(v[:, j])), mean_integral(v[:, j]), 1.,
+                x = ([mean_integral(sin_q)] if joint == 2 else []) + [
+                    mean_integral(coulomb[:, j]), mean_integral(v[:, j]), 1.,
                     (v[high, j]-v[low, j])/duration]
+                x.extend(mean_integral(term[:, j]) for term in stribeck)
                 y = mean_integral(tau[:, j]) - (
                     momentum[high, j]-momentum[low, j])/duration
                 if joint == 2:
                     y += mean_integral(kinetic_q2)
                 windows[joint].append((*x, y))
-    return {j: np.array(values).reshape(-1, 6 if j == 2 else 5)
+    return {j: np.array(values).reshape(-1, 4+j+len(stribeck_speeds))
             for j, values in windows.items()}
 
 
@@ -349,6 +371,188 @@ def deployed_coefficients():
         gravity_sin_nm=float(re.search(r"\.gravity_sin_nm\s*=\s*"+number, source)[1]),
         friction=[dict(coulomb_nm=float(a), viscous_nm_s=float(b)) for a, b in re.findall(
             r"\.coulomb_nm\s*=\s*"+number+r",\s*\.viscous_nm_s\s*=\s*"+number, source)])
+
+
+def alternating_joint(groups, joint, deployed, speeds):
+    """Equal weight per run. Extra inertia above CAD, not a full rigid-body fit."""
+    names = (["gravity_sin_nm"] if joint == 2 else []) + [
+        "coulomb_nm", "viscous_nm_s", "bias_nm", "extra_diagonal_inertia_kg_m2"]
+    n = len(names)
+    f, b, offset, inertia = range(n-4, n)
+    positive = [f, b, inertia]
+    dyn = [i for i in range(n) if i not in (f, b)]
+    if not all(groups.get(split) for split in ("training", "validation", "test")):
+        raise ValueError(f"J{joint}: expected complete training, validation and test groups")
+    if any(not len(d) for group in groups.values() for d in group.values()):
+        raise ValueError(f"J{joint}: a recording has no usable moving windows")
+    train = list(groups["training"].values())
+    raw = np.vstack(train)
+    stacked = np.vstack([d/math.sqrt(len(d)) for d in train])
+    x, y = stacked[:, :n], stacked[:, -1]
+    norms = np.linalg.norm(x, axis=0)
+    rank = int(np.linalg.matrix_rank(x))
+    counts = dict(pos_speed=int(sum(raw[:, b] > .025)), neg_speed=int(sum(raw[:, b] < -.025)),
+                  pos_accel=int(sum(raw[:, inertia] > .3)), neg_accel=int(sum(raw[:, inertia] < -.3)))
+    if rank != n or not norms.all() or min(counts.values()) < 15:
+        raise ValueError(f"J{joint}: insufficient excitation/rank: {counts}, rank {rank}/{n}")
+    def score(beta, split, *, extra=None):
+        scores = {}
+        for path, d in groups[split].items():
+            pred = d[:, :n]@beta
+            if extra is not None:
+                col, delta = extra
+                pred += delta*d[:, n+col]
+            scores[path] = float(np.sqrt(np.mean((pred-d[:, -1])**2)))
+        return dict(rmse_nm=math.sqrt(float(np.mean(np.square(list(scores.values()))))),
+                    per_record_rmse_nm=scores)
+
+    def record(beta):
+        return dict(parameters=dict(zip(names, map(float, beta))),
+                    train_rmse_nm=score(beta, "training")["rmse_nm"],
+                    validation_rmse_nm=score(beta, "validation")["rmse_nm"])
+
+    def refit(cols, beta):
+        rhs = y-x@beta+x[:, cols]@beta[cols]
+        beta[cols] = constrained_fit(x[:, cols], rhs,
+                                     [k for k, i in enumerate(cols) if i in positive])[1]
+
+    beta = np.zeros(n)
+    refit(dyn, beta)
+    steps = {"no_friction": record(beta)}
+    for k in (1, 2):
+        refit([f,b], beta)
+        steps[f"residual_friction_{k}"] = record(beta)
+        refit(dyn, beta)
+        steps[f"refit_dynamics_{k}"] = record(beta)
+    _, linear = constrained_fit(x, y, positive)
+    steps["joint_linear"] = record(linear)
+    # Constant bias is a nuisance parameter, NOT a constant assist command.
+    linear_ff = linear.copy()
+    linear_ff[offset] = 0
+    old = np.array(([deployed["gravity_sin_nm"]] if joint == 2 else []) + [
+        deployed["friction"][joint-1]["coulomb_nm"], deployed["friction"][joint-1]["viscous_nm_s"],
+        0., deployed["extra_inertia_kg_m2"][joint-1]])
+    # Optional speed-dependent excess is profiled after fitting the linear model.
+    # Select its speed on training only; validation may veto it before final test.
+    candidates = []
+    for col, vs in enumerate(speeds):
+        z = stacked[:, n+col]
+        if np.linalg.norm(z) < 1e-8:
+            continue
+        a = np.column_stack((x,z))
+        if np.linalg.matrix_rank(a) != n + 1:
+            continue
+        mse, ext = constrained_fit(a, y, positive+[n])
+        candidates.append((mse, col, ext))
+    result = dict(window_counts={s:{p:len(d) for p,d in g.items()} for s,g in groups.items()},
+                  excitation=counts, scaled_condition=float(np.linalg.cond(x/norms)), rank=rank,
+                  train_accel_p05_p95_rad_s2=np.percentile(raw[:,inertia],[5,95]).tolist(),
+                  steps=steps, linear_deployed_form={}, baseline={}, stribeck=None,
+                  selected="coulomb_viscous", deployment="none")
+    for split in groups:
+        result["linear_deployed_form"][split] = score(linear_ff, split)
+        result["baseline"][split] = score(old, split)
+    if candidates:
+        _, col, ext = min(candidates, key=lambda c:c[0])
+        ext_ff = ext[:n].copy()
+        ext_ff[offset] = 0
+        def ext_score(split):
+            return score(ext_ff, split, extra=(col, ext[-1]))
+        val = ext_score("validation")
+        simple = result["linear_deployed_form"]["validation"]
+        if (simple["rmse_nm"] - val["rmse_nm"] > max(1e-12, .05*simple["rmse_nm"]) and all(
+                v <= simple["per_record_rmse_nm"][p] for p,v in val["per_record_rmse_nm"].items())):
+            result["selected"] = "stribeck"
+        result["stribeck"] = dict(speed_rad_s=speeds[col], delta_nm=float(ext[-1]),
+                                   parameters=dict(zip(names, map(float,ext[:n]))),
+                                   validation=val, test=ext_score("test"))
+    return result
+
+
+def alternating_identification(train, validate, test):
+    if not train or not validate or not test:
+        raise ValueError("Alternating fit requires separate train, validation and final test runs")
+    model, deployed = nominal_parameters(), deployed_coefficients()
+    source = (Path(__file__).resolve().parents[1]/"config/motor_config.c").read_text(encoding="utf-8")
+    smooth = float(re.search(r"\.friction_smooth_rad_s\s*=\s*([-+\deE.]+)f", source)[1])
+    speeds = (.04,.08,.16,.32)
+    groups, metadata, hashes, zeros = {}, {}, set(), []
+    for group, paths in (("training", train), ("validation", validate), ("test", test)):
+        groups[group] = {}
+        for run in paths:
+            path = Path(run)
+            digest = hashlib.sha256((path/"samples.csv").read_bytes()).hexdigest()
+            if digest in hashes:
+                raise ValueError(f"Duplicate sample recording: {run}")
+            hashes.add(digest)
+            r = json.loads((path/"report.json").read_text(encoding="utf-8"))
+            zero = float(r["configuration"]["values"]["0.4"])
+            zeros.append(zero)
+            if not math.isfinite(zero) or max(zeros)-min(zeros) > .01:
+                raise ValueError("Mixed J2 zero conventions; split the experiments")
+            metadata[str(run)] = dict(sha256=digest, zero_deg=zero, start_utc=r.get("start_utc"))
+            groups[group][str(run)] = impulse_windows([path], model, smooth_speed=smooth,
+                                                      stribeck_speeds=speeds)
+    return dict(scope="two-axis archived model only; NOT V1.2 five-axis calibration or a firmware write",
+                window_s=.25, smooth_speed_rad_s=smooth, stribeck_speed_grid_rad_s=speeds,
+                method="CAD momentum balance + J2 sine gravity + effective extra diagonal inertia; "
+                "measured drive velocity (not the controller's filtered velocity); current-estimated torque",
+                scoring="equal weight per run; overlapping windows are not independent. "
+                "Intermediate RMSE includes nuisance bias; feedforward comparisons omit bias. "
+                "Stribeck requires >=5% validation gain and no worse individual validation run.",
+                fixed_cad=model, baseline_coefficients=deployed, recordings=metadata,
+                joints={str(j):alternating_joint({s:{p:d[j] for p,d in g.items()}
+                                                    for s,g in groups.items()}, j, deployed, speeds)
+                        for j in (1,2)})
+
+
+def kinematic_check(path, window_s=.25):
+    """Compare like-bandwidth acceleration from position and reported velocity. No torque fit."""
+    if not math.isfinite(window_s) or window_s <= 0:
+        raise ValueError("Window must be finite and positive")
+    axes = {}
+    with Path(path).open(encoding="utf-8-sig", newline="") as stream:
+        for r in csv.DictReader(stream):
+            j = int(r["logical_joint"])
+            axes.setdefault(j, []).append((float(r["feedback_ms"])*.001, float(r["position_rad"]),
+                                           float(r["velocity_rad_s"]), int(r["state"])))
+    if not axes:
+        raise ValueError("Recording has no source feedback")
+    result = {}
+    for j, rows in axes.items():
+        t, q, v, state = np.asarray(rows).T
+        if not np.isfinite([t,q,v]).all() or np.any(np.diff(t) <= 0):
+            raise ValueError(f"J{j}: invalid, repeated or reset time/source values")
+        i, windows, moving = 0, 0, []
+        while i+8 < len(t):
+            m, h = np.searchsorted(t, [t[i]+window_s/2, t[i]+window_s])
+            if h >= len(t):
+                break
+            dt = np.diff(t[i:h+1])
+            if (i < m < h and dt.max() <= .06 and np.ptp(state[i:h+1]) == 0 and
+                    np.max(abs(np.diff(q[i:h+1]))) < np.pi):
+                left, right = t[m]-t[i], t[h]-t[m]
+                duration = left+right
+                dqdt = (q[h]-q[i])/duration
+                windows += 1
+                if abs(dqdt) > .05:
+                    vi = .5*(v[i:h]+v[i+1:h+1])*dt
+                    a_q = 2*((q[h]-q[m])/right-(q[m]-q[i])/left)/duration
+                    a_v = 2*(vi[m-i:].sum()/right-vi[:m-i].sum()/left)/duration
+                    moving.append((dqdt, vi.sum()/duration, a_q, a_v))
+            i = h
+        entry = dict(samples=len(t), states=sorted(set(map(int,state))), valid_windows=windows,
+                     moving_windows=len(moving))
+        if moving:
+            qp, vp, aq, av = np.array(moving).T
+            entry.update(velocity_rmse_rad_s=float(np.mean((qp-vp)**2)**.5),
+                         acceleration_rmse_rad_s2=float(np.mean((aq-av)**2)**.5),
+                         position_accel_p05_p95_rad_s2=np.percentile(aq,[5,95]).tolist())
+        result[str(j)] = entry
+    return dict(recording=str(path), window_s=window_s, moving_threshold_rad_s=.05,
+                interpretation="encoder position vs drive velocity, nonoverlapping windows; "
+                "kinematic consistency only, NOT an external angular acceleration reference",
+                joints=result)
 
 
 def identify(train_paths, validation_paths, *, use_deployed_inertia=False, test_paths=()):
@@ -641,7 +845,52 @@ def self_test():
         for joint, data in impulse_windows([path], model).items():
             beta = np.linalg.lstsq(data[:, :-1], data[:, -1], rcond=None)[0]
             assert abs(beta[-1]-(.03 if joint == 1 else .04)) < 1e-4
-    print("Identification fit self-test passed (synthetic data, no hardware)")
+        try:
+            alternating_identification([path], [path], [path])
+        except ValueError as error:
+            assert "Duplicate sample recording" in str(error)
+        else:
+            raise AssertionError("Duplicate run crossed a dataset split")
+        with (path/"kinematic.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(("logical_joint", "feedback_ms", "position_rad", "velocity_rad_s", "state"))
+            for i in range(250):
+                t = i*.01 + (.11 if i >= 120 else 0)
+                writer.writerow((1, 1000*t, .2*t+.3*t*t, .2+.6*t, int(i >= 60)))
+                writer.writerow((4, 1000*t, 1., 0., 0))
+        k = kinematic_check(path/"kinematic.csv")["joints"]
+        assert 4 <= k["1"]["moving_windows"] < 9
+        assert np.allclose(k["1"]["position_accel_p05_p95_rad_s2"], .6)
+        assert k["1"]["acceleration_rmse_rad_s2"] < 1e-10
+        assert k["4"]["moving_windows"] == 0 and "acceleration_rmse_rad_s2" not in k["4"]
+    rng = np.random.default_rng(18)
+    for delta in (0., .23):
+        truth = np.array([-.57, .48, .19, 0., .035])
+        groups = {}
+        for split in ("training", "validation", "test"):
+            v, q, a = rng.uniform(-.65, .65, (3, 450))
+            a = 2*a + .7*v
+            cv = np.tanh(v/.02)
+            x = np.column_stack((np.sin(q), cv, v, np.ones(len(v)), a))
+            z = cv*np.exp(-(v/.12)**2)
+            groups[split] = {split:np.column_stack((x, z, x@truth+delta*z))}
+        result = alternating_joint(groups, 2, deployed_coefficients(), (.12,))
+        rms = [s["train_rmse_nm"] for s in result["steps"].values()]
+        assert np.all(np.diff(rms) < 1e-12)
+        if delta:
+            assert result["selected"] == "stribeck"
+            assert abs(result["stribeck"]["delta_nm"]-delta) < 1e-10
+        else:
+            assert result["selected"] == "coulomb_viscous"
+            assert np.allclose(list(result["steps"]["joint_linear"]["parameters"].values()), truth)
+        groups["training"]["training"][:, 4] = 0.
+        try:
+            alternating_joint(groups, 2, deployed_coefficients(), (.12,))
+        except ValueError as error:
+            assert "excitation/rank" in str(error)
+        else:
+            raise AssertionError("Unexcited inertia accepted")
+    print("Identification fit self-test passed (integral/alternating/kinematics, synthetic, no hardware)")
 
 
 if __name__ == "__main__":
@@ -651,6 +900,10 @@ if __name__ == "__main__":
     parser.add_argument("--test", nargs="+", default=[],
                         help="Final unseen records; evaluation only, not fitting/model selection")
     parser.add_argument("--output")
+    parser.add_argument("--alternate", action="store_true",
+                        help="Integrated two-axis fit: two residual/dynamics updates, joint LS, held-out comparison")
+    parser.add_argument("--kinematics", metavar="SAMPLES.CSV",
+                        help="Position/velocity acceleration cross-check only; accepts passive USB recordings")
     parser.add_argument("--returns", nargs="+",
                         help="Summarize matched-center return recordings only; no model fit")
     parser.add_argument("--deployed-inertia", action="store_true",
@@ -659,6 +912,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.self_test:
         self_test()
+    elif args.kinematics:
+        if not args.output:
+            parser.error("--output is required")
+        result = kinematic_check(args.kinematics)
+        Path(args.output).write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
+        print(json.dumps(result["joints"], indent=2))
     elif args.returns:
         if not args.output:
             parser.error("--output is required")
@@ -676,7 +935,17 @@ if __name__ == "__main__":
                   for paths in (args.train, args.validate, args.test)]
         if any(groups[a] & groups[b] for a, b in ((0, 1), (0, 2), (1, 2))):
             parser.error("Training, validation and final test recordings must be separate")
-        result = identify(args.train, args.validate, use_deployed_inertia=args.deployed_inertia,
-                          test_paths=args.test)
+        if args.alternate:
+            if args.deployed_inertia or not args.test:
+                parser.error("--alternate fits the additional inertia and requires --test")
+            result = alternating_identification(args.train, args.validate, args.test)
+        else:
+            result = identify(args.train, args.validate, use_deployed_inertia=args.deployed_inertia,
+                              test_paths=args.test)
         Path(args.output).write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
-        print(json.dumps(result["joints"], indent=2))
+        if args.alternate:
+            for j, r in result["joints"].items():
+                print(f"J{j} {r['selected']}; test RMSE: baseline {r['baseline']['test']['rmse_nm']:.4f}, "
+                      f"joint linear (zero bias) {r['linear_deployed_form']['test']['rmse_nm']:.4f} Nm")
+        else:
+            print(json.dumps(result["joints"], indent=2))

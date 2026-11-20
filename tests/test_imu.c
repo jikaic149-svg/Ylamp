@@ -79,8 +79,8 @@ static void finish(void)
 }
 static void ready(void)
 {
-    BSP_IMU_NotifyReady(BMI088_ACCEL__INTERRUPT_Pin);
-    BSP_IMU_NotifyReady(BMI088_GYRO__INTERRUPT_Pin);
+    BMI088_Port_NotifyReady(BMI088_ACCEL__INTERRUPT_Pin);
+    BMI088_Port_NotifyReady(BMI088_GYRO__INTERRUPT_Pin);
 }
 static void run(uint32_t now)
 {
@@ -121,7 +121,7 @@ int main(int argc, char **argv)
         .CLKPolarity = SPI_POLARITY_HIGH, .CLKPhase = SPI_PHASE_2EDGE,
         .BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8}};
     registers[0][0] = 0x1E; registers[1][0] = 0x0F;
-    assert(BSP_IMU_Init() == HAL_OK);
+    assert(BMI088_Port_Init() == HAL_OK);
     assert(BMI088_Init() == HAL_OK);
     assert(BMI088_IsSuspended());
     assert(registers[0][0x7D] == 0 && registers[1][0x11] == 0x80);

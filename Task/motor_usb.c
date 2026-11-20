@@ -1,15 +1,41 @@
 #include "motor_usb.h"
 #include "bsp_usb.h"
-#include "motor_tuning.h"
+#include "five_control.h"
 #include "motor_telemetry.h"
+#include "joint_calibration.h"
+#include "yummy_imu.h"
+#include "usb_config.h"
 #include <string.h>
+#include <math.h>
 
+_Static_assert(USB_FOCUS_PERIOD_MS>0 && USB_FOCUS_MAX_AGE_MS>0 &&
+               USB_FOCUS_MAX_AGE_MS<=UINT16_MAX,"invalid focus cadence/age");
 static struct {
     bool initialized, session_valid;
     uint8_t frame[31], used, session[8], last_request[24], last_response[20];
     uint8_t response[27], response_length;
     uint32_t epoch, last_byte_ms, last_id;
+    double target[FIVE_AXES];
+    unsigned staged;
+    uint32_t staged_at;
+    YummyIMU_Status_t imu_snapshot;
+    uint32_t imu_snapshot_at;
+    bool imu_snapshot_valid;
+    uint8_t focus_mode;
+    uint32_t focus_at, focus_sequence;
+    bool focus_owns_bmi;
 } link;
+
+static void end_session(void)
+{
+    if (link.session_valid) { FiveControl_Gravity(); }
+    link.session_valid=false; link.staged=0; link.used=0; link.response_length=0;
+    link.focus_mode=0;
+    if (link.focus_owns_bmi) {
+        (void)JointCalibration_SetIMU(false,HAL_GetTick());
+        link.focus_owns_bmi=false; /* Normal asynchronous stop; no retry/reset. */
+    }
+}
 
 static uint32_t get32(const uint8_t *p)
 {
@@ -17,23 +43,208 @@ static uint32_t get32(const uint8_t *p)
         (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24;
 }
 
-static bool allowed(const uint8_t *rpc)
+static void put32(uint8_t *p, uint32_t value)
 {
-    const uint8_t op = rpc[1], scope = rpc[2], field = rpc[3];
-    return (op == 0U && scope == 0U && field == 0U) ||
-        (op == 6U && scope == 0U && field <= 1U) ||
-        (op == 7U && scope == 0U && (field == 2U || field == 3U)) ||
-        (op == 12U && ((scope == 0U &&
-            (field == 0U || (field >= 5U && field <= 8U) || field == 255U)) ||
-            ((scope == 1U || scope == 2U) && field >= 11U && field <= 14U)));
+    for (unsigned i=0;i<4;++i) { p[i]=(uint8_t)(value>>(8U*i)); }
+}
+
+static void put_float(uint8_t *p, float value)
+{
+    uint32_t bits; memcpy(&bits,&value,sizeof bits); put32(p,bits);
+}
+
+static void focus_sample(uint32_t now)
+{
+    if (now-link.focus_at<USB_FOCUS_PERIOD_MS) { return; }
+    link.focus_at=now;
+    const FiveControl_Status *s=FiveControl_StatusNow();
+    const bool j2=link.focus_mode==3;
+    const DM_Motor_Feedback_t *f=s ? &s->feedback[j2 ? 1 : 2] : NULL;
+    uint32_t imu_at=0,imu_count=0;
+    float angle=NAN;
+    bool ready=false;
+    if (j2) {
+        BMI088_Sample_t b;
+        JointCalibration_Status_t cal;
+        if (BMI088_GetSample(&b)==HAL_OK &&
+            hypotf(b.accel_m_s2[0],hypotf(b.accel_m_s2[1],b.accel_m_s2[2]))>.001f) {
+            angle=atan2f(-b.accel_m_s2[0],
+                hypotf(b.accel_m_s2[1],b.accel_m_s2[2]))*57.29577951308232f;
+            imu_at=b.received_at_ms; imu_count=b.sequence;
+            ready=JointCalibration_GetStatus(now,&cal)==BSP_CAN_OK &&
+                (cal.flags & (CAL_IMU_FRESH|CAL_WARM))==(CAL_IMU_FRESH|CAL_WARM);
+        }
+    } else {
+        YummyIMU_Status_t y; YummyIMU_GetStatus(&y);
+        angle=y.pitch_deg; imu_at=y.received_at_ms; imu_count=y.sequence;
+        ready=y.rx_running;
+    }
+    const bool motor=f && f->received_count && isfinite(f->position_rad);
+    const bool imu=imu_count && isfinite(angle);
+    uint8_t frame[43]={0xA5,0x5A,1,0x94,36};
+    uint8_t *p=frame+5;
+    put32(p,++link.focus_sequence); put32(p+4,now);
+    put32(p+8,motor ? f->received_at_ms : 0);
+    put32(p+12,motor ? f->received_count : 0);
+    put32(p+16,imu ? imu_at : 0);
+    put32(p+20,imu ? imu_count : 0);
+    put_float(p+24,motor ? f->position_rad*57.29577951308232f : NAN);
+    put_float(p+28,imu ? angle : NAN);
+    p[32]=(motor ? 1U : 0U) |
+        (motor && now-f->received_at_ms<=USB_FOCUS_MAX_AGE_MS ? 2U : 0U) |
+        (imu ? 4U : 0U) |
+        (imu && ready && now-imu_at<=USB_FOCUS_MAX_AGE_MS ? 8U : 0U);
+    p[33]=motor ? f->state : 255U;
+    p[34]=(uint8_t)USB_FOCUS_MAX_AGE_MS;
+    p[35]=(uint8_t)(USB_FOCUS_MAX_AGE_MS>>8);
+    const uint16_t crc=MotorTelemetry_CRC16(frame+2,39);
+    frame[41]=(uint8_t)crc; frame[42]=(uint8_t)(crc>>8);
+    /* BSP copies before returning; BUSY drops this sample, never catches up. */
+    (void)BSP_USB_Send(frame,sizeof frame);
+}
+
+static void imu_request(const uint8_t *rpc, uint32_t now_ms, uint8_t *reply)
+{
+    BSP_CAN_Status_t result = BSP_CAN_INVALID_ARG;
+    uint32_t value = 0U;
+    const uint8_t field = rpc[3];
+    if (rpc[2] == 0U && get32(&rpc[4]) == 0U) {
+        if (field == 255U) { result = BSP_CAN_OK; value = MOTOR_UART_IMU_VERSION; }
+        else if (field <= 9U) {
+            if (field == 0U) {
+                YummyIMU_GetStatus(&link.imu_snapshot);
+                link.imu_snapshot_at = now_ms;
+                link.imu_snapshot_valid = true;
+            }
+            if (!link.imu_snapshot_valid || now_ms - link.imu_snapshot_at > 1000U) {
+                result = BSP_CAN_NOT_READY;
+            } else {
+                const YummyIMU_Status_t *s = &link.imu_snapshot;
+                const uint32_t age = s->sequence == 0U ? UINT32_MAX :
+                    link.imu_snapshot_at - s->received_at_ms;
+                result = BSP_CAN_OK;
+                if (field == 0U) {
+                    value = 0xB1000000UL | (uint32_t)s->format << 8 |
+                        (s->rx_running ? 1U : 0U) | (s->sequence != 0U ? 2U : 0U) |
+                        (s->rx_running && age <= 500U ? 4U : 0U);
+                } else if (field == 1U) { value = age; }
+                else if (field == 2U) { value = s->sequence; }
+                else if (field >= 3U && field <= 5U) {
+                    const float angles[3] = {s->pitch_deg, s->roll_deg, s->yaw_deg};
+                    memcpy(&value, &angles[field - 3U], sizeof(value));
+                } else if (field == 6U) { value = s->rx_bytes; }
+                else if (field == 7U) { value = s->bad_frames; }
+                else if (field == 8U) { value = s->overflows; }
+                else { value = s->uart_error; }
+            }
+        }
+    }
+    reply[1] = (uint8_t)result;
+    memcpy(&reply[4], &value, sizeof(value));
+}
+
+static void joint_reference_request(const uint8_t *rpc, uint8_t *reply)
+{
+    BSP_CAN_Status_t result = BSP_CAN_INVALID_ARG;
+    uint32_t value = 0U;
+    const uint8_t scope = rpc[2], field = rpc[3];
+    if (get32(&rpc[4]) == 0U) {
+        if (scope == 0U && field == 255U) {
+            result = BSP_CAN_OK;
+            value = MOTOR_JOINT_REFERENCE_VERSION;
+        } else if (scope >= 1U && scope <= MOTOR_CAN_JOINT_COUNT && field <= 3U) {
+            const MotorJointReference_Config_t *r = &g_joint_reference_config[scope - 1U];
+            result = r->kind == 0U ? BSP_CAN_NOT_READY : BSP_CAN_OK;
+            if (field == 0U) { value = r->kind; }
+            else {
+                const float fields[] = {
+                    r->zero_rad, r->observed_lower_rad, r->observed_upper_rad
+                };
+                memcpy(&value, &fields[field - 1U], sizeof(value));
+            }
+        }
+    }
+    reply[1] = (uint8_t)result;
+    for (unsigned i = 0U; i < 4U; ++i) { reply[4U+i] = (uint8_t)(value >> (8U*i)); }
+}
+
+static void five_request(const uint8_t *r,uint32_t arrived,uint32_t now,uint8_t *reply)
+{
+    const FiveControl_Status *s=FiveControl_StatusNow();
+    const unsigned scope=r[2], field=r[3];
+    const uint32_t arg=get32(r+4);
+    uint32_t value=0;
+    BSP_CAN_Status_t rc=BSP_CAN_INVALID_ARG;
+    if (!s) { rc=BSP_CAN_NOT_READY; }
+#ifdef YLAMP_J3_REVERSE_TEST
+    else if (!scope && !arg && field==254) { rc=BSP_CAN_OK;value=MOTOR_J3_REVERSE_VERSION; }
+#endif
+    else if (!scope && !arg && field==253) { rc=BSP_CAN_OK;value=MOTOR_J3_READ_VERSION; }
+    else if (!scope && !arg && (field<=3 || field==255)) {
+        rc=BSP_CAN_OK;
+        if (field==255) { value=MOTOR_FIVE_VERSION; }
+        else if (!field) { value=s->phase | (uint32_t)s->fresh<<8 | (uint32_t)s->enabled<<16 | (uint32_t)s->submitted<<24; }
+        else if (field==1) { value=s->fault; }
+        else if (field==2) { value=s->gravity_valid ? now-s->gravity_at : UINT32_MAX; }
+        else { value=s->limited; }
+    } else if (scope>=1 && scope<=5 && !arg && field==4) {
+        rc=s->gravity_valid ? BSP_CAN_OK : BSP_CAN_NOT_READY;
+        if (rc==BSP_CAN_OK) { memcpy(&value,&s->gravity_nm[scope-1],4); }
+    } else if (now-arrived>500U) { rc=BSP_CAN_NOT_READY; }
+    else if (scope>=1 && scope<=5 && field==5) {
+        float deg; memcpy(&deg,&arg,sizeof deg);
+        if (isfinite(deg)) {
+            if (!link.staged || now-link.staged_at>2000U) { link.staged=0;link.staged_at=now; }
+            link.target[scope-1]=deg; link.staged|=1U<<(scope-1); rc=BSP_CAN_OK;
+        }
+    } else if (!scope && field==6) {
+        rc=(link.staged==FIVE_ALL && now-link.staged_at<=2000U) ? FiveControl_Move(link.target,arg) : BSP_CAN_NOT_READY;
+        link.staged=0;
+    } else if (!scope && !arg && field==7) { FiveControl_Gravity(); link.staged=0;rc=BSP_CAN_OK; }
+    else if (!scope && !arg && field==8) { rc=FiveControl_Acknowledge(); }
+    else if (!scope && field==9 && arg==MOTOR_COLD_SUPPORTED) { rc=FiveControl_ColdStart(); }
+    else if (scope==3 && field==11 && arg==MOTOR_J3_READ_SUPPORTED) { rc=FiveControl_ReadLegacyJ3(); }
+#ifdef YLAMP_J3_REVERSE_TEST
+    else if (scope==3 && field==10 && arg==MOTOR_J3_REVERSE_SUPPORTED) { rc=FiveControl_ReverseJ3(); }
+#endif
+    reply[1]=(uint8_t)rc; memcpy(reply+4,&value,4);
 }
 
 static void request(uint32_t now_ms)
 {
     const uint8_t *p = &link.frame[5];
     uint8_t type = 0x92U, length = 8U;
-    if (link.frame[3] == 0x12U) {
+    if (link.frame[3] == 0x13U) {
+        /* Nonce-matched observation command, deliberately outside control
+         * SESSION: start/pause must never invoke an actuator or mode switch. */
+        type=0x93U; length=18U;
+        const uint8_t mode=p[8];
+        BSP_CAN_Status_t rc=mode<=4 ? BSP_CAN_OK : BSP_CAN_INVALID_ARG;
+        if (mode==3 && !link.focus_owns_bmi) {
+            JointCalibration_Status_t cal;
+            rc=JointCalibration_GetStatus(now_ms,&cal);
+            if (rc==BSP_CAN_OK && (cal.flags & (CAL_IMU_ACTIVE|CAL_IMU_STOPPING|CAL_IMU_STOP_FAILED))) {
+                rc=BSP_CAN_BUSY; /* Never take over somebody else's IMU session. */
+            }
+            if (rc==BSP_CAN_OK) {
+                rc=JointCalibration_SetIMU(true,now_ms);
+                if (rc==BSP_CAN_OK) { link.focus_owns_bmi=true; }
+            }
+        } else if (mode<=2 && link.focus_owns_bmi) {
+            rc=JointCalibration_SetIMU(false,now_ms);
+            if (rc==BSP_CAN_OK) { link.focus_owns_bmi=false; }
+        }
+        if (rc==BSP_CAN_OK) {
+            link.focus_mode=mode;
+            link.focus_at=now_ms-USB_FOCUS_PERIOD_MS;
+        }
+        memcpy(link.response+5,p,8);
+        link.response[13]=mode; link.response[14]=(uint8_t)rc;
+        put32(link.response+15,mode==3 || mode==4 ? MOTOR_J2_FOCUS_VERSION : MOTOR_FOCUS_VERSION);
+        put32(link.response+19,now_ms);
+    } else if (link.frame[3] == 0x12U) {
         if (!link.session_valid || memcmp(link.session, p, 8U) != 0) {
+            end_session();
             memcpy(link.session, p, 8U);
             link.last_id = 0U;
             link.session_valid = true;
@@ -54,10 +265,12 @@ static void request(uint32_t now_ms)
                     memcpy(response, link.last_response, 20U);
                 } else { reply[1] = BSP_CAN_INVALID_ARG; }
             } else if (link.last_id != UINT32_MAX && id == link.last_id + 1U) {
-                if (!allowed(rpc)) { reply[1] = BSP_CAN_INVALID_ARG; }
-                else if (MotorTuning_HandleRequest(rpc, get32(&p[12]), now_ms, reply) != BSP_CAN_OK) {
-                    reply[1] = BSP_CAN_ERROR;
-                }
+                if (rpc[1] == 16U) { five_request(rpc,get32(&p[12]),now_ms,reply); }
+                else if (rpc[1] == 15U) { joint_reference_request(rpc, reply); }
+                else if (rpc[1] == 14U) { imu_request(rpc, now_ms, reply); }
+                else if (rpc[1]==10 && !rpc[2] && rpc[3]<=1 && !get32(rpc+4) && now_ms-get32(&p[12])<=500U) {
+                    reply[1]=(uint8_t)JointCalibration_SetIMU(rpc[3]!=0,now_ms);
+                } else { reply[1]=BSP_CAN_INVALID_ARG; }
                 /* Cache even rejected requests before TX; retry cannot execute
                  * a command twice, or change an expired intent's timestamp. */
                 memcpy(link.last_request, p, 24U);
@@ -75,11 +288,22 @@ static void request(uint32_t now_ms)
     link.response_length = (uint8_t)(length + 7U);
 }
 
-void MotorUSB_Init(void) { memset(&link, 0, sizeof(link)); link.initialized = true; }
+void MotorUSB_Init(void)
+{
+    memset(&link, 0, sizeof(link));
+    link.initialized = true;
+}
 
 bool MotorUSB_Run(void)
 {
     if (!link.initialized || __get_IPSR() != 0U) { return true; }
+    BSP_USB_Diagnostics_t diag = {0};
+    (void)BSP_USB_GetDiagnostics(&diag);
+    if (!diag.configured || !diag.dtr || BSP_USB_RxEpoch() != link.epoch) {
+        end_session();
+    }
+    /* Runs even when USB TX is busy or the host is gone; stopping must not
+     * depend on the next RPC response getting a telemetry slot. */
     /* Single consumer; ISR only enqueues bytes. Work bounded to 64 bytes/tick.
      * Check the RX epoch before sending a cached reply too. */
     for (unsigned budget = 0U; budget < 64U; ++budget) {
@@ -90,7 +314,7 @@ bool MotorUSB_Run(void)
         __disable_irq();
         if (BSP_USB_RxEpoch() != link.epoch) {
             link.epoch = BSP_USB_RxEpoch();
-            link.used = 0U; link.session_valid = false; link.response_length = 0U;
+            end_session();
         }
         if (link.response_length != 0U) {
             BSP_USB_Diagnostics_t diag = {0};
@@ -106,7 +330,7 @@ bool MotorUSB_Run(void)
         }
         const BSP_USB_Status_t got = BSP_USB_Read(&byte, &at, &epoch);
         if (epoch != link.epoch) {
-            link.epoch = epoch; link.used = 0U; link.session_valid = false;
+            link.epoch = epoch; end_session();
         }
         __set_PRIMASK(mask);
         if (got != BSP_USB_OK) { break; }
@@ -116,7 +340,8 @@ bool MotorUSB_Run(void)
         while (link.used >= 5U) {
             const uint8_t *p = link.frame;
             const bool header = p[0] == 0xA5U && p[1] == 0x5AU && p[2] == 1U &&
-                ((p[3] == 0x12U && p[4] == 8U) || (p[3] == 0x11U && p[4] == 24U));
+                ((p[3] == 0x12U && p[4] == 8U) || (p[3] == 0x11U && p[4] == 24U) ||
+                 (p[3] == 0x13U && p[4] == 9U));
             const unsigned total = (unsigned)p[4] + 7U;
             if (header && link.used < total) { break; }
             if (header && MotorTelemetry_CRC16(&p[2], total - 4U) ==
@@ -133,6 +358,10 @@ bool MotorUSB_Run(void)
             }
             memmove(link.frame, link.frame + 1, --link.used);
         }
+    }
+    if (link.focus_mode) {
+        if (link.focus_mode==1 || link.focus_mode==3) { focus_sample(HAL_GetTick()); }
+        return false; /* Includes PAUSE: no fallback five-axis stream. */
     }
     return true;
 }

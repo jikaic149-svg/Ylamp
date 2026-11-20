@@ -6,5 +6,8 @@
  * Actual throughput/jitter/CPU budget require a board+host measurement. */
 #define USB_TELEMETRY_PERIOD_MS 1U
 #define USB_TELEMETRY_MAX_AGE_MS 100U
+/* Temporary J3 raw encoder + Yummy Pitch observer; not a motor-control mode. */
+#define USB_FOCUS_PERIOD_MS 10U
+#define USB_FOCUS_MAX_AGE_MS 40U
 
 #endif

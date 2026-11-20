@@ -4,9 +4,10 @@
 #include "bsp_rgb.h"
 #include "bsp_uart.h"
 #include "dm_motor.h"
-#include "motor_task.h"
-#include "motor_tuning.h"
-#include "motor_serial.h"
+#include "five_mit.h"
+#include "five_control.h"
+#include "five_support.h"
+#include "five_workspace.h"
 #include "joint_calibration.h"
 #include "serial_config.h"
 #include "can3_telemetry.h"
@@ -67,17 +68,12 @@ static unsigned uart_rx_calls, uart_tx_calls, uart_abort_calls, uart_callbacks;
 static uint8_t *uart_rx_data;
 static const uint8_t *uart_tx_data;
 static uint16_t uart_tx_len;
-static DMA_HandleTypeDef uart_receive_dma = {
-    .Init = {.Mode = DMA_CIRCULAR, .Direction = DMA_PERIPH_TO_MEMORY}};
-static DMA_HandleTypeDef uart_transmit_dma = {
-    .Init = {.Mode = DMA_NORMAL, .Direction = DMA_MEMORY_TO_PERIPH}};
 static uint32_t spi_clock = 50000000U;
 static HAL_StatusTypeDef spi_result = HAL_OK;
 static uint8_t spi_wire[524];
 static unsigned spi_calls;
 static void (*tick_hook)(void);
 
-int bsp_cpp_headers_check(void);
 
 HAL_StatusTypeDef HAL_FDCAN_Init(FDCAN_HandleTypeDef *bus)
 {
@@ -976,12 +972,12 @@ static void test_dm_motor(void)
     assert(feedback.position_rad == -6.0f && feedback.velocity_rad_s == 8.0f);
     assert(feedback.torque_nm == -2.0f);
 
-    /* Screenshot J2 sample: 02 64 F6 7F F8 00 1E 1B. Remap only motor ID
-     * to this fixture's DM4340; data fields must reproduce the saved upright. */
+    /* Historical screenshot: 02 64 F6 7F F8 00 1E 1B. Remap only motor ID;
+     * codec raw decoding must not depend on a subsequently changed zero. */
     const uint8_t observed[8] = {0x01U, 0x64U, 0xF6U, 0x7FU, 0xF8U, 0x00U, 0x1EU, 0x1BU};
     inject_motor_feedback(&hfdcan1, 0x11U, observed, 8U);
     assert(DM_Motor_GetFeedback(m4340, &feedback) == BSP_CAN_OK);
-    assert(fabsf(feedback.position_rad - g_motor_config.drag_j2_zero_rad) < 1e-6f);
+    assert(fabsf(feedback.position_rad - (-2.640383005142212f)) < 1e-6f);
     assert(fabsf(feedback.velocity_rad_s + .00244200244f) < 1e-6f);
     assert(fabsf(feedback.torque_nm - .00683760684f) < 2e-6f);
     assert(feedback.state == 0U && feedback.mos_temperature_c == 30U &&
@@ -1022,8 +1018,6 @@ static void test_dm_motor_capacity(void)
 }
 
 
-#include "test_motor_task.inc"
-#include "test_motor_serial.inc"
 
 static void receive_during_can_start(FDCAN_HandleTypeDef *bus)
 {
@@ -1071,7 +1065,7 @@ static void test_can_motor_config(void)
 {
     DM_Motor_t *motors[MOTOR_CAN_JOINT_COUNT] = {0};
     DM_Motor_Feedback_t feedback;
-    assert(MOTOR_CAN_JOINT_COUNT == 5U && MOTOR_TASK_JOINT_COUNT == 2U);
+    assert(MOTOR_CAN_JOINT_COUNT == 5U && FIVE_AXES == 5);
     assert(BSP_CAN_Init(&hfdcan1) == BSP_CAN_OK);
     assert(BSP_CAN_Init(&hfdcan2) == BSP_CAN_OK);
     for (unsigned i = 0U; i < MOTOR_CAN_JOINT_COUNT; ++i) {
@@ -1084,24 +1078,10 @@ static void test_can_motor_config(void)
                                           DM_MOTOR_PROTOCOL_V13));
         assert(cfg->pmax == 12.5f && cfg->vmax == (large ? 10.0f : 30.0f));
         assert(cfg->tmax == (large ? 28.0f : 10.0f));
-        if (i < MOTOR_TASK_JOINT_COUNT) {
-            const DM_Motor_Config_t *controlled = &g_motor_config.joint[i].device;
-            assert(controlled->model == cfg->model && controlled->bus == cfg->bus);
-            assert(controlled->can_id == cfg->can_id && controlled->master_id == cfg->master_id);
-            assert(controlled->pmax == cfg->pmax && controlled->vmax == cfg->vmax &&
-                   controlled->tmax == cfg->tmax);
-        }
         assert(DM_Motor_Init(cfg, &motors[i]) == BSP_CAN_OK);
     }
     assert(can_tx_calls == 0U && gpio_writes == 0U);
-    /* Five feedback registrations and the real tuning endpoint must coexist. */
-    assert(MotorTask_Init(&g_motor_config, motors, 1000U) == BSP_CAN_OK);
-    MotorTask_Config_t changed = g_motor_config;
-    changed.joint[0].device.protocol = DM_MOTOR_PROTOCOL_LEGACY_MIT;
-    assert(MotorTask_ApplyConfig(&changed, 1000U) == BSP_CAN_INVALID_ARG);
-    assert(MotorTask_GetConfig(&changed) == BSP_CAN_OK);
-    assert(changed.joint[0].device.protocol == DM_MOTOR_PROTOCOL_V13);
-    assert(MotorTuning_Init(g_motor_config.joint[0].device.bus) == BSP_CAN_OK);
+    assert(FiveControl_Init(motors, test_tick));
     assert(can_tx_calls == 0U);
     for (unsigned i = 0U; i < MOTOR_CAN_JOINT_COUNT; ++i) {
         const DM_Motor_Config_t *cfg = &g_motor_can_config[i];
@@ -1614,9 +1594,25 @@ static void test_can3_fd(bool fail_init)
     test_ipsr = 0U;
 }
 
+#include "five_mit_checks.inc"
+
 int main(int argc, char **argv)
 {
     initialize_fake_hardware();
+    if (argc==2 && strcmp(argv[1],"five-mit")==0) { test_five_mit(); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-control")==0) { test_control(); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-key")==0) { test_key_modes(); return 0; }
+#ifdef YLAMP_J3_REVERSE_TEST
+    if (argc==2 && strcmp(argv[1],"five-j3-reverse")==0) { test_j3_reverse(); return 0; }
+#endif
+    if (argc==2 && strcmp(argv[1],"five-motion-admission")==0) { test_motion_admission(); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-cold")==0) { test_cold(false); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-cold-silent")==0) { test_cold(true); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-j3-read")==0) { test_j3_read("ok"); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-j3-read-timeout")==0) { test_j3_read("timeout"); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-j3-read-cancel")==0) { test_j3_read("cancel"); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-j3-read-tx")==0) { test_j3_read("tx"); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-wire")==0) { return five_wire_stream(); }
     if (argc == 2 && (strcmp(argv[1], "can3-fd") == 0 ||
                       strcmp(argv[1], "can3-init-failure") == 0)) {
         test_can3_fd(strcmp(argv[1], "can3-init-failure") == 0);
@@ -1643,24 +1639,9 @@ int main(int argc, char **argv)
         puts("PASS: explicit bounded CAN recovery gates, FIFO flush and immutable evidence");
         return 0;
     }
-    if (argc == 2 && strcmp(argv[1], "serial-link") == 0) {
-        test_serial_link();
-        puts("PASS: UART framing/RPC, CRC, overflow, stale actions and Bus-Off telemetry");
-        return 0;
-    }
-    if (argc == 2 && strcmp(argv[1], "serial-reliable") == 0) {
-        test_serial_reliable();
-        puts("PASS: circular DMA cursors, retry after overflow/lost reply, dedup and stale IDs");
-        return 0;
-    }
     if (argc == 2 && strcmp(argv[1], "can-diagnostics") == 0) {
         test_can_diagnostics();
         puts("PASS: immutable first CAN error / Bus-Off evidence, IRQ and send sampling");
-        return 0;
-    }
-    if (argc == 2 && strncmp(argv[1], "task-", 5U) == 0) {
-        test_task(argv[1]);
-        puts("PASS: drag Mode, Task gates and guarded MIT output");
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "dm-motor-full") == 0) {
@@ -1669,7 +1650,6 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "dm-motor") == 0) {
-        assert(bsp_cpp_headers_check() == 0);
         test_dm_motor();
         puts("PASS: DM4310 / DM4340 MIT, feedback and transport failures");
         return 0;
@@ -1683,7 +1663,7 @@ int main(int argc, char **argv)
         puts("PASS: key held at boot does not synthesize an edge");
         return 0;
     }
-    assert(bsp_cpp_headers_check() == 0);
+    if (argc != 1) { return 2; }
     test_can();
     test_key();
     test_power();

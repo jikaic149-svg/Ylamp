@@ -17,6 +17,13 @@ ALL_PROTECTIONS = sum(mask for mask, _ in PROTECTIONS)
 CALIBRATION_VERSION = 0x594C4302
 DRAG_VERSION = 0x594C4402
 MOTION_VERSION = 0x594C5002
+J3_FEEDBACK_VERSION = 0x594C4A01
+UART_IMU_VERSION = 0x594C4901
+JOINT_REFERENCE_VERSION = 0x594C5202
+J3_FEEDBACK_PHASES = ("未采集", "确认失能", "预装中性MIT", "确认使能",
+                      "采集中（100Hz中性MIT）", "停止：确认失能", "失能未确认")
+J3_FEEDBACK_REASONS = ("无", "反馈过期", "电机状态异常", "过温", "CAN提交失败",
+                       "使能确认超时", "失能确认超时")
 DRAG_PHASES = ("关闭/仅预览", "建立支撑", "自由拖动", "转保持", "保持", "释放保持")
 IMU_AXES = ("未确认", "+X", "-X", "+Y", "-Y", "+Z", "-Z")
 TASK_STATES = ("空闲（未使能）", "使能确认中", "运行", "转保持中", "保持（有力矩）", "故障锁定",
@@ -129,6 +136,12 @@ def validate_motion(values):
     return values
 
 
+class RpcRejected(RuntimeError):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
 class Client:
     """TX thread owns RPC; RX thread only delivers matched replies to a queue."""
     def __init__(self, send, events, stop):
@@ -141,6 +154,9 @@ class Client:
         self.drag_supported = False
         self.motion_supported = False
         self.capture_supported = False
+        self.j3_feedback_supported = False
+        self.j3_feedback_status = None
+        self.j3_feedback_at = 0.0
         self.online = False
         self.next_status = 0.0
         self.snapshot = None
@@ -150,6 +166,8 @@ class Client:
         # Recorders already consume the fast telemetry. They can omit bulky
         # diagnostic snapshots without pretending the firmware lacks features.
         self.poll_details = True
+        self.poll_imu = False
+        self.uart_imu_supported = False  # USB-only, read-only external sensor
 
     def receive(self, data):
         if len(data) == 8:
@@ -163,8 +181,10 @@ class Client:
             return "连接正在关闭"
         if not self.supported:
             return "尚未识别支持调参的 MCU 固件"
-        stopping = kind == "command" and (
+        stopping = (kind == "command" and (
             payload[0] if isinstance(payload, tuple) else payload) in (2, 3)
+            or kind == "j3_feedback" and payload is False
+            or kind == "imu" and (payload[0] if isinstance(payload, tuple) else payload) is False)
         if not self.online and kind != "read" and not stopping:
             return "MCU 状态未知，请先显式重新读取"
         try:
@@ -174,9 +194,10 @@ class Client:
         return ""
 
     def rpc(self, op, scope=0, field=0, value=0, floating=False):
-        readonly = op in (0, 1, 6, 8, 11) or (
+        readonly = op in (0, 1, 6, 8, 11, 14, 15) or (
             op == 12 and (scope == 0 and field in (0, 5, 6, 7, 255)
-                          or scope in (1, 2) and field in (11, 12, 13, 14)))
+                          or scope in (1, 2) and field in (11, 12, 13, 14))) or (
+            op == 13 and scope == 3 and field in (0, 255))
         # Only reads may make fresh-sequence attempts here. The reliable UART
         # transport may retry an identical envelope with MCU deduplication;
         # CAN actions/commits are still submitted only once.
@@ -196,7 +217,7 @@ class Client:
                     continue
                 if reply[1] != 0:
                     reason = RESULTS[reply[1]] if reply[1] < len(RESULTS) else f"未知状态{reply[1]}"
-                    raise RuntimeError(f"{reason}（op={op}, scope={scope}, field={field}）")
+                    raise RpcRejected(reply[1], f"{reason}（op={op}, scope={scope}, field={field}）")
                 return struct.unpack("<f" if floating else "<I", reply[4:])[0]
         raise TimeoutError("MCU 只读查询连续超时/已断开；状态未知，请重新读取" if readonly else
                            "MCU 应答超时/已断开；未重发，实际结果未知，请重新读取")
@@ -246,7 +267,7 @@ class Client:
             self.online = False
             self.events.put(("tuning_error", str(exc)))
 
-    def read_calibration(self):
+    def read_calibration(self, include_joints=True):
         captured_at = time.perf_counter()
         packed = self.rpc(8)  # freeze one coherent MCU snapshot, valid for 1s
         if packed >> 24 != 0xC1:
@@ -259,7 +280,7 @@ class Client:
             "accel": [self.rpc(8, field=f, floating=True) for f in (4, 5, 6)],
             "gyro": [self.rpc(8, field=f, floating=True) for f in (7, 8, 9)],
             "joints": [[self.rpc(8, j, f, floating=True) for f in (1, 2, 3, 4)]
-                       for j in (1, 2)],
+                       for j in (1, 2)] if include_joints else [],
             "at": captured_at,
         }
         if snapshot["axis"] > 6 or snapshot["valid_mask"] > 3:
@@ -282,6 +303,25 @@ class Client:
         if snapshot["phase"] >= len(DRAG_PHASES):
             raise RuntimeError("拖动阶段无效")
         self.events.put(("drag_status", snapshot))
+        return snapshot
+
+    def read_uart_imu(self):
+        captured_at = time.perf_counter()
+        packed = self.rpc(14)
+        if packed >> 16 != 0xB100 or (packed >> 8) & 255 not in (0, 1) or packed & 255 > 7:
+            raise RuntimeError("UART10 IMU 快照版本不匹配")
+        snapshot = {
+            "flags": packed & 255, "format": (packed >> 8) & 255,
+            "age_ms": self.rpc(14, field=1), "count": self.rpc(14, field=2),
+            "angles": [self.rpc(14, field=f, floating=True) for f in (3, 4, 5)],
+            "rx_bytes": self.rpc(14, field=6), "bad_frames": self.rpc(14, field=7),
+            "overflows": self.rpc(14, field=8), "uart_error": self.rpc(14, field=9),
+            "at": captured_at,
+        }
+        if snapshot["flags"] & 2 and any(not math.isfinite(v) or abs(v) > 180
+                                         for v in snapshot["angles"]):
+            raise RuntimeError("UART10 IMU 姿态角无效")
+        self.events.put(("uart_imu_status", snapshot))
         return snapshot
 
     def read_motion(self):
@@ -332,6 +372,15 @@ class Client:
                             for k, v in snapshot["values"].items()):
                         raise RuntimeError("提交后回读不一致；请勿启动，重新读取")
                     self.events.put(("tuning_applied", snapshot))
+                elif kind == "j3_feedback":
+                    if not self.j3_feedback_supported:
+                        raise RuntimeError("固件未提供J3手动采集，请更新配套固件")
+                    if type(payload) is not bool:
+                        raise ValueError("J3采集只接受开始/停止")
+                    if payload and time.perf_counter() - requested > 0.5:
+                        raise RuntimeError("J3启动请求排队过期；未发送")
+                    self.rpc(13, scope=3, field=1 if payload else 2)
+                    self.events.put(("j3_feedback_ack", payload))
                 elif kind == "command":
                     action, revision = payload if isinstance(payload, tuple) else (payload, 0)
                     if action == 1 and time.perf_counter() - requested > 0.5:
@@ -378,14 +427,16 @@ class Client:
                         joint, axis, revision = payload
                         self.rpc(9, joint, axis, revision)
                     else:
-                        enabled, revision = payload
+                        enabled, revision = ((payload, self.rpc(6, field=1))
+                                             if type(payload) is bool else payload)
                         self.rpc(10, field=int(enabled), value=revision)
-                    self.read_calibration()
+                    self.read_calibration(include_joints=self.poll_details)
                     self.events.put(("calibration_ack", kind))
                 else:
                     raise ValueError("未知调参操作")
             except Exception as exc:
                 self.events.put(("calibration_error" if kind in ("calibration", "imu")
+                                 else "j3_feedback_error" if kind == "j3_feedback"
                                  else "tuning_error", str(exc)))
         if self.supported and self.online and time.perf_counter() >= self.next_status:
             self.next_status = time.perf_counter() + 0.5
@@ -395,14 +446,28 @@ class Client:
                 self.task_status = (*struct.pack("<I", packed), revision)
                 self.task_status_at = time.perf_counter()
                 self.events.put(("task_status", self.task_status))
+                if self.j3_feedback_supported:
+                    packed = self.rpc(13, scope=3)
+                    phase, reason, state, tag = struct.pack("<I", packed)
+                    if (tag != 0xA3 or phase >= len(J3_FEEDBACK_PHASES) or
+                            reason >= len(J3_FEEDBACK_REASONS) or state not in (*range(16), 255)):
+                        raise RuntimeError("J3采集状态格式无效")
+                    self.j3_feedback_status = (phase, reason, state)
+                    self.j3_feedback_at = time.perf_counter()
+                    self.events.put(("j3_feedback_status", self.j3_feedback_status))
             except Exception as exc:
                 self.events.put(("tuning_error", str(exc)))
                 self.online = False  # keep capability known; don't fall back to bare enable
-            if self.online and self.poll_details and self.calibration_supported:
+            if self.online and (self.poll_details or self.poll_imu) and self.calibration_supported:
                 try:
-                    self.read_calibration()
+                    self.read_calibration(include_joints=self.poll_details)
                 except Exception as exc:
                     self.events.put(("calibration_error", str(exc)))
+            if self.online and self.uart_imu_supported:
+                try:
+                    self.read_uart_imu()
+                except Exception as exc:
+                    self.events.put(("uart_imu_error", str(exc)))
             if self.online and self.poll_details and self.drag_supported:
                 try:
                     self.read_drag()
@@ -620,7 +685,7 @@ class Panel:
         from tkinter import ttk
         tk = self.tk
         ttk.Label(page, text="建模角度 = 参考圈角度 − 建模零点（°）；参考角 = 原始角 + 整数圈 × 360°\n"
-                  "J1：当前区间中点。J2：连杆朝上，竖直参考点。不会改电机零点、原始限位或驱动电机。",
+                  "J1：实测行程中点，保留原始圈数。J2：连杆朝上。不会改电机零点、原始限位或驱动电机。",
                   wraplength=950).pack(anchor="w", pady=8)
         self.cal_text = tk.StringVar(value="等待标定状态；IMU 默认关闭。")
         ttk.Label(page, textvariable=self.cal_text, wraplength=950).pack(anchor="w", pady=8)
@@ -639,7 +704,7 @@ class Panel:
         self.imu_start.pack(side="left", padx=4)
         self.imu_stop = ttk.Button(row, text="关闭 IMU", command=lambda: self.imu_session(False))
         self.imu_stop.pack(side="left", padx=4)
-        self.cal_j1 = ttk.Button(row, text="以区间中点重标 J1", command=lambda: self.mark(1))
+        self.cal_j1 = ttk.Button(row, text="恢复 J1 软件零点", command=lambda: self.mark(1))
         self.cal_j1.pack(side="left", padx=4)
         ttk.Label(page, text="连杆朝上时，传感器哪个正/负轴应当朝上？\n"
                   "必须按板上轴向与实际安装确认；不是自动选最大分量。",
@@ -734,7 +799,7 @@ class Panel:
             return
         c = self.calibration
         payload = {"schema": 2, "units": "degree",
-                   "formula": "reference = raw + 360*k; model = reference - zero",
+                   "formula": "model = reference - zero; J1 reference = raw; J2 reference = raw + 360*k",
                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                    "j2_reference": "link_up", "imu_up_axis": IMU_AXES[c["axis"]],
                    "imu_vertical_verified": 1 <= c["axis"] <= 6,

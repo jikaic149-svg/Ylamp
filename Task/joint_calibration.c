@@ -1,4 +1,6 @@
 #include "joint_calibration.h"
+#include "motor_config.h"
+#include "five_control.h"
 
 #include <math.h>
 #include <string.h>
@@ -25,20 +27,16 @@ static float angle(const float a[3], const float b[3])
     return acosf(fmaxf(-1.0f, fminf(1.0f, dot)));
 }
 
-static bool motors_still(uint32_t now_ms, MotorTask_Status_t *status,
-                         MotorTask_Config_t *config)
+static bool motors_still(uint32_t now_ms, const FiveControl_Status *status)
 {
-    if (MotorTask_GetStatus(status) != BSP_CAN_OK ||
-        MotorTask_GetConfig(config) != BSP_CAN_OK ||
-        (status->state != MOTOR_TASK_IDLE && status->state != MOTOR_TASK_FAULT) ||
-        status->feedback_valid_mask != 3U) { return false; }
-    for (unsigned i = 0U; i < 2U; ++i) {
+    if (!status || status->fresh!=FIVE_ALL || status->enabled) { return false; }
+    for (unsigned i = 0U; i < FIVE_AXES; ++i) {
         const DM_Motor_Feedback_t *fb = &status->feedback[i];
-        if (fb->state != 0U || now_ms - fb->received_at_ms > config->feedback_max_age_ms ||
+        if (fb->state != 0U || now_ms - fb->received_at_ms > FIVE_MAX_AGE_MS ||
             !isfinite(fb->position_rad) || !isfinite(status->reference_rad[i]) ||
             !isfinite(fb->velocity_rad_s) ||
-            status->reference_rad[i] < config->joint[i].lower_rad ||
-            status->reference_rad[i] > config->joint[i].upper_rad ||
+            status->reference_rad[i] < g_joint_reference_config[i].observed_lower_rad ||
+            status->reference_rad[i] > g_joint_reference_config[i].observed_upper_rad ||
             fabsf(fb->velocity_rad_s) > g_calibration_config.motor_still_rad_s) {
             return false;
         }
@@ -59,13 +57,11 @@ BSP_CAN_Status_t JointCalibration_Init(void)
 {
     if (__get_IPSR() != 0U) { return BSP_CAN_INVALID_ARG; }
     if (calibration.initialized) { return BSP_CAN_BUSY; }
-    MotorTask_Config_t config;
-    const BSP_CAN_Status_t result = MotorTask_GetConfig(&config);
-    if (result != BSP_CAN_OK) { return result; }
-    calibration.zero[0] = 0.5f * (config.joint[0].lower_rad + config.joint[0].upper_rad);
-    const bool saved = config.drag_reference_confirmed == 1U &&
-        isfinite(config.drag_j2_zero_rad);
-    calibration.zero[1] = saved ? config.drag_j2_zero_rad : NAN;
+    if (!FiveControl_StatusNow()) { return BSP_CAN_NOT_READY; }
+    calibration.zero[0] = g_joint_reference_config[0].zero_rad;
+    const bool saved = g_joint_reference_config[1].kind == MOTOR_REFERENCE_USER_APPROVED &&
+        isfinite(g_joint_reference_config[1].zero_rad);
+    calibration.zero[1] = saved ? g_joint_reference_config[1].zero_rad : NAN;
     calibration.valid_mask = saved ? 3U : 1U;
     /* axis remains unknown: a saved manual reference is not an IMU measurement. */
     calibration.initialized = true;
@@ -122,17 +118,16 @@ void JointCalibration_Run(uint32_t now_ms)
     }
     calibration.last_ms = sample.received_at_ms;
     calibration.sequence = sample.sequence;
-    MotorTask_Status_t status;
-    MotorTask_Config_t config;
+    const FiveControl_Status *status=FiveControl_StatusNow();
     const bool good = fabsf(magnitude - cfg->gravity_m_s2) <= cfg->gravity_tolerance_m_s2 &&
         norm(calibration.gyro) <= cfg->gyro_still_rad_s &&
         angle(accel, calibration.low_pass) <= cfg->accel_residual_rad &&
-        motors_still(now_ms, &status, &config);
+        motors_still(now_ms, status);
     if (!good) {
         calibration.resting = false;
         return;
     }
-    const float encoder = status.reference_rad[1];
+    const float encoder = status->reference_rad[1];
     if (calibration.resting) {
         calibration.encoder_min = fminf(calibration.encoder_min, encoder);
         calibration.encoder_max = fmaxf(calibration.encoder_max, encoder);
@@ -185,17 +180,16 @@ BSP_CAN_Status_t JointCalibration_GetStatus(uint32_t now_ms,
             }
         }
     }
-    MotorTask_Status_t motor;
-    MotorTask_Config_t config;
-    if (motors_still(now_ms, &motor, &config)) { status->flags |= CAL_MOTORS_STILL_DISABLED; }
-    if (MotorTask_GetStatus(&motor) == BSP_CAN_OK &&
-        MotorTask_GetConfig(&config) == BSP_CAN_OK) {
+    const FiveControl_Status *motor=FiveControl_StatusNow();
+    if (motors_still(now_ms, motor)) { status->flags |= CAL_MOTORS_STILL_DISABLED; }
+    if (motor) {
         for (unsigned i = 0U; i < 2U; ++i) {
-            status->raw_rad[i] = (motor.feedback_valid_mask & (1U << i)) != 0U &&
-                now_ms - motor.feedback[i].received_at_ms <= config.feedback_max_age_ms ?
-                motor.feedback[i].position_rad : NAN;
+            status->raw_rad[i] = (motor->fresh & (1U << i)) != 0U &&
+                now_ms - motor->feedback[i].received_at_ms <= FIVE_MAX_AGE_MS ?
+                motor->feedback[i].position_rad : NAN;
             if (isfinite(status->raw_rad[i])) {
-                status->reference_rad[i] = motor.reference_rad[i];
+                status->reference_rad[i] = i == 0U ? status->raw_rad[i] :
+                    motor->reference_rad[i];
             }
         }
     }
@@ -215,11 +209,10 @@ BSP_CAN_Status_t JointCalibration_SetIMU(bool enabled, uint32_t now_ms)
     if (calibration.active || calibration.stop_requested || calibration.stop_failed) {
         return BSP_CAN_BUSY;
     }
-    MotorTask_Status_t motor;
+    const FiveControl_Status *motor=FiveControl_StatusNow();
     /* Sampling is read-only and need not depend on CAN health. Capturing a zero
      * still uses motors_still(), including fresh disabled feedback. */
-    if (MotorTask_GetStatus(&motor) != BSP_CAN_OK ||
-        (motor.state != MOTOR_TASK_IDLE && motor.state != MOTOR_TASK_FAULT)) {
+    if (!motor || motor->phase==FIVE_MOTION) {
         return BSP_CAN_BUSY;
     }
     const HAL_StatusTypeDef result = BMI088_SetEnabled(true, now_ms);
@@ -235,11 +228,10 @@ BSP_CAN_Status_t JointCalibration_Mark(uint8_t joint, uint8_t axis, uint32_t now
     if (__get_IPSR() != 0U || joint < 1U || joint > 2U ||
         (joint == 2U && (axis < 1U || axis > 6U))) { return BSP_CAN_INVALID_ARG; }
     if (!calibration.initialized) { return BSP_CAN_NOT_READY; }
-    MotorTask_Status_t motor;
-    MotorTask_Config_t config;
-    if (!motors_still(now_ms, &motor, &config)) { return BSP_CAN_BUSY; }
+    const FiveControl_Status *motor=FiveControl_StatusNow();
+    if (!motors_still(now_ms, motor)) { return BSP_CAN_BUSY; }
     if (joint == 1U) {
-        calibration.zero[0] = 0.5f * (config.joint[0].lower_rad + config.joint[0].upper_rad);
+        calibration.zero[0] = g_joint_reference_config[0].zero_rad;
         calibration.valid_mask |= 1U;
         return BSP_CAN_OK;
     }
@@ -253,7 +245,7 @@ BSP_CAN_Status_t JointCalibration_Mark(uint8_t joint, uint8_t axis, uint32_t now
     if (!isfinite(error) || error > g_calibration_config.vertical_tolerance_rad) {
         return BSP_CAN_INVALID_ARG;
     }
-    calibration.zero[1] = motor.reference_rad[1];
+    calibration.zero[1] = motor->reference_rad[1];
     calibration.axis = axis;
     calibration.valid_mask |= 2U;
     (void)JointCalibration_SetIMU(false, now_ms);

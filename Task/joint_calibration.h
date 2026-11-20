@@ -1,7 +1,7 @@
 #ifndef YLAMP_JOINT_CALIBRATION_H
 #define YLAMP_JOINT_CALIBRATION_H
 
-#include "motor_task.h"
+#include "dm_motor.h"
 #include "bmi088.h"
 #include "calibration_config.h"
 

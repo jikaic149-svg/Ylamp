@@ -25,10 +25,17 @@ static void task_feedback(unsigned i, float position, float velocity, uint8_t st
     inject_motor_feedback(cfg->bus, cfg->master_id, data, 8U);
 }
 
+static float task_nominal_position(unsigned i)
+{
+    return i == 0U ? -2.6f : g_motor_config.drag_j2_zero_rad + .04f;
+}
+
 static void feedback_pair(uint32_t now, uint8_t state)
 {
     test_tick = now;
-    for (unsigned i = 0U; i < 2U; ++i) { task_feedback(i, -2.6f, 0.0f, state); }
+    for (unsigned i = 0U; i < 2U; ++i) {
+        task_feedback(i, task_nominal_position(i), 0.0f, state);
+    }
 }
 
 static void task_run(uint32_t now)
@@ -224,6 +231,8 @@ static void test_drag_polarity(void)
 {
     MotorTask_Config_t cfg = g_motor_config;
     cfg.drag_velocity_filter_ms = 0.0f;
+    /* Isolated geometry curve at q2=90deg, not the deployed travel interval. */
+    cfg.joint[1].upper_rad = cfg.drag_j2_zero_rad + 1.7f;
     const float speeds[] = {0.0f, 5.0f, 10.0f, 20.0f, 30.0f, 40.0f,
                             50.0f, 55.0f, 60.0f, 90.0f, 120.0f};
     /* Pin the steeper 20..60 deg/s curve, independently of config bounds. */
@@ -328,7 +337,7 @@ static void test_drag_polarity(void)
     uint32_t now = 1000U;
     setup_task(true, now);
     start_task(&now, false);
-    float position[2] = {-2.6f, -2.6f};
+    float position[2] = {-2.6f, task_nominal_position(1)};
     for (unsigned step = 0U; step < 450U; ++step) {
         now += 5U;
         test_tick = now;
@@ -497,6 +506,8 @@ static void test_grip_geometry(void)
 static void test_drag_dynamics(void)
 {
     MotorTask_Config_t cfg = g_motor_config;
+    /* Pure model sweep covers +/-0.7rad, independently of physical limits. */
+    cfg.joint[1].lower_rad = cfg.drag_j2_zero_rad - .8f;
     assert(g_drag_dynamics.scale == .25f);
     /* Both directions: nonzero M*ddq AND c reach FF at the common fraction.
      * Position targets remain current position, not an invented trajectory. */
@@ -616,7 +627,7 @@ static void test_drag_dynamics(void)
     for (unsigned n = 0U; n < 25U; ++n) {
         now += 5U; test_tick = now;
         task_feedback(0, -2.6f, .12f * (n + 1U), 1U);
-        task_feedback(1, -2.2f, -.08f * (n + 1U), 1U);
+        task_feedback(1, task_nominal_position(1) + .4f, -.08f * (n + 1U), 1U);
         task_run(now);
         const MotorTask_Status_t s = task_status();
         assert(s.state == MOTOR_TASK_RUNNING && s.drag.valid);
@@ -633,7 +644,7 @@ static void test_drag_dynamics(void)
     now += 5U; test_tick = now;
     task_feedback(0, -2.6f + JOINT_TURN_RAD,
                   before.feedback[0].velocity_rad_s, 1U);
-    task_feedback(1, -2.2f + JOINT_TURN_RAD,
+    task_feedback(1, task_nominal_position(1) + .4f + JOINT_TURN_RAD,
                   before.feedback[1].velocity_rad_s, 1U);
     task_run(now);
     const MotorTask_Status_t after = task_status();
@@ -760,7 +771,7 @@ static void test_motion(uint32_t now)
     assert(task_status().state == MOTOR_TASK_HOLDING && !task_status().drag.valid);
     assert(task_status().motion.valid && task_status().target_kp[0] == g_motion_config.kp[0]);
     (void)tuning_request(12, 0, 1, MOTOR_MODE_DRAG, BSP_CAN_BUSY);
-    MotionMode_Request_t request = {.target_rad = {-2.3f, -2.35f},
+    MotionMode_Request_t request = {.target_rad = {-2.3f, task_nominal_position(1) + .25f},
         .velocity_rad_s = {.2f, .25f}, .acceleration_rad_s2 = {.4f, .5f},
         .jerk_rad_s3 = {1, 1.2f}};
     (void)tuning_request(12, 0, 2, 1, BSP_CAN_OK);
@@ -791,7 +802,7 @@ static void test_motion(uint32_t now)
            float_bits(status.motion.model.gravity_nm[1]));
     task_steps(&now, 30, 1);
     assert(task_status().state == MOTOR_TASK_HOLDING && motor_enable_calls[1] == 1);
-    request.target_rad[0] = -2.8f; request.target_rad[1] = -2.9f;
+    request.target_rad[0] = -2.8f; request.target_rad[1] = task_nominal_position(1) - .3f;
     assert(MotorTask_Move(&request, now) == BSP_CAN_OK);
     task_steps(&now, 65, 1);
     const float v_before = task_status().target_velocity_rad_s[0];
@@ -806,11 +817,22 @@ static void test_motion(uint32_t now)
     assert(fabsf(status.target_reference_rad[0] - request.target_rad[0]) > .05f);
     /* Same inverse encoder branch in Motion; never a multi-turn PD jump. */
     test_tick = now += 5;
-    for (unsigned i = 0; i < 2; ++i) { task_feedback(i, -2.6f + JOINT_TURN_RAD, 0, 1); }
+    for (unsigned i = 0; i < 2; ++i) {
+        task_feedback(i, task_nominal_position(i) + JOINT_TURN_RAD, 0, 1);
+    }
     task_run(now);
     assert(task_status().state == MOTOR_TASK_HOLDING);
-    assert(fabsf(task_status().target_rad[0] - status.target_reference_rad[0] -
-                 JOINT_TURN_RAD) < .001f);
+    const MotorTask_Status_t wrapped = task_status();
+    for (unsigned i = 0; i < 2; ++i) {
+        assert(fabsf(wrapped.target_rad[i] - status.target_reference_rad[i] -
+            JOINT_TURN_RAD) < .001f);
+        assert(fabsf(wrapped.reference_rad[i] - status.reference_rad[i]) < .001f);
+        assert(fabsf(wrapped.motion.friction_velocity_rad_s[i]) < .01f);
+        const uint8_t *data = motor_last_mit[i + 1U];
+        const uint16_t code = (uint16_t)((uint16_t)data[0] << 8) | data[1];
+        const float wire = (2.0f * code / 65535.0f - 1.0f) * 12.5f;
+        assert(fabsf(wire - wrapped.target_rad[i]) < .0008f);
+    }
     request.target_rad[0] = NAN;
     assert(MotorTask_Move(&request, now) == BSP_CAN_INVALID_ARG);
     assert(task_status().state == MOTOR_TASK_HOLDING);
@@ -845,7 +867,9 @@ static void test_impedance(uint32_t now)
     task_steps(&now, 3, 0); /* Do not ramp gains before both enable ACKs. */
     assert(task_status().state == MOTOR_TASK_ARMING && task_status().target_kp[0] == 0);
     test_tick = now += 5;
-    for (unsigned i = 0; i < 2; ++i) { task_feedback(i, -2.55f, 0, 1); }
+    for (unsigned i = 0; i < 2; ++i) {
+        task_feedback(i, task_nominal_position(i) + .05f, 0, 1);
+    }
     task_run(now);
     task_steps(&now, 220, 1);
     assert(task_status().state == MOTOR_TASK_HOLDING);
@@ -972,9 +996,10 @@ static void test_coordinates(bool hold)
     MotorTask_Status_t s = task_status();
     assert(s.feedback[0].position_rad > 0 && s.feedback[1].position_rad > 0);
     assert(fabsf(s.reference_rad[0] + .66129f) < .0004f);
-    assert(fabsf(s.reference_rad[1] + 3.17320568f) < .0004f);
-    assert(fabsf(s.drag.q2_rad - (-3.17320568f - g_motor_config.drag_j2_zero_rad)) < .0004f);
-    assert(s.drag.gravity_nm[0] == 0 && s.drag.gravity_nm[1] > .24f);
+    const float expected_reference = -3.17320568f + JOINT_TURN_RAD;
+    assert(fabsf(s.reference_rad[1] - expected_reference) < .0004f);
+    assert(fabsf(s.drag.q2_rad - (expected_reference - g_motor_config.drag_j2_zero_rad)) < .0004f);
+    assert(s.drag.gravity_nm[0] == 0 && s.drag.gravity_nm[1] < -.24f);
     assert(motor_enable_calls[1] == 0U && motor_mit_calls[1] == 0U);
     const float reference = s.reference_rad[1], gravity = s.drag.gravity_nm[1];
     const float a = s.drag.inertia[0], b = s.drag.inertia[1];
@@ -1033,13 +1058,13 @@ static void test_coordinates(bool hold)
     }
     assert(motor_enable_calls[1] == 1U && motor_disable_calls[1] == 0U);
     /* Physical small motion through the usual +pi -> -pi raw boundary. */
-    for (unsigned n = 0; n < 2U; ++n) {
+    for (unsigned n = 0; n < 4U; ++n) {
         coordinate_feedback(now += 5U, 1U, 0);
-        task_feedback(1, n == 0U ? 3.1414f : -3.1414f, 0, 1);
+        task_feedback(1, (n == 0U || n == 3U) ? 3.1414f : -3.1414f, 0, 1);
         task_run(now);
         s = task_status();
         assert(s.state == (hold ? MOTOR_TASK_HOLDING : MOTOR_TASK_RUNNING));
-        assert(fabsf(s.reference_rad[1] + 3.141592654f) < .0007f);
+        assert(fabsf(s.reference_rad[1] - 3.141592654f) < .0007f);
         assert(fabsf(s.target_rad[1] - s.feedback[1].position_rad) < .04f);
     }
     /* A genuinely out-of-range posture is NOT pulled onto a legal limit. */
@@ -1084,7 +1109,7 @@ static void test_recovery(const char *name)
         start_task(&now, false);
         task_steps(&now, 220U, 1U);
         if (motion) {
-            const MotionMode_Request_t job = {.target_rad = {-2, -2.2f},
+            const MotionMode_Request_t job = {.target_rad = {-2, task_nominal_position(1) + .4f},
                 .velocity_rad_s = {.2f, .2f}, .acceleration_rad_s2 = {.4f, .4f},
                 .jerk_rad_s3 = {1, 1}};
             assert(MotorTask_Move(&job, now) == BSP_CAN_OK);
@@ -1146,7 +1171,10 @@ static void test_recovery(const char *name)
     if (hot) {
         /* Current fixture rotor is 26C, below the real default 60C. Inject a
          * real hot feedback frame instead of changing policy during recovery. */
-        const uint8_t data[8] = {2U, 0x65U, 0x60U, 0x7FU, 0xF7U, 0xFFU, 60U, 60U};
+        const uint16_t p = signed_code(task_nominal_position(1),
+            g_motor_config.joint[1].device.pmax, UINT16_MAX);
+        const uint8_t data[8] = {2U, (uint8_t)(p >> 8), (uint8_t)p,
+            0x7FU, 0xF7U, 0xFFU, 60U, 60U};
         for (unsigned n = 0; n < 25U; ++n) {
             feedback_pair(now += 5U, 0U);
             inject_motor_feedback(&hfdcan2, 0x12U, data, 8U);
@@ -1162,7 +1190,7 @@ static void test_recovery(const char *name)
     for (unsigned n = 0U; n < 22U; ++n) {
         test_tick = now += 5U;
         task_feedback(0, -2.4f, 0, 0U);
-        task_feedback(1, -2.4f, 0, 0U);
+        task_feedback(1, task_nominal_position(1) + .2f, 0, 0U);
         task_run(now);
     }
     if (idle || key || stop || disable) {
@@ -1176,7 +1204,7 @@ static void test_recovery(const char *name)
     assert(task_status().state == MOTOR_TASK_ARMING);
     assert(motor_enable_calls[1] == 2U && motor_enable_calls[2] == 2U);
     assert(task_status().target_kp[1] == 0.0f && task_status().target_torque_ff_nm[1] == 0.0f);
-    assert(fabsf(task_status().target_rad[1] + 2.4f) < .001f);
+    assert(fabsf(task_status().target_rad[1] - task_nominal_position(1) - .2f) < .001f);
     BSP_CAN_Diagnostics_t diag;
     assert(BSP_CAN_GetDiagnostics(&hfdcan2, &diag) == BSP_CAN_OK);
     assert(diag.first_valid && diag.bus_off_valid && diag.bus_off.tx_pending_mask == 0xF0U);
@@ -1193,7 +1221,7 @@ static void test_recovery(const char *name)
     if (hold) {
         task_steps(&now, 220U, 1U);
         assert(task_status().state == MOTOR_TASK_HOLDING);
-        assert(fabsf(task_status().target_reference_rad[1] + 2.6f) < .001f);
+        assert(fabsf(task_status().target_reference_rad[1] - task_nominal_position(1)) < .001f);
     }
     if (limit) {
         for (unsigned n = 0U; n < 2U; ++n) {
@@ -1272,7 +1300,7 @@ static void test_task(const char *name)
     if (strcmp(name, "task-start-still") == 0) {
         for (unsigned joint = 0U; joint < 2U; ++joint) {
             feedback_pair(now, 0U);
-            task_feedback(joint, -2.6f, joint == 0U ? .3f : -.3f, 0U);
+            task_feedback(joint, task_nominal_position(joint), joint == 0U ? .3f : -.3f, 0U);
             assert(MotorTask_Command(MOTOR_COMMAND_START, now) == BSP_CAN_ERROR);
             assert(task_status().state == MOTOR_TASK_IDLE);
             assert(task_status().reason == MOTOR_REASON_NOT_STILL);
@@ -1352,11 +1380,11 @@ static void test_task(const char *name)
     } else if (strcmp(name, "task-state") == 0) {
         now += 5U;
         feedback_pair(now, 1);
-        task_feedback(1, -2.6f, 0, 8);
+        task_feedback(1, task_nominal_position(1), 0, 8);
         task_run(now);
         assert_task_fault(MOTOR_REASON_STATE, now, true);
     } else if (strcmp(name, "task-drag-speed") == 0) {
-        float position[2] = {-2.6f, -2.6f};
+        float position[2] = {-2.6f, task_nominal_position(1)};
         const unsigned initial_mit[2] = {motor_mit_calls[1], motor_mit_calls[2]};
         /* Both directions, both axes, >20 deg/s throughout the support transition
          * and free drag. Speeds still raise Kd instead of submitting disable. */
@@ -1423,7 +1451,7 @@ static void test_task(const char *name)
         now += 5U;
         feedback_pair(now, 1);
         task_feedback(0, -2.3f, .05f, 1); /* Free drag ignores old tracking target. */
-        task_feedback(1, -2.0f, .05f, 1);
+        task_feedback(1, task_nominal_position(1) + .6f, .05f, 1);
         task_run(now);
         assert(task_status().state == MOTOR_TASK_RUNNING && task_status().target_kp[0] == 0.0f);
         assert(task_status().target_torque_ff_nm[0] == task_status().drag.dynamic_ff_nm[0] +

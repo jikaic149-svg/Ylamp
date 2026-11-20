@@ -1,0 +1,19 @@
+/* Shared C/Python software references, in degrees; raw feedback is unchanged.
+ * JOINT_REFERENCE(joint, zero, observed_raw_min, observed_raw_max, kind)
+ * USER_APPROVED = user accepted the reference, NOT a passed repeat test.
+ * MIDPOINT = user definition. J2 also supplies the actual control defaults.
+ * These single-axis ranges do NOT certify collision-free combinations.
+ * Narrow ranges select an equivalent 2*pi branch; J1/J4 preserve multi-turn raw.
+ * J1 uses the 2026-11-18 measured travel midpoint; planning retains a 1-deg inset. */
+JOINT_REFERENCE(1, -88.7282485, -290.380356, 112.923859, MIDPOINT)
+/* J2/J3: 2026-11-19 all-fresh-pair affine LS, Pitch=a*(raw-zero).
+ * See build/pitch-zero-ls-20261119_01/fit.json for block-bootstrap intervals.
+ * Zero mounting offset assumed. J3 is conditional on the recorded upstream
+ * posture; neither the regression slope nor R^2 validates mechanical geometry. */
+JOINT_REFERENCE(2, 146.18099179755507, 110.803768, 192.745370, USER_APPROVED)
+JOINT_REFERENCE(3, 17.291374640739114, -69.319289, 132.748142, USER_APPROVED)
+/* 2026-11-19: user-confirmed RAW range, not new mechanical measurements.
+ * Keep the old 55.7024265-deg reference; do NOT recenter to -245 deg.
+ * The retained reference is outside this range, so it is no longer MIDPOINT. */
+JOINT_REFERENCE(4, 55.7024265, -500.0, 10.0, USER_APPROVED)
+JOINT_REFERENCE(5, -57.024737, -79.657593, -34.391881, MIDPOINT)

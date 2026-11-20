@@ -46,7 +46,7 @@ class Stream:
                     break
                 total = self.buffer[4] + 7 if rpc else 48
                 if rpc and not (self.buffer[2] == 1 and
-                    (self.buffer[3], self.buffer[4]) in ((0x92, 8), (0x91, 20))):
+                    (self.buffer[3], self.buffer[4]) in ((0x92, 8), (0x91, 20), (0x93, 18), (0x94, 36))):
                     self.malformed += 1
                     del self.buffer[0]
                     continue
