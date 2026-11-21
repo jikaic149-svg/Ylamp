@@ -29,24 +29,23 @@ extern "C" {
  * These references do not certify collision-free combinations.
  * Older builds may omit scope1. No configuration or actuator writes. */
 #define MOTOR_JOINT_REFERENCE_VERSION 0x594C5202UL
-/* Read-only observer, no control SESSION/enable/disable/motion/zero write:
- * v1 frame type13, payload nonce[8]+mode[1]: 0 normal,1 run,2 pause.
- * type93 ACK: nonce[8], mode, result, version u32, board tick u32 (18B).
- * type94 sample (36B): u32 seq,tick,j3_at,j3_count,imu_at,imu_count;
- * f32 J3 RAW encoder degrees, Yummy Pitch degrees; u8 flags,state; u16 age limit.
- * flags bits0/1 motor received/fresh, bits2/3 IMU received/fresh.
- * Missing angles are NaN; stale angles retain source time but not fresh flags.
- * Pausing suppresses all periodic USB telemetry, not control/IMU acquisition.
- * DTR close/RX epoch loss restores normal five-axis USB reporting.
- * One already-submitted transfer may precede the pause ACK. No replay/recovery. */
-#define MOTOR_FOCUS_VERSION 0x594C5001UL
-#define MOTOR_J2_FOCUS_VERSION 0x594C3202UL
-/* Modes 3/4 select J2 encoder + BMI088 Pitch degrees, run/pause.
- * Pitch = atan2(-ax, hypot(ay,az)), no mounting/bias correction.
- * Same sample layout; IMU-fresh additionally requires the existing warmup.
- * Explicit run acquires the temporary BMI session; pause retains it.
- * Leaving this profile or disconnecting requests normal asynchronous STOP.
- * No motor enable, trajectory, zero capture or calibration write. */
+/* Unified observer: every sample carries all five motors + both IMU Pitches.
+ * No control SESSION, motor query/enable/disable/motion or zero write.
+ * v1 type13 request: nonce[8]+mode: 0 normal,1 run,2 pause; old 3/4 rejected.
+ * type93 ACK (18B): nonce[8],mode,result,u32 version,board tick.
+ * type94 payload: u32 seq,tick; u8 motor_count,imu_count,motor_size,imu_size;
+ * u16 max_age_ms, then count*32B MotorSnapshot records (rad,rad/s,Nm),
+ * then two 16B IMU records: u8 id,flags; u16 reserved=0; u32 at,count; f32 Pitch deg.
+ * IMU IDs 1=BMI088,2=Yummy; flags bit0 received,bit1 fresh; absent angle=NaN.
+ * Actual five-axis payload=206B, total frame=213B; same-envelope, NOT simultaneous
+ * sensor acquisition. Original source times/counts and independent flags remain.
+ * BMI Pitch=atan2(-ax,hypot(ay,az)); freshness includes existing warmup.
+ * Run acquires only an unowned temporary BMI session; pause retains it.
+ * Normal/close/epoch loss requests normal async STOP, never steals another owner.
+ * Pause suppresses periodic USB data, not motor control or sensor acquisition.
+ * An in-flight sample may precede the pause ACK; no replay/recovery.
+ * New version rejects old pair-only hosts rather than reinterpreting old data. */
+#define MOTOR_FOCUS_VERSION 0x594C5002UL
 void MotorUSB_Init(void);
 bool MotorUSB_Run(void);
 #ifdef __cplusplus

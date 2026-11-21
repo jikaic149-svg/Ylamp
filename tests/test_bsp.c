@@ -10,8 +10,6 @@
 #include "five_workspace.h"
 #include "joint_calibration.h"
 #include "serial_config.h"
-#include "can3_telemetry.h"
-#include "can3_config.h"
 
 #include <assert.h>
 #include <float.h>
@@ -21,8 +19,7 @@
 
 GPIO_TypeDef test_gpioa, test_gpioc;
 uint32_t test_ipsr, test_primask, test_tick, test_spi6_instance, test_spi2_instance;
-FDCAN_HandleTypeDef hfdcan1, hfdcan2, hfdcan3;
-FDCAN_GlobalTypeDef test_fdcan3_instance;
+FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 UART_HandleTypeDef huart1, huart2, huart3, huart4, huart5;
 UART_HandleTypeDef huart6, huart7, huart8, huart9, huart10;
 SPI_HandleTypeDef hspi6, hspi2;
@@ -37,9 +34,9 @@ static HAL_StatusTypeDef can_stop_result = HAL_OK;
 static bool can_stop_flush = true;
 static unsigned can_deactivate_calls, can_callbacks;
 static unsigned can_irq_calls, can_protocol_reads, can_counter_reads;
-static FDCAN_GlobalTypeDef can_instances[3];
-static FDCAN_ProtocolStatusTypeDef can_protocol[3];
-static FDCAN_ErrorCountersTypeDef can_counters[3];
+static FDCAN_GlobalTypeDef can_instances[2];
+static FDCAN_ProtocolStatusTypeDef can_protocol[2];
+static FDCAN_ErrorCountersTypeDef can_counters[2];
 static HAL_StatusTypeDef can_protocol_result = HAL_OK, can_counter_result = HAL_OK;
 typedef struct {
     uint32_t free_slots, rx_pending;
@@ -50,7 +47,7 @@ typedef struct {
     FDCAN_TxHeaderTypeDef tx_header;
     uint8_t tx_data[64];
 } FakeCAN_IO;
-static FakeCAN_IO can_io[3];
+static FakeCAN_IO can_io[2];
 /* Existing single-bus cases keep their CAN1 fixture names. */
 #define can_free (can_io[0].free_slots)
 #define can_rx_pending (can_io[0].rx_pending)
@@ -75,17 +72,10 @@ static unsigned spi_calls;
 static void (*tick_hook)(void);
 
 
-HAL_StatusTypeDef HAL_FDCAN_Init(FDCAN_HandleTypeDef *bus)
-{
-    assert(bus == &hfdcan3);
-    if (can_config_result == HAL_OK) { bus->State = HAL_FDCAN_STATE_READY; }
-    return can_config_result;
-}
-
 static unsigned fake_can_index(const FDCAN_HandleTypeDef *bus)
 {
-    assert(bus == &hfdcan1 || bus == &hfdcan2 || bus == &hfdcan3);
-    return bus == &hfdcan1 ? 0U : bus == &hfdcan2 ? 1U : 2U;
+    assert(bus == &hfdcan1 || bus == &hfdcan2);
+    return bus == &hfdcan1 ? 0U : 1U;
 }
 
 uint32_t HAL_GetTick(void)
@@ -236,10 +226,8 @@ HAL_StatusTypeDef HAL_FDCAN_AddMessageToTxFifoQ(FDCAN_HandleTypeDef *bus,
         0U,1U,2U,3U,4U,5U,6U,7U,8U,12U,16U,20U,24U,32U,48U,64U};
     assert(header->DataLength < 16U);
     const unsigned length = lengths[header->DataLength];
-    if (length > 8U) {
-        assert(bus == &hfdcan3 && header->FDFormat == FDCAN_FD_CAN &&
-               header->BitRateSwitch == FDCAN_BRS_ON);
-    }
+    assert(length <= 8U && header->FDFormat == FDCAN_CLASSIC_CAN &&
+           header->BitRateSwitch == FDCAN_BRS_OFF);
     memcpy(can_tx_data, data, length);
     ++io->tx_calls;
     io->tx_header = *header;
@@ -461,10 +449,6 @@ static void test_can(void)
     const unsigned configured = can_config_calls;
     assert(BSP_CAN_Init(&hfdcan2) == BSP_CAN_ERROR);
     assert(can_config_calls == configured);
-    can_start_result = HAL_ERROR;
-    assert(BSP_CAN_Init(&hfdcan3) == BSP_CAN_ERROR);
-    assert(can_deactivate_calls == 1U);
-    assert(BSP_CAN_Send(&hfdcan3, &frame) == BSP_CAN_NOT_READY);
     test_ipsr = 1U;
     assert(BSP_CAN_Send(&hfdcan1, &frame) == BSP_CAN_INVALID_ARG);
     test_ipsr = 0U;
@@ -680,11 +664,9 @@ static void initialize_fake_hardware(void)
     };
     hfdcan1 = can;
     hfdcan2 = can;
-    hfdcan3 = can;
     hfdcan1.Instance = &can_instances[0];
     hfdcan2.Instance = &can_instances[1];
-    hfdcan3.Instance = &can_instances[2];
-    for (unsigned i = 0U; i < 3U; ++i) { can_io[i].free_slots = 8U; }
+    for (unsigned i = 0U; i < 2U; ++i) { can_io[i].free_slots = 8U; }
     UART_HandleTypeDef *const uarts[] = {
         &huart1, &huart2, &huart3, &huart4, &huart5,
         &huart6, &huart7, &huart8, &huart9, &huart10
@@ -1032,11 +1014,11 @@ static void receive_during_can_start(FDCAN_HandleTypeDef *bus)
 static void test_can_startup(void)
 {
     /* NVIC entry before this instance has been initialized must not touch HAL. */
-    FDCAN_GlobalTypeDef *const instance = hfdcan3.Instance;
-    hfdcan3.Instance = NULL;
-    BSP_CAN_IRQHandler(&hfdcan3);
+    FDCAN_GlobalTypeDef *const instance = hfdcan1.Instance;
+    hfdcan1.Instance = NULL;
+    BSP_CAN_IRQHandler(&hfdcan1);
     assert(can_irq_calls == 0U);
-    hfdcan3.Instance = instance;
+    hfdcan1.Instance = instance;
 
     can_start_hook = receive_during_can_start;
     assert(BSP_CAN_Init(&hfdcan1) == BSP_CAN_OK);
@@ -1050,15 +1032,30 @@ static void test_can_startup(void)
     }
     assert(can_irq_calls == 2U && can_tx_calls == 0U && gpio_writes == 0U);
     assert(BSP_CAN_Init(&hfdcan1) == BSP_CAN_BUSY);
+    FDCAN_HandleTypeDef unknown = {0};
+    const BSP_CAN_Frame_t frame = {.id = 1U, .len = 8U};
+    assert(BSP_CAN_Init(&unknown) == BSP_CAN_INVALID_ARG);
+    assert(BSP_CAN_Send(&unknown, &frame) == BSP_CAN_INVALID_ARG);
+    BSP_CAN_Diagnostics_t diag;
+    assert(BSP_CAN_GetDiagnostics(&unknown, &diag) == BSP_CAN_INVALID_ARG);
+    BSP_CAN_IRQHandler(&unknown);
+    assert(can_irq_calls == 2U);
+}
+
+static void test_can_start_failure(void)
+{
     const BSP_CAN_Frame_t frame = {.id = 1U, .len = 8U};
     can_start_result = HAL_ERROR;
-    assert(BSP_CAN_Init(&hfdcan3) == BSP_CAN_ERROR);
-    assert(hfdcan3.Instance->IE == 0U && can_deactivate_calls == 1U);
-    assert(BSP_CAN_Send(&hfdcan3, &frame) == BSP_CAN_NOT_READY);
+    assert(BSP_CAN_Init(&hfdcan1) == BSP_CAN_ERROR);
+    assert(hfdcan1.Instance->IE == 0U && can_deactivate_calls == 1U);
+    assert(BSP_CAN_Send(&hfdcan1, &frame) == BSP_CAN_NOT_READY);
     BSP_CAN_Diagnostics_t diag;
-    assert(BSP_CAN_GetDiagnostics(&hfdcan3, &diag) == BSP_CAN_NOT_READY);
+    assert(BSP_CAN_GetDiagnostics(&hfdcan1, &diag) == BSP_CAN_NOT_READY);
     const unsigned starts = can_start_calls;
-    assert(BSP_CAN_Init(&hfdcan3) == BSP_CAN_ERROR && can_start_calls == starts);
+    can_start_result = HAL_OK;
+    assert(BSP_CAN_Init(&hfdcan1) == BSP_CAN_ERROR && can_start_calls == starts);
+    assert(BSP_CAN_Init(&hfdcan2) == BSP_CAN_OK);
+    assert(BSP_CAN_Send(&hfdcan2, &frame) == BSP_CAN_OK);
 }
 
 static void test_can_motor_config(void)
@@ -1447,153 +1444,6 @@ static void test_can_recovery(void)
     assert(test_primask == 0U && hfdcan2.Instance->CCCR == 0U);
 }
 
-static uint32_t can3_u32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static float can3_float(const uint8_t *p)
-{
-    const uint32_t bits = can3_u32(p);
-    float result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
-}
-
-static void test_can3_fd(bool fail_init)
-{
-    DM_Motor_t *motors[MOTOR_CAN_JOINT_COUNT];
-    CAN3Telemetry_Status_t telemetry;
-    assert(CAN3Telemetry_GetStatus(&telemetry) == BSP_CAN_NOT_READY);
-    assert(BSP_CAN_Init(&hfdcan1) == BSP_CAN_OK);
-    assert(BSP_CAN_Init(&hfdcan2) == BSP_CAN_OK);
-    const FDCAN_InitTypeDef can1_init = hfdcan1.Init, can2_init = hfdcan2.Init;
-    if (fail_init) { can_config_result = HAL_ERROR; }
-    const BSP_CAN_Status_t init_result = BSP_CAN3_InitFD();
-    assert(init_result == (fail_init ? BSP_CAN_ERROR : BSP_CAN_OK));
-    assert(BSP_CAN3_InitFD() == BSP_CAN_BUSY); /* no implicit retry/reset */
-    assert(memcmp(&can1_init, &hfdcan1.Init, sizeof(can1_init)) == 0);
-    assert(memcmp(&can2_init, &hfdcan2.Init, sizeof(can2_init)) == 0);
-    assert(hfdcan3.Init.FrameFormat == FDCAN_FRAME_FD_BRS &&
-        hfdcan3.Init.TxElmtSize == FDCAN_DATA_BYTES_64 &&
-        hfdcan3.Init.RxFifo0ElmtSize == FDCAN_DATA_BYTES_64 &&
-        hfdcan3.Init.MessageRAMOffset == 1706U &&
-        hfdcan3.Init.AutoRetransmission == DISABLE);
-    assert(120000000U / hfdcan3.Init.NominalPrescaler /
-        (1U+hfdcan3.Init.NominalTimeSeg1+hfdcan3.Init.NominalTimeSeg2) == 1000000U);
-    assert(120000000U / hfdcan3.Init.DataPrescaler /
-        (1U+hfdcan3.Init.DataTimeSeg1+hfdcan3.Init.DataTimeSeg2) == 2000000U);
-    can_config_result = HAL_OK;
-    for (unsigned i = 0U; i < MOTOR_CAN_JOINT_COUNT; ++i) {
-        assert(DM_Motor_Init(&g_motor_can_config[i], &motors[i]) == BSP_CAN_OK);
-    }
-    test_tick = UINT32_MAX - 4U;
-    assert(CAN3Telemetry_Init(NULL, test_tick, init_result) == BSP_CAN_INVALID_ARG);
-    assert(CAN3Telemetry_Init(motors, test_tick, init_result) == init_result);
-    assert(CAN3Telemetry_Init(motors, test_tick, init_result) == BSP_CAN_BUSY);
-    if (fail_init) {
-        CAN3Telemetry_Run(test_tick);
-        CAN3Telemetry_Run(2000U);
-        assert(CAN3Telemetry_GetStatus(&telemetry) == BSP_CAN_OK);
-        assert(telemetry.init_status == BSP_CAN_ERROR &&
-            telemetry.snapshots == 0U && can_tx_calls == 0U);
-        const BSP_CAN_Frame_t query = {.id = 0x7FFU, .len = 8U};
-        assert(BSP_CAN_Send(&hfdcan1, &query) == BSP_CAN_OK);
-        assert(BSP_CAN_Send(&hfdcan2, &query) == BSP_CAN_OK);
-        return;
-    }
-    BSP_CAN_FDFrame_t fd = {.id = 0x600U, .len = 64U};
-    assert(BSP_CAN_SendFD(&hfdcan1, &fd) == BSP_CAN_INVALID_ARG);
-    for (unsigned len = 0U; len <= 65U; ++len) {
-        fd.len = (uint8_t)len;
-        const bool valid = len <= 8U || len == 12U || len == 16U || len == 20U ||
-            len == 24U || len == 32U || len == 48U || len == 64U;
-        assert(BSP_CAN_SendFD(&hfdcan3, &fd) ==
-               (valid ? BSP_CAN_OK : BSP_CAN_INVALID_ARG));
-    }
-    fd.id = 0x800U;
-    assert(BSP_CAN_SendFD(&hfdcan3, &fd) == BSP_CAN_INVALID_ARG);
-    fd.id = CAN3_TELEMETRY_ID; fd.len = CAN3_TELEMETRY_LENGTH;
-    can_tx_result = HAL_BUSY;
-    assert(BSP_CAN_SendFD(&hfdcan3, &fd) == BSP_CAN_BUSY);
-    can_tx_result = HAL_ERROR;
-    assert(BSP_CAN_SendFD(&hfdcan3, &fd) == BSP_CAN_ERROR);
-    can_tx_result = HAL_OK;
-    /* CAN3 input is not a motor-control bridge, even for matching motor IDs. */
-    const uint8_t incoming[8] = {1U, 0U, 0U, 0U, 0U, 0U, 20U, 21U};
-    queue_motor_feedback(&hfdcan3, 0x11U, incoming, FDCAN_DLC_BYTES_48);
-    can_io[2].rx_header.FDFormat = FDCAN_FD_CAN;
-    HAL_FDCAN_RxFifo0Callback(&hfdcan3, FDCAN_IT_RX_FIFO0_NEW_MESSAGE);
-    DM_Motor_Feedback_t no_bridge;
-    assert(DM_Motor_GetFeedback(motors[0], &no_bridge) == BSP_CAN_NOT_READY);
-    for (unsigned i = 0U; i < 4U; ++i) {
-        const DM_Motor_Config_t *cfg = &g_motor_can_config[i];
-        const uint8_t reply[8] = {(uint8_t)cfg->can_id, 0xFFU, 0xFFU,
-                                 0x7FU, 0xF8U, 0U, 30U, 31U};
-        inject_motor_feedback(cfg->bus, cfg->master_id, reply, 8U);
-    }
-    /* Canonical byte vector is also asserted in Python; raw pos, not zeros. */
-    static const uint8_t expected[48] = {
-        0x59,0x4C,1,5,1,0,0,0,0xFB,0xFF,0xFF,0xFF,100,0,32,0,
-        1,2,0,3,1,0,0x11,0,0xFB,0xFF,0xFF,0xFF,1,0,0,0,
-        0,0,0x48,0x41,0,0x0A,0x20,0xBB,0,0x1C,0xE0,0x3B,0,30,31,0
-    };
-    const unsigned original_motor_tx = can_io[0].tx_calls + can_io[1].tx_calls;
-    const unsigned before = can_tx_calls;
-    for (unsigned i = 0U; i < 5U; ++i) {
-        test_tick = UINT32_MAX - 4U + i;
-        CAN3Telemetry_Run(test_tick);
-        assert(can_tx_header.DataLength == FDCAN_DLC_BYTES_48 &&
-            can_tx_header.Identifier == CAN3_TELEMETRY_ID &&
-            can_tx_header.FDFormat == FDCAN_FD_CAN &&
-            can_tx_header.BitRateSwitch == FDCAN_BRS_ON);
-        assert(can_tx_data[15] == i && can_tx_data[16] == i+1U);
-        assert(can_tx_data[17] == (i < 2U ? 2U : 1U));
-        assert(can_tx_data[18] == (i == 2U ? 1U : 0U));
-        assert(can_tx_data[19] == (i < 4U ? 3U : 0U));
-        assert(can3_u32(&can_tx_data[8]) == UINT32_MAX - 4U);
-        if (i == 0U) {
-            assert(memcmp(can_tx_data, expected, 48U) == 0);
-        } else if (i == 4U) {
-            assert(isnan(can3_float(&can_tx_data[32])) && can_tx_data[44] == 0xFFU);
-        }
-        CAN3Telemetry_Run(test_tick); /* at most one submission/tick */
-    }
-    assert(can_tx_calls == before + 5U);
-    /* Immutable snapshot, source counter does not advance just by republishing. */
-    test_tick = 5U; CAN3Telemetry_Run(test_tick); /* tick wraps */
-    assert(can3_u32(&can_tx_data[4]) == 2U &&
-           can3_u32(&can_tx_data[28]) == 1U && can_tx_data[19] == 3U);
-    test_tick = 1000U; CAN3Telemetry_Run(test_tick); /* previous partial expires */
-    assert(can3_u32(&can_tx_data[4]) == 3U && can_tx_data[19] == 1U);
-    assert(can3_float(&can_tx_data[32]) == 12.5f); /* keep stale angle */
-    can_io[2].free_slots = 0U;
-    test_tick = 1001U; CAN3Telemetry_Run(test_tick);
-    const unsigned pressure_tx = can_tx_calls;
-    test_tick = 1002U; CAN3Telemetry_Run(test_tick);
-    assert(can_tx_calls == pressure_tx); /* no busy retry/spin */
-    can_io[2].free_slots = 8U;
-    test_tick = 1010U; CAN3Telemetry_Run(test_tick);
-    assert(can3_u32(&can_tx_data[4]) == 4U && can_tx_data[15] == 0U);
-    hfdcan3.Instance->CCCR |= FDCAN_CCCR_INIT;
-    can_protocol[2].BusOff = 1U;
-    test_tick = 1011U; CAN3Telemetry_Run(test_tick);
-    assert(CAN3Telemetry_GetStatus(&telemetry) == BSP_CAN_OK);
-    assert(telemetry.snapshots == 4U && telemetry.snapshots_dropped == 3U &&
-        telemetry.last_transport == BSP_CAN_NOT_READY);
-    assert(can_stop_calls == 0U && can_start_calls == 3U);
-    assert(original_motor_tx == can_io[0].tx_calls + can_io[1].tx_calls);
-    for (unsigned i = 1U; i <= 5U; ++i) {
-        assert(motor_enable_calls[i] == 0U && motor_disable_calls[i] == 0U &&
-            motor_mit_calls[i] == 0U && motor_query_calls[i] == 0U);
-    }
-    test_ipsr = 1U;
-    assert(BSP_CAN_SendFD(&hfdcan3, &fd) == BSP_CAN_INVALID_ARG);
-    assert(CAN3Telemetry_GetStatus(&telemetry) == BSP_CAN_INVALID_ARG);
-    test_ipsr = 0U;
-}
-
 #include "five_mit_checks.inc"
 
 int main(int argc, char **argv)
@@ -1606,6 +1456,7 @@ int main(int argc, char **argv)
     if (argc==2 && strcmp(argv[1],"five-j3-reverse")==0) { test_j3_reverse(); return 0; }
 #endif
     if (argc==2 && strcmp(argv[1],"five-motion-admission")==0) { test_motion_admission(); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-smooth-control")==0) { test_smooth_control(); return 0; }
     if (argc==2 && strcmp(argv[1],"five-cold")==0) { test_cold(false); return 0; }
     if (argc==2 && strcmp(argv[1],"five-cold-silent")==0) { test_cold(true); return 0; }
     if (argc==2 && strcmp(argv[1],"five-j3-read")==0) { test_j3_read("ok"); return 0; }
@@ -1613,12 +1464,7 @@ int main(int argc, char **argv)
     if (argc==2 && strcmp(argv[1],"five-j3-read-cancel")==0) { test_j3_read("cancel"); return 0; }
     if (argc==2 && strcmp(argv[1],"five-j3-read-tx")==0) { test_j3_read("tx"); return 0; }
     if (argc==2 && strcmp(argv[1],"five-wire")==0) { return five_wire_stream(); }
-    if (argc == 2 && (strcmp(argv[1], "can3-fd") == 0 ||
-                      strcmp(argv[1], "can3-init-failure") == 0)) {
-        test_can3_fd(strcmp(argv[1], "can3-init-failure") == 0);
-        puts("PASS: CAN3 FD aggregate, bounded TX, age/wrap, pressure/failure isolation");
-        return 0;
-    }
+    if (argc==2 && strcmp(argv[1],"can-start-failure")==0) { test_can_start_failure(); return 0; }
     if (argc == 2 && strcmp(argv[1], "can-motor-config") == 0) {
         test_can_motor_config();
         puts("PASS: production J1..J5 CAN bus/ID/ranges, feedback isolation and no enable");
@@ -1626,7 +1472,7 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "can-startup") == 0) {
         test_can_startup();
-        puts("PASS: early IRQ, receive during HAL Start and failed-start isolation");
+        puts("PASS: early IRQ, receive during HAL Start and unknown-bus rejection");
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "can-five-axis") == 0) {

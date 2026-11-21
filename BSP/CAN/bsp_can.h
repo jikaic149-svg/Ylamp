@@ -10,7 +10,6 @@ extern "C" {
 
 #define BSP_CAN_MAX_STD_ID      0x7FFU
 #define BSP_CAN_MAX_DATA_LENGTH 8U
-#define BSP_CAN_FD_MAX_DATA_LENGTH 64U
 
 typedef enum {
     BSP_CAN_OK = 0,
@@ -27,13 +26,6 @@ typedef struct {
     uint8_t data[BSP_CAN_MAX_DATA_LENGTH];
     uint8_t len; /* 有效字节数：0 .. BSP_CAN_MAX_DATA_LENGTH */
 } BSP_CAN_Frame_t;
-
-typedef struct {
-    uint32_t id;
-    uint8_t data[BSP_CAN_FD_MAX_DATA_LENGTH];
-    /* CAN FD 实际字节数：0..8、12、16、20、24、32、48、64，不是DLC码。 */
-    uint8_t len;
-} BSP_CAN_FDFrame_t;
 
 /* 诊断时间为 HAL tick ms。LEC/DLEC 0=无错误，1..6=错误类型，7=无新事件。
  * 一次寄存器采样，不承诺这些硬件字段严格同时锁存。
@@ -67,10 +59,10 @@ typedef void (*BSP_CAN_RxCallback_t)(FDCAN_HandleTypeDef *hfdcan,
 /**
  * 初始化一个 FDCAN 实例的 BSP 接收路径并启动控制器。
  *
- * 前置条件：已完成 HAL 初始化，使用 Classic CAN 或 FD+BRS 标准帧配置，
+ * 前置条件：已完成 HAL 初始化，使用 Classic CAN 标准帧配置，
  * 已配置消息 RAM、接收 FIFO0（1..16 项）、发送 FIFO/Queue 和对应 NVIC 中断。
  * IT0/IT1 入口须转发 BSP_CAN_IRQHandler，以便在 HAL 清中断前保存错误证据。
- * 仅接管生成的 hfdcan1/2/3；全模块静态回调容量 16 项。
+ * 仅接管生成的 hfdcan1/2；全模块静态回调容量 16 项。
  * hfdcan 不得为 NULL，必须指向板级生成的有效句柄，生命周期覆盖整个运行期。
  * 本模块独占该实例的接收过滤配置、FIFO0、协议状态读取和错误通知配置；
  * 不在其他代码直接读取 PSR/ECR，否则会消费 LEC/错误日志计数。
@@ -84,12 +76,6 @@ typedef void (*BSP_CAN_RxCallback_t)(FDCAN_HandleTypeDef *hfdcan,
  * 不修改引脚、时钟、位速率或电源支路，不发送电机使能/控制命令。
  */
 BSP_CAN_Status_t BSP_CAN_Init(FDCAN_HandleTypeDef *hfdcan);
-
-/* 板级启动入口：CAN3专用于只读汇总，1Mbps仲裁/2Mbps数据，FD+BRS。
- * 复用SDK的FDCAN3 MSP（PD12/13），本项目维护位时序/RAM配置，不调用
- * MX_FDCAN3_Init。仅启动阶段一次调用；不触碰CAN1/2，不发电机命令。
- * CAN3单次发送、无自动重发/恢复；失败返回错误，不调用Error_Handler。 */
-BSP_CAN_Status_t BSP_CAN3_InitFD(void);
 
 /**
  * 非阻塞提交一帧到硬件发送 FIFO/Queue，无软件队列或软件自动重试。
@@ -109,12 +95,6 @@ BSP_CAN_Status_t BSP_CAN3_InitFD(void);
  */
 BSP_CAN_Status_t BSP_CAN_Send(FDCAN_HandleTypeDef *hfdcan,
                               const BSP_CAN_Frame_t *frame);
-
-/* 与Send同样的上下文、复制及提交语义；仅接受CAN3的FD+BRS配置、
- * 64字节TX元素，始终发送FD+BRS。没有接收转发或软件自动重试。
- * 非法长度直接拒绝，不隐式补齐。Classic电机接口及回调保持不变。 */
-BSP_CAN_Status_t BSP_CAN_SendFD(FDCAN_HandleTypeDef *hfdcan,
-                                const BSP_CAN_FDFrame_t *frame);
 
 /* 显式、非阻塞、分步恢复；仅资源所有者普通任务串行调用，非 Send/ISR 隐式重试。
  * 只接受实际 INIT+Bus-Off；正常或非 Bus-Off 的 INIT 返回 NOT_READY，不修改硬件。

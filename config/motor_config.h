@@ -10,7 +10,9 @@ extern "C" {
 
 /* Physical owner, model, calibration and bus addresses have the same order. */
 #define MOTOR_CAN_JOINT_COUNT 5U
-#define FIVE_PERIOD_MS 5U
+/* 500 Hz motor-owner tick; the existing RTOS task still wakes every 1 ms.
+ * Leave CAN headroom instead of sending all five at the 1 kHz task rate. */
+#define FIVE_PERIOD_MS 2U
 #define FIVE_QUERY_MS 10U
 #define FIVE_MAX_SKEW_MS 20U
 #define FIVE_MAX_AGE_MS 100U

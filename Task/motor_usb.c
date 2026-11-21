@@ -5,11 +5,17 @@
 #include "joint_calibration.h"
 #include "yummy_imu.h"
 #include "usb_config.h"
+#include "motor_snapshot.h"
 #include <string.h>
 #include <math.h>
 
 _Static_assert(USB_FOCUS_PERIOD_MS>0 && USB_FOCUS_MAX_AGE_MS>0 &&
                USB_FOCUS_MAX_AGE_MS<=UINT16_MAX,"invalid focus cadence/age");
+enum { FOCUS_HEADER_SIZE=14, FOCUS_IMU_SIZE=16, FOCUS_IMU_COUNT=2,
+       FOCUS_PAYLOAD_SIZE=FOCUS_HEADER_SIZE+MOTOR_CAN_JOINT_COUNT*MOTOR_SNAPSHOT_RECORD_SIZE+
+                          FOCUS_IMU_COUNT*FOCUS_IMU_SIZE };
+_Static_assert(FOCUS_PAYLOAD_SIZE<=UINT8_MAX &&
+               FOCUS_PAYLOAD_SIZE+7<=BSP_USB_TX_CAPACITY,"unified observer exceeds USB capacity");
 static struct {
     bool initialized, session_valid;
     uint8_t frame[31], used, session[8], last_request[24], last_response[20];
@@ -53,52 +59,59 @@ static void put_float(uint8_t *p, float value)
     uint32_t bits; memcpy(&bits,&value,sizeof bits); put32(p,bits);
 }
 
+static void focus_imu(uint8_t *p,uint8_t id,uint32_t now,uint32_t at,
+                      uint32_t count,float angle,bool ready)
+{
+    const bool received=count && isfinite(angle);
+    p[0]=id;
+    p[1]=(received ? 1U : 0U) |
+        (received && ready && now-at<=USB_FOCUS_MAX_AGE_MS ? 2U : 0U);
+    put32(p+4,received ? at : 0);
+    put32(p+8,received ? count : 0);
+    put_float(p+12,received ? angle : NAN);
+}
+
 static void focus_sample(uint32_t now)
 {
     if (now-link.focus_at<USB_FOCUS_PERIOD_MS) { return; }
     link.focus_at=now;
     const FiveControl_Status *s=FiveControl_StatusNow();
-    const bool j2=link.focus_mode==3;
-    const DM_Motor_Feedback_t *f=s ? &s->feedback[j2 ? 1 : 2] : NULL;
-    uint32_t imu_at=0,imu_count=0;
-    float angle=NAN;
-    bool ready=false;
-    if (j2) {
-        BMI088_Sample_t b;
-        JointCalibration_Status_t cal;
-        if (BMI088_GetSample(&b)==HAL_OK &&
-            hypotf(b.accel_m_s2[0],hypotf(b.accel_m_s2[1],b.accel_m_s2[2]))>.001f) {
-            angle=atan2f(-b.accel_m_s2[0],
-                hypotf(b.accel_m_s2[1],b.accel_m_s2[2]))*57.29577951308232f;
-            imu_at=b.received_at_ms; imu_count=b.sequence;
-            ready=JointCalibration_GetStatus(now,&cal)==BSP_CAN_OK &&
-                (cal.flags & (CAL_IMU_FRESH|CAL_WARM))==(CAL_IMU_FRESH|CAL_WARM);
-        }
-    } else {
-        YummyIMU_Status_t y; YummyIMU_GetStatus(&y);
-        angle=y.pitch_deg; imu_at=y.received_at_ms; imu_count=y.sequence;
-        ready=y.rx_running;
+    BMI088_Sample_t bmi={0};
+    float pitch=NAN;
+    if (BMI088_GetSample(&bmi)==HAL_OK &&
+        hypotf(bmi.accel_m_s2[0],hypotf(bmi.accel_m_s2[1],bmi.accel_m_s2[2]))>.001f) {
+        pitch=atan2f(-bmi.accel_m_s2[0],
+            hypotf(bmi.accel_m_s2[1],bmi.accel_m_s2[2]))*57.29577951308232f;
     }
-    const bool motor=f && f->received_count && isfinite(f->position_rad);
-    const bool imu=imu_count && isfinite(angle);
-    uint8_t frame[43]={0xA5,0x5A,1,0x94,36};
+    YummyIMU_Status_t yummy;YummyIMU_GetStatus(&yummy);
+    /* Timestamp AFTER copying sources; the envelope is not a hardware trigger. */
+    const uint32_t sampled=HAL_GetTick();
+    JointCalibration_Status_t cal;
+    const bool warm=JointCalibration_GetStatus(sampled,&cal)==BSP_CAN_OK &&
+        (cal.flags & (CAL_IMU_FRESH|CAL_WARM))==(CAL_IMU_FRESH|CAL_WARM);
+    uint8_t frame[FOCUS_PAYLOAD_SIZE+7]={0xA5,0x5A,1,0x94,FOCUS_PAYLOAD_SIZE};
     uint8_t *p=frame+5;
-    put32(p,++link.focus_sequence); put32(p+4,now);
-    put32(p+8,motor ? f->received_at_ms : 0);
-    put32(p+12,motor ? f->received_count : 0);
-    put32(p+16,imu ? imu_at : 0);
-    put32(p+20,imu ? imu_count : 0);
-    put_float(p+24,motor ? f->position_rad*57.29577951308232f : NAN);
-    put_float(p+28,imu ? angle : NAN);
-    p[32]=(motor ? 1U : 0U) |
-        (motor && now-f->received_at_ms<=USB_FOCUS_MAX_AGE_MS ? 2U : 0U) |
-        (imu ? 4U : 0U) |
-        (imu && ready && now-imu_at<=USB_FOCUS_MAX_AGE_MS ? 8U : 0U);
-    p[33]=motor ? f->state : 255U;
-    p[34]=(uint8_t)USB_FOCUS_MAX_AGE_MS;
-    p[35]=(uint8_t)(USB_FOCUS_MAX_AGE_MS>>8);
-    const uint16_t crc=MotorTelemetry_CRC16(frame+2,39);
-    frame[41]=(uint8_t)crc; frame[42]=(uint8_t)(crc>>8);
+    put32(p,++link.focus_sequence);put32(p+4,sampled);
+    p[8]=MOTOR_CAN_JOINT_COUNT;p[9]=FOCUS_IMU_COUNT;
+    p[10]=MOTOR_SNAPSHOT_RECORD_SIZE;p[11]=FOCUS_IMU_SIZE;
+    p[12]=(uint8_t)USB_FOCUS_MAX_AGE_MS;p[13]=(uint8_t)(USB_FOCUS_MAX_AGE_MS>>8);
+    p+=FOCUS_HEADER_SIZE;
+    for (unsigned i=0;i<MOTOR_CAN_JOINT_COUNT;++i) {
+        const DM_Motor_Feedback_t *f=s ? &s->feedback[i] : NULL;
+        const bool valid=f && f->received_count && isfinite(f->position_rad) &&
+            isfinite(f->velocity_rad_s) && isfinite(f->torque_nm);
+        const DM_Motor_Config_t *cfg=&g_motor_can_config[i];
+        uint8_t packet[MOTOR_SNAPSHOT_LENGTH];
+        MotorSnapshot_Encode(packet,MOTOR_CAN_JOINT_COUNT,(uint8_t)i,
+            cfg->bus==&hfdcan1 ? 1U : 2U,link.focus_sequence,sampled,
+            USB_FOCUS_MAX_AGE_MS,cfg,valid ? f : NULL);
+        memcpy(p,packet+16,MOTOR_SNAPSHOT_RECORD_SIZE);p+=MOTOR_SNAPSHOT_RECORD_SIZE;
+    }
+    focus_imu(p,1,sampled,bmi.received_at_ms,bmi.sequence,pitch,warm);
+    focus_imu(p+FOCUS_IMU_SIZE,2,sampled,yummy.received_at_ms,yummy.sequence,
+              yummy.pitch_deg,yummy.rx_running);
+    const uint16_t crc=MotorTelemetry_CRC16(frame+2,FOCUS_PAYLOAD_SIZE+3);
+    frame[sizeof frame-2]=(uint8_t)crc;frame[sizeof frame-1]=(uint8_t)(crc>>8);
     /* BSP copies before returning; BUSY drops this sample, never catches up. */
     (void)BSP_USB_Send(frame,sizeof frame);
 }
@@ -219,8 +232,8 @@ static void request(uint32_t now_ms)
          * SESSION: start/pause must never invoke an actuator or mode switch. */
         type=0x93U; length=18U;
         const uint8_t mode=p[8];
-        BSP_CAN_Status_t rc=mode<=4 ? BSP_CAN_OK : BSP_CAN_INVALID_ARG;
-        if (mode==3 && !link.focus_owns_bmi) {
+        BSP_CAN_Status_t rc=mode<=2 ? BSP_CAN_OK : BSP_CAN_INVALID_ARG;
+        if (mode==1 && !link.focus_owns_bmi) {
             JointCalibration_Status_t cal;
             rc=JointCalibration_GetStatus(now_ms,&cal);
             if (rc==BSP_CAN_OK && (cal.flags & (CAL_IMU_ACTIVE|CAL_IMU_STOPPING|CAL_IMU_STOP_FAILED))) {
@@ -230,7 +243,7 @@ static void request(uint32_t now_ms)
                 rc=JointCalibration_SetIMU(true,now_ms);
                 if (rc==BSP_CAN_OK) { link.focus_owns_bmi=true; }
             }
-        } else if (mode<=2 && link.focus_owns_bmi) {
+        } else if (mode==0 && link.focus_owns_bmi) {
             rc=JointCalibration_SetIMU(false,now_ms);
             if (rc==BSP_CAN_OK) { link.focus_owns_bmi=false; }
         }
@@ -240,7 +253,7 @@ static void request(uint32_t now_ms)
         }
         memcpy(link.response+5,p,8);
         link.response[13]=mode; link.response[14]=(uint8_t)rc;
-        put32(link.response+15,mode==3 || mode==4 ? MOTOR_J2_FOCUS_VERSION : MOTOR_FOCUS_VERSION);
+        put32(link.response+15,MOTOR_FOCUS_VERSION);
         put32(link.response+19,now_ms);
     } else if (link.frame[3] == 0x12U) {
         if (!link.session_valid || memcmp(link.session, p, 8U) != 0) {
@@ -360,7 +373,7 @@ bool MotorUSB_Run(void)
         }
     }
     if (link.focus_mode) {
-        if (link.focus_mode==1 || link.focus_mode==3) { focus_sample(HAL_GetTick()); }
+        if (link.focus_mode==1) { focus_sample(HAL_GetTick()); }
         return false; /* Includes PAUSE: no fallback five-axis stream. */
     }
     return true;

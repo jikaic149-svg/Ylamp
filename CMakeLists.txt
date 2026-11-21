@@ -6,7 +6,6 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(BSP_HOST_TEST "Build HAL-fake behavioral tests on the host" OFF)
-option(YLAMP_CAN3_TELEMETRY "Enable optional CAN3 FD telemetry alongside board USB" ON)
 option(YLAMP_J3_REVERSE_TEST "Temporary supported J3 gravity-direction comparison" OFF)
 set(ylamp_image ylamp_v12_five_axis)
 foreach(retired YLAMP_J5_TEST_ONLY YLAMP_CAN_CHECK_ONLY YLAMP_LEGACY_DUAL_AXIS YLAMP_FIVE_MIT_PREVIEW YLAMP_J25_SHADOW)
@@ -18,7 +17,6 @@ set(BSP_CUBE_ROOT "" CACHE PATH "Unmodified DM-MC02 H7_BSP-HEAD reference projec
 
 add_library(ylamp_bsp STATIC
     BSP/CAN/bsp_can.c
-    BSP/CAN/bsp_can3.c
     BSP/USB/bsp_usb.c
     BSP/UART/bsp_uart.c
     BSP/RGB/bsp_rgb.c
@@ -43,7 +41,7 @@ target_compile_options(ylamp_model PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(ylamp_model PUBLIC m)
 add_library(ylamp_task STATIC Task/five_control.c Task/five_mit_send.c Mode/five_mit.c Mode/five_support.c
     config/five_mit.c config/motor_config.c config/calibration_config.c
-    Task/joint_calibration.c Task/motor_usb.c Task/motor_telemetry.c Task/can3_telemetry.c)
+    Task/joint_calibration.c Task/motor_usb.c Task/motor_telemetry.c)
 target_include_directories(ylamp_task PUBLIC Task Mode Model config)
 target_link_libraries(ylamp_task PUBLIC ylamp_device ylamp_model m)
 target_compile_options(ylamp_task PRIVATE -Wall -Wextra -Werror -fstack-usage)
@@ -60,9 +58,9 @@ if(BSP_HOST_TEST)
     if(YLAMP_J3_REVERSE_TEST)
         add_test(NAME five-j3-reverse COMMAND bsp_tests five-j3-reverse)
     endif()
-    foreach(suite can-startup can-motor-config can-five-axis five-mit five-control five-key five-motion-admission five-cold five-cold-silent
-                  five-j3-read five-j3-read-timeout five-j3-read-cancel five-j3-read-tx can3-fd
-                  can3-init-failure can-diagnostics can-recovery key-boot dm-motor dm-motor-full)
+    foreach(suite can-startup can-start-failure can-motor-config can-five-axis five-mit five-control five-key five-motion-admission five-smooth-control five-cold five-cold-silent
+                  five-j3-read five-j3-read-timeout five-j3-read-cancel five-j3-read-tx
+                  can-diagnostics can-recovery key-boot dm-motor dm-motor-full)
         add_test(NAME ${suite} COMMAND bsp_tests ${suite})
     endforeach()
     target_include_directories(ylamp_bsp PUBLIC tests/fakes)
@@ -156,6 +154,10 @@ else()
         "${BSP_CUBE_ROOT}/Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Src/usbd_cdc.c"
     )
     target_link_libraries(bsp_hal_check PRIVATE ylamp_bsp)
+    # Keep the SDK unchanged, but do not carry unused bus initializers/handles
+    # into the image merely because its fdcan.c also supplies CAN1 and CAN2.
+    set_source_files_properties("${BSP_CUBE_ROOT}/Core/Src/fdcan.c" PROPERTIES
+        COMPILE_OPTIONS "-ffunction-sections;-fdata-sections")
     file(READ "${BSP_CUBE_ROOT}/STM32H723XG_FLASH.ld" BSP_LINK_SCRIPT)
     if(CMAKE_C_COMPILER_VERSION VERSION_LESS 11)
         string(REPLACE "(READONLY)" "" BSP_LINK_SCRIPT "${BSP_LINK_SCRIPT}")
@@ -196,15 +198,13 @@ else()
         ylamp_freertos ylamp_task ylamp_device ylamp_bsp bsp_hal_check
         -Wl,--end-group m)
     target_compile_options(ylamp_firmware PRIVATE -Wall -Wextra -Werror)
-    if(YLAMP_CAN3_TELEMETRY)
-        target_compile_definitions(ylamp_firmware PRIVATE YLAMP_CAN3_TELEMETRY=1)
-    endif()
     set_source_files_properties(App/fault.c PROPERTIES
         COMPILE_OPTIONS "-mgeneral-regs-only;-fstack-usage")
     target_link_options(ylamp_firmware PRIVATE
         "-T${CMAKE_CURRENT_BINARY_DIR}/bsp_link_check.ld"
         --specs=nano.specs --specs=nosys.specs
         "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/${ylamp_image}.map"
+        -Wl,--gc-sections
         -Wl,--print-memory-usage
     )
     set_target_properties(ylamp_firmware PROPERTIES OUTPUT_NAME "${ylamp_image}" SUFFIX ".elf")

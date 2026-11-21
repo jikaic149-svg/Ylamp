@@ -13,7 +13,6 @@
 #include "five_control.h"
 #include "bmi088_port.h"
 #include "motor_usb.h"
-#include "can3_telemetry.h"
 #include "usb_telemetry.h"
 #include "usb_config.h"
 #include "joint_calibration.h"
@@ -104,9 +103,6 @@ void Ylamp_ControlStep(uint32_t now)
     g_fault_stage=YLAMP_STAGE_CALIBRATION;
     JointCalibration_Run(now);
     if (MotorUSB_Run()) { USBTelemetry_Run(HAL_GetTick()); }
-#ifdef YLAMP_CAN3_TELEMETRY
-    CAN3Telemetry_Run(HAL_GetTick());
-#endif
     if (now-report>=500U) {
         report=now;
         const FiveControl_Status *s=FiveControl_StatusNow();
@@ -163,11 +159,6 @@ int main(void)
      * words. CAN initialization does not switch power or enable motors. */
     MX_FDCAN2_Init();
     if (BSP_CAN_Init(&hfdcan2) != BSP_CAN_OK) { Error_Handler(); }
-    /* Optional PC telemetry must not prevent motor control from booting.
-     * Own configuration overrides the SDK's unused Classic-CAN3 initializer. */
-#ifdef YLAMP_CAN3_TELEMETRY
-    const BSP_CAN_Status_t can3_status = BSP_CAN3_InitFD();
-#endif
     /* Existing SDK port selects HSI48, IRQ priority 5, embedded FS PHY, no DMA.
      * No generated usb_device.c/cdc_if.c or reference C++ application is used. */
     (void)BSP_USB_Init();
@@ -177,9 +168,6 @@ int main(void)
             Error_Handler();
         }
     }
-#ifdef YLAMP_CAN3_TELEMETRY
-    (void)CAN3Telemetry_Init(motors, HAL_GetTick(), can3_status);
-#endif
     USBTelemetry_Source_t usb_sources[MOTOR_CAN_JOINT_COUNT];
     _Static_assert(MOTOR_CAN_JOINT_COUNT <= MOTOR_SNAPSHOT_MAX_JOINTS, "USB joint capacity");
     _Static_assert(USB_TELEMETRY_PERIOD_MS > 0U && USB_TELEMETRY_PERIOD_MS <= UINT16_MAX,
@@ -218,8 +206,6 @@ void FDCAN1_IT0_IRQHandler(void) { BSP_CAN_IRQHandler(&hfdcan1); }
 void FDCAN1_IT1_IRQHandler(void) { BSP_CAN_IRQHandler(&hfdcan1); }
 void FDCAN2_IT0_IRQHandler(void) { BSP_CAN_IRQHandler(&hfdcan2); }
 void FDCAN2_IT1_IRQHandler(void) { BSP_CAN_IRQHandler(&hfdcan2); }
-void FDCAN3_IT0_IRQHandler(void) { BSP_CAN_IRQHandler(&hfdcan3); }
-void FDCAN3_IT1_IRQHandler(void) { BSP_CAN_IRQHandler(&hfdcan3); }
 void OTG_HS_IRQHandler(void) { BSP_USB_IRQHandler(); }
 void USART1_IRQHandler(void) { HAL_UART_IRQHandler(&huart1); }
 void USART2_IRQHandler(void) { HAL_UART_IRQHandler(&huart2); }

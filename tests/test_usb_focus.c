@@ -77,79 +77,95 @@ static void command(uint8_t mode)
     assert(!MotorUSB_Run()); /* ACK has priority over sample. */
     assert(output_size==25 && output[3]==0x93 && output[4]==18);
     assert(memcmp(output+5,frame+5,9)==0);
-    assert(output[14]==(mode<=4 ? BSP_CAN_OK : BSP_CAN_INVALID_ARG));
-    assert(u32(output+15)==(mode==3 || mode==4 ? MOTOR_J2_FOCUS_VERSION : MOTOR_FOCUS_VERSION) &&
-           u32(output+19)==test_tick);
+    assert(output[14]==(mode<=2 ? BSP_CAN_OK : BSP_CAN_INVALID_ARG));
+    assert(u32(output+15)==MOTOR_FOCUS_VERSION && u32(output+19)==test_tick);
     assert(MotorTelemetry_CRC16(output+2,output_size-4)==
            (uint16_t)(output[output_size-2]|output[output_size-1]<<8));
+}
+static const uint8_t *motor(unsigned i) { return output+19+i*32; }
+static const uint8_t *sensor(unsigned i) { return output+179+i*16; }
+static void refresh_sources(void)
+{
+    for (unsigned i=0;i<5;++i) { control.feedback[i].received_at_ms=test_tick-2; }
+    bmi.received_at_ms=test_tick-1;imu.received_at_ms=test_tick-3;
+}
+static void check_sample(void)
+{
+    assert(output_size==213 && output[3]==0x94 && output[4]==206);
+    assert(u32(output+9)==test_tick);
+    assert(output[13]==5 && output[14]==2 && output[15]==32 && output[16]==16);
+    assert(output[17]==40 && output[18]==0);
+    assert(MotorTelemetry_CRC16(output+2,209)==(uint16_t)(output[211]|output[212]<<8));
+    for (unsigned i=0;i<5;++i) {
+        const uint8_t *r=motor(i);
+        assert(r[0]==i+1 && r[1]==(i<2 ? 2 : 1) && r[2]==(i==2 ? 1 : 0));
+        assert(r[4]==i+1 && r[6]==0x11+i);
+    }
+    assert(sensor(0)[0]==1 && sensor(1)[0]==2);
 }
 int main(void)
 {
     MotorUSB_Init();
-    control.feedback[2]=(DM_Motor_Feedback_t){.position_rad=.5f,.received_at_ms=98,
-        .received_count=5,.state=1};
-    imu=(YummyIMU_Status_t){.sequence=7,.received_at_ms=97,.pitch_deg=4.5f,.rx_running=true};
-    assert(MotorUSB_Run()); /* Original five-axis default unchanged. */
-    command(2);
+    for (unsigned i=0;i<5;++i) {
+        control.feedback[i]=(DM_Motor_Feedback_t){.position_rad=(i+1)*.25f,
+            .received_at_ms=98,.received_count=i+11,.state=1};
+    }
+    imu=(YummyIMU_Status_t){.sequence=7,.pitch_deg=4.5f,.rx_running=true};
+    bmi=(BMI088_Sample_t){.accel_m_s2={-1,0,1},.sequence=3};
+    assert(MotorUSB_Run());
+    command(2); /* Connect-to-pause does not start sensors or motors. */
     unsigned before=writes;
     for (unsigned i=0;i<20;++i) { ++test_tick;assert(!MotorUSB_Run()); }
-    assert(writes==before && !actuator_calls);
-    control.feedback[2].received_at_ms=test_tick-2;imu.received_at_ms=test_tick-3;
-    command(1);
-    assert(!MotorUSB_Run() && output_size==43 && output[3]==0x94 && output[4]==36);
-    assert(u32(output+5)==1 && u32(output+9)==test_tick);
-    assert(u32(output+17)==5 && u32(output+25)==7);
-    assert(fabsf(scalar(output+29)-28.6478898f)<.00001f && scalar(output+33)==4.5f);
-    assert(output[37]==15 && output[38]==1 && output[39]==40 && output[40]==0);
-    assert(MotorTelemetry_CRC16(output+2,39)==(uint16_t)(output[41]|output[42]<<8));
+    assert(writes==before && !sensor_starts && !actuator_calls);
+    refresh_sources();command(1);
+    assert(sensor_starts==1 && !MotorUSB_Run());
+    check_sample();
+    for (unsigned i=0;i<5;++i) {
+        assert(motor(i)[3]==3 && scalar(motor(i)+16)==(i+1)*.25f);
+        assert(u32(motor(i)+12)==i+11);
+    }
+    assert(sensor(0)[1]==1 && scalar(sensor(0)+12)==45.f); /* BMI warmup is local. */
+    assert(sensor(1)[1]==3 && scalar(sensor(1)+12)==4.5f);
+    bmi_flags|=CAL_WARM|CAL_IMU_FRESH;
+    test_tick+=10;refresh_sources();assert(!MotorUSB_Run());
+    check_sample();assert(sensor(0)[1]==3 && sensor(1)[1]==3);
     printf("GOLDEN ");
     for (unsigned i=0;i<output_size;++i) { printf("%02x",output[i]); }
     puts("");
     before=writes;
     test_tick+=9;assert(!MotorUSB_Run() && writes==before);
     ++test_tick;assert(!MotorUSB_Run() && writes==before+1);
-    command(2);before=writes;
-    test_tick+=100;assert(!MotorUSB_Run() && writes==before);
-    command(1);assert(!MotorUSB_Run());
-    assert(output[37]==5); /* Both received but now stale, not fabricated zeros. */
-    command(7);assert(!MotorUSB_Run()); /* Invalid command must preserve running mode. */
+    command(2);before=writes;test_tick+=100;
+    assert(!MotorUSB_Run() && writes==before && !sensor_stops);
+    command(1);assert(sensor_starts==1 && !MotorUSB_Run());
+    assert(motor(1)[3]==1 && motor(2)[3]==1 && sensor(0)[1]==1 && sensor(1)[1]==1);
+    command(3);command(4);command(7); /* Retired profiles/invalid requests preserve run. */
+    test_tick+=10;refresh_sources();
     control.feedback[2].received_count=0;imu.sequence=0;
-    test_tick+=10;assert(!MotorUSB_Run());
-    assert(output[37]==0 && output[38]==255 && isnan(scalar(output+29)) && isnan(scalar(output+33)));
+    assert(!MotorUSB_Run());check_sample();
+    assert(motor(1)[3]==3 && motor(2)[3]==0 && motor(2)[28]==255);
+    assert(isnan(scalar(motor(2)+16)) && sensor(0)[1]==3 &&
+           sensor(1)[1]==0 && isnan(scalar(sensor(1)+12)));
     busy=true;test_tick+=10;before=writes;assert(!MotorUSB_Run() && writes==before);
     busy=false;assert(!MotorUSB_Run() && writes==before); /* No catch-up retry. */
     test_tick+=10;assert(!MotorUSB_Run() && writes==before+1);
-    command(2);dtr=false;++epoch;assert(MotorUSB_Run()); /* Restores normal, no actuator. */
+    command(2);dtr=false;++epoch;assert(MotorUSB_Run());
+    assert(sensor_stops==1 && !actuator_calls);
     dtr=true;assert(MotorUSB_Run());
-    command(1);
-    command(0);assert(MotorUSB_Run());
-    /* Corrupted observer frame cannot change the stream profile. */
+    command(2);assert(sensor_starts==1);
+    command(1);assert(sensor_starts==2);
+    command(0);assert(MotorUSB_Run() && sensor_stops==2);
     uint8_t bad[16]={0xA5,0x5A,1,0x13,9};
     memcpy(input,bad,sizeof bad);head=sizeof bad;tail=0;
     assert(MotorUSB_Run() && !actuator_calls);
-    assert(!sensor_starts && !sensor_stops);
-    command(4);assert(!sensor_starts); /* Connect-to-pause never powers BMI. */
-    control.feedback[1]=(DM_Motor_Feedback_t){.position_rad=2.5f,
-        .received_at_ms=test_tick,.received_count=9,.state=1};
-    bmi=(BMI088_Sample_t){.accel_m_s2={-1,0,1},.received_at_ms=test_tick,.sequence=3};
-    command(3);assert(sensor_starts==1 && !actuator_calls);
-    assert(!MotorUSB_Run() && output[37]==7); /* Fresh but not warmed: not calibratable. */
-    bmi_flags|=CAL_WARM|CAL_IMU_FRESH;
-    test_tick+=10;control.feedback[1].received_at_ms=bmi.received_at_ms=test_tick;
-    assert(!MotorUSB_Run() && output[37]==15);
-    assert(fabsf(scalar(output+29)-143.23945f)<.0001f && fabsf(scalar(output+33)-45.f)<.0001f);
-    command(4);before=writes;test_tick+=20;
-    assert(!MotorUSB_Run() && writes==before && sensor_stops==0);
-    command(3);assert(sensor_starts==1); /* Resume does not reopen/retry the sensor. */
-    command(0);assert(sensor_stops==1 && MotorUSB_Run());
-    /* An externally owned session is BUSY, never stolen or stopped. */
+    /* An external BMI session is not stolen or stopped. */
     bmi_flags=CAL_IMU_ACTIVE;
-    uint8_t held[16]={0xA5,0x5A,1,0x13,9,1,2,3,4,5,6,7,8,3};
+    uint8_t held[16]={0xA5,0x5A,1,0x13,9,1,2,3,4,5,6,7,8,1};
     crc(held,sizeof held);memcpy(input,held,sizeof held);head=sizeof held;tail=0;
     assert(!MotorUSB_Run() && !MotorUSB_Run() && output[14]==BSP_CAN_BUSY);
-    assert(sensor_starts==1 && sensor_stops==1 && !actuator_calls);
-    bmi_flags=0;command(3);assert(sensor_starts==2);
-    dtr=false;++epoch;assert(MotorUSB_Run() && sensor_stops==2 && !actuator_calls);
-    puts("USB focus: both profiles/start/pause/warmup/ownership/DTR/CRC/no motor control PASS");
+    assert(sensor_starts==2 && sensor_stops==2 && !actuator_calls);
+    bmi_flags=0;command(1);assert(sensor_starts==3);
+    dtr=false;++epoch;assert(MotorUSB_Run() && sensor_stops==3 && !actuator_calls);
+    puts("USB unified: five motors/both Pitches/start/pause/warmup/ownership/DTR/CRC/no motor control PASS");
     return 0;
 }

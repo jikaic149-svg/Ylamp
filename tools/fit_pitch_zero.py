@@ -54,13 +54,24 @@ def block_interval(q, pitch, seconds, block_s, repeats, seed):
                 slope_interval=np.percentile(beta[:, 0], [2.5, 97.5]).tolist())
 
 
-def load(path):
+def load(path, joint=None):
     with path.open(encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         fields = reader.fieldnames or []
-        if "bmi_pitch_deg" in fields and "j2_raw_deg" in fields:
+        unified = all(name in fields for name in
+                      ("bmi_pitch_deg", "yummy_pitch_deg", "j2_flags", "j3_flags"))
+        if unified:
+            if joint not in (2, 3):
+                raise ValueError("Unified capture contains both joints; select J2 or J3 for this fit")
+            source = "bmi" if joint == 2 else "yummy"
+            column = f"{source}_pitch_deg"
+        elif "bmi_pitch_deg" in fields and "j2_raw_deg" in fields:
+            if joint not in (None, 2):
+                raise ValueError("This historical capture contains J2 only")
             joint, column = 2, "bmi_pitch_deg"
         elif "pitch_deg" in fields and "j3_raw_deg" in fields:
+            if joint not in (None, 3):
+                raise ValueError("This historical capture contains J3 only")
             joint, column = 3, "pitch_deg"
         else:
             raise ValueError(f"{path}: not a J2/J3 Pitch capture (Roll is not Pitch)")
@@ -68,21 +79,27 @@ def load(path):
     valid = []
     previous = None
     for row in rows:
-        if int(row["flags"]) & 15 != 15:
+        flags = (int(row[f"j{joint}_flags"]) | int(row[f"{source}_flags"]) << 2
+                 if unified else int(row["flags"]))
+        if flags & 15 != 15:
             continue
         q, pitch = float(row[f"j{joint}_raw_deg"]), float(row[column])
         if not np.isfinite([q, pitch]).all() or float(row["imu_mount_offset_deg"]) != 0:
             raise ValueError("Nonfinite data or mixed mounting-offset convention")
         tick, motor_at, imu_at = map(int, (row["tick_ms"], row[f"j{joint}_at_ms"],
-                                         row["imu_at_ms"]))
+                                         row[f"{source}_at_ms" if unified else "imu_at_ms"]))
         maximum = int(row["max_age_ms"])
         if (int(row[f"j{joint}_state"]) != 1 or
                 not (0 <= tick - motor_at <= maximum and 0 <= tick - imu_at <= maximum)):
             raise ValueError("Fresh flag contradicts drive state or source time")
-        counts = (int(row[f"j{joint}_count"]), int(row["imu_count"]))
-        if previous and (tick <= previous[0] or
-                         any(new <= old for new, old in zip(counts, previous[1]))):
-            raise ValueError("Repeated/backward source sample; cannot count as independent pairs")
+        counts = (int(row[f"j{joint}_count"]), int(row[f"{source}_count" if unified else "imu_count"]))
+        if previous:
+            if tick <= previous[0] or any(new < old for new, old in zip(counts, previous[1])):
+                raise ValueError("Backward source sample; cannot count as independent pairs")
+            if any(new == old for new, old in zip(counts, previous[1])):
+                if unified:
+                    continue  # Same envelope cadence does not imply every source advanced.
+                raise ValueError("Repeated source sample; cannot count as independent pairs")
         previous = tick, counts
         valid.append((q, pitch, tick, motor_at, imu_at))
     data = np.asarray(valid, dtype=float)
@@ -91,8 +108,8 @@ def load(path):
     return joint, len(rows), data
 
 
-def analyze(path, repeats=4000):
-    joint, total, data = load(path)
+def analyze(path, repeats=4000, joint=None):
+    joint, total, data = load(path, joint)
     q, pitch, tick, motor_at, imu_at = data.T
     seconds = (tick - tick[0]) / 1000
     result = affine(q, pitch)
@@ -142,6 +159,7 @@ def analyze(path, repeats=4000):
                 deploy=False,
                 limitations=["95% is an interval procedure, not probability the physical zero is correct.",
                              "100 Hz rows are time-correlated; IID confidence is not used.",
+                             "Unified cached envelopes with repeated source counts are excluded per joint.",
                              "Intervals are conditional on this affine model and one recording.",
                              "Mounting offset assumed zero; projection/upstream-pose/dynamic errors remain.",
                              "Pitch regression slope is NOT an encoder scale or torque multiplier.",
@@ -163,7 +181,31 @@ def self_test():
         pass
     else:
         raise AssertionError("Unexcited encoder accepted")
-    print("PASS: affine zero, block confidence and excitation rejection (synthetic, offline)")
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="ylamp-unified-pitch-") as directory:
+        path = Path(directory)/"capture.csv"
+        fields = ("tick_ms", "max_age_ms", "imu_mount_offset_deg") + tuple(
+            f"{source}_{name}" for source in ("j2", "j3", "bmi", "yummy")
+            for name in ("flags", "at_ms", "count", "state", "raw_deg", "pitch_deg"))
+        with path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fields);writer.writeheader()
+            for i in range(240):
+                row = dict(tick_ms=100+i*10, max_age_ms=40, imu_mount_offset_deg=0)
+                for joint, source in ((2, "bmi"), (3, "yummy")):
+                    qj = 110+i/3 if joint==2 else -50+i/2
+                    row.update({f"j{joint}_flags": 3, f"j{joint}_at_ms": 98+i*10,
+                                f"j{joint}_count": i+1, f"j{joint}_state": 1,
+                                f"j{joint}_raw_deg": qj, f"{source}_flags": 3,
+                                f"{source}_at_ms": 99+(i//2)*20,
+                                f"{source}_count": i//2+1,
+                                f"{source}_pitch_deg": -(qj-(146.18 if joint==2 else 17.29))})
+                writer.writerow(row)
+        for joint in (2, 3):
+            selected, total, pairs = load(path, joint)
+            assert selected==joint and total==240 and len(pairs)==120
+            fit = affine(pairs[:, 0], pairs[:, 1])
+            assert abs(fit["zero_deg"]-(146.18 if joint==2 else 17.29))<1e-8
+    print("PASS: affine zero/block confidence/excitation/unified dual-Pitch/source dedup (offline)")
 
 
 if __name__ == "__main__":
@@ -175,8 +217,14 @@ if __name__ == "__main__":
     if args.self_test:
         self_test()
     if args.captures:
+        results = []
+        for path in args.captures:
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                fields = csv.DictReader(stream).fieldnames or []
+            joints = (2, 3) if "yummy_pitch_deg" in fields and "bmi_pitch_deg" in fields else (None,)
+            results.extend(analyze(path, joint=joint) for joint in joints)
         report = dict(schema="ylamp-pitch-zero-ls-1", formula="Pitch_deg = slope*(encoder_deg-zero_deg)",
-                      joints=[analyze(path) for path in args.captures])
+                      joints=results)
         text = json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False)
         if args.output:
             with args.output.open("x", encoding="utf-8") as stream:

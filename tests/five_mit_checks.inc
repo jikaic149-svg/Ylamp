@@ -90,11 +90,6 @@ static void test_five_mit(void)
     const double rounded[][2]={{-34.05,16.46},{-52.99,66.98},{-84.57,29.09}};
     for (int k=0;k<3;++k) {
         live_workspace_pose(boxes[k][0]);live_workspace_pose(boxes[k][1]);
-        if (k!=1) {
-            /* Historical boxes exceed the user-updated raw J4 upper bound. */
-            assert(!FiveWorkspace_BoxJ3Band(boxes[k][0],boxes[k][1],band));
-            continue;
-        }
         assert(FiveWorkspace_BoxJ3Band(boxes[k][0],boxes[k][1],band));
         assert(band[0]<=rounded[k][0]+shift && band[1]>=rounded[k][1]+shift);
         assert(!FiveWorkspace_BoxJ3Band(boxes[k][1],boxes[k][0],band));
@@ -109,7 +104,7 @@ static void test_five_mit(void)
     double anchor[5]={0,-28.73228985940499,-86.72787226950314,204.52846412226867,-4.8693157650418115};
     double end[5]={0,-30.73228985940499,-93.1805102842604,198.52846412226867,-5.6193157650418115};
     live_workspace_pose(anchor);live_workspace_pose(end);
-    assert(!FiveWorkspace_Line(anchor,end)); /* Old positive J4 branch is excluded. */
+    assert(FiveWorkspace_Line(anchor,end)); /* Positive raw J4 branch is now in range. */
     double inside[5]={0,-32,0,-160,-13};live_workspace_pose(inside);
     double outside[5];memcpy(outside,inside,sizeof outside);outside[2]=travel_low-.01;
     assert(FiveWorkspace_Line(inside,inside));
@@ -117,7 +112,7 @@ static void test_five_mit(void)
     /* Per-axis admission does not certify this negative J4 point's geometry. */
     double other[5]={0,-28.549226288298314,-94.09541149521296,-208.30512363628617,-0.47016172764041997};
     live_workspace_pose(other);
-    assert(FiveWorkspace_Line(other,other) && !FiveWorkspace_Line(end,other));
+    assert(FiveWorkspace_Line(other,other) && FiveWorkspace_Line(end,other));
     double safe_anchor[5]={0,-32,0,-160,-13};
     double safe_end[5]={0,-32,2,-160,-13};
     live_workspace_pose(safe_anchor);live_workspace_pose(safe_end);
@@ -192,11 +187,10 @@ static void test_five_mit(void)
     double ya[5]={-200,-5,-5,-5,-5}, yb[5]={200,5,5,5,5};
     live_workspace_pose(ya);live_workspace_pose(yb);
     FiveMIT_Box yaw_box;
-    assert(!FiveMIT_CheckBox(&yaw_box,ya,yb) && !FiveMIT_Prepare(&p,ya,yb,30));
-    assert(!FiveMIT_PrepareInBox(&p,&yaw_box,ya,yb,30));
-    assert(!FiveWorkspace_Line(yb,ya) && !FiveMIT_Prepare(&p,ya,yb,.001));
-    /* Sampler/packet unit test ONLY, not an admitted motion: the new raw
-     * interval has no intersection with the historical J4 +/-5 yaw box. */
+    assert(FiveMIT_CheckBox(&yaw_box,ya,yb) && FiveMIT_Prepare(&p,ya,yb,30));
+    assert(FiveMIT_PrepareInBox(&p,&yaw_box,ya,yb,30));
+    assert(FiveWorkspace_Line(yb,ya) && !FiveMIT_Prepare(&p,ya,yb,.001));
+    /* Range/packet unit test only; this does not certify collision geometry. */
     FiveMIT_Plan yaw_sample={.seconds=30};
     memcpy(yaw_sample.start_deg,ya,sizeof ya);memcpy(yaw_sample.end_deg,yb,sizeof yb);
     FiveMIT_State yaw_state={0};
@@ -215,26 +209,26 @@ static void test_five_mit(void)
     assert(batch.motor[0].position_rad==yaw_state.raw_rad[0] &&
            fabsf(batch.motor[0].velocity_rad_s-.4363323f)<1e-6f);
     double qmid[5]={0};live_workspace_pose(qmid);
-    assert(!FiveWorkspace_Line(ya,qmid) && !FiveWorkspace_Line(qmid,yb));
+    assert(FiveWorkspace_Line(ya,qmid) && FiveWorkspace_Line(qmid,yb));
     double yp[5]={34.49,0,0,0,0};
     live_workspace_pose(yp);
-    assert(!FiveWorkspace_J3Band(yp,band));
+    assert(FiveWorkspace_J3Band(yp,band));
     const double old_yaw_center[5]={34.49,0,0,0,0};
-    assert(!FiveWorkspace_J3Band(old_yaw_center,band)); /* No stale-coordinate bypass. */
-    yb[0]=200.0001;assert(!FiveWorkspace_Line(ya,yb));yb[0]=200;
-    yb[3]=5.001;assert(!FiveWorkspace_Line(ya,yb));yb[3]=5;
+    assert(FiveWorkspace_J3Band(old_yaw_center,band)); /* Per-axis admission, not frozen geometry. */
+    yb[0]=201;assert(!FiveWorkspace_Line(ya,yb));yb[0]=200;
+    yb[3]=294.2975735;assert(!FiveWorkspace_Line(ya,yb));yb[3]=5;
     yb[4]=NAN;assert(!FiveWorkspace_Line(ya,yb));yb[4]=5;
     assert(!FiveMIT_CheckBox(&yaw_box,yb,ya));
 
     /* All five axes can leave the old small box, including nonzero J1.
-     * J4 spans raw -499..9 (508 degrees after the retained 1-degree inset).
+     * J4 spans raw -179..349 (528 degrees after the retained 1-degree inset).
      * These are range checks ONLY, not a physical collision-free trajectory. */
-    double lo[5]={-200,-34,-85,-554.7024265,-21};
-    double hi[5]={200,45,114,-46.7024265,21};
+    double lo[5]={-200,-34,-85,-234.7024265,-21};
+    double hi[5]={200,45,114,293.2975735,21};
     assert(FiveWorkspace_Line(lo,hi) && FiveWorkspace_Line(hi,lo));
     assert(FiveMIT_CheckBox(&yaw_box,lo,hi));
     assert(FiveMIT_Prepare(&p,lo,hi,60));
-    assert(fabs(p.end_deg[3]-p.start_deg[3]-508)<1e-10);
+    assert(fabs(p.end_deg[3]-p.start_deg[3]-528)<1e-10);
     assert(FiveMIT_PrepareInBox(&p,&yaw_box,hi,lo,60));
     assert(p.start_deg[3]==hi[3] && p.end_deg[3]==lo[3]);
     assert(!FiveMIT_Prepare(&p,lo,hi,.001) && p.seconds==0);
@@ -296,6 +290,86 @@ static void assert_gravity_frames(const FiveControl_Status *s,unsigned mask)
         assert(DM_Motor_EncodeMIT(&g_motor_can_config[i],&cmd,&expected)==BSP_CAN_OK);
         assert(!memcmp(motor_last_mit[i+1],expected.data,8));
     }
+}
+static void test_smooth_control(void)
+{
+    assert(FIVE_PERIOD_MS==2U);
+    assert(g_five_mit_tracking[2].kp==5 && g_five_mit_tracking[2].kd==.5f);
+    assert(g_five_mit_tracking[3].kp==3 && g_five_mit_tracking[3].kd==.3f);
+    assert(g_five_mit_tracking[2].max_nm==1.8f && g_five_mit_tracking[3].max_nm==.8f);
+    assert(g_five_tracking_ramp_s==.1f);
+    DM_Motor_t *motors[5];five_setup(motors);
+    assert(FiveControl_Init(motors,test_tick));
+    const FiveControl_Status *s=FiveControl_StatusNow();
+    const uint32_t start=test_tick;
+    const unsigned initial_tx=can_tx_calls;
+    for (unsigned ms=1;ms<=1000;++ms) {
+        test_tick=start+ms;
+        for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
+        const uint32_t before=s->ticks;
+        const unsigned sent=can_tx_calls;
+        FiveControl_Tick(test_tick);
+        assert(s->ticks==before+(ms%2==0));
+        assert(can_tx_calls==sent+(ms%2==0 ? 5U : 0U));
+    }
+    assert(s->ticks==500 && can_tx_calls-initial_tx==2500);
+    assert(s->phase==FIVE_GRAVITY && !s->fault && s->submitted==31);
+    assert_gravity_frames(s,31);
+
+    FiveMIT_State x={0};
+    double from[5],to[5];
+    float q[5],g[5],nominal[5];const float zero[5]={0};
+    for (unsigned i=0;i<5;++i) {
+        from[i]=(s->reference_rad[i]-g_joint_reference_config[i].zero_rad)/.01745329251994329577;
+        to[i]=from[i];
+        x.software_deg[i]=from[i];x.raw_rad[i]=s->feedback[i].position_rad;
+        q[i]=(float)((from[i]+g_five_mit_hw[i].cad_offset_deg)*.01745329251994329577);
+    }
+    to[1]+=.2;
+    FiveMIT_Plan plan;assert(FiveMIT_Prepare(&plan,from,to,1));
+    assert(FiveDynamics_Inverse(q,zero,zero,nominal));
+    assert(FiveSupport_GravityModel(q,(float)(from[2]*.01745329251994329577),g));
+    FiveMIT_Output active,bare;
+    assert(FiveMIT_SampleFeedback(&plan,0,&x,g,&active));
+    for (unsigned i=0;i<5;++i) {
+        assert(fabsf(active.motor[i].torque_ff_nm-g[i])<2e-6f);
+        x.velocity_rad_s[i]=.01f*(float)(i+1);
+    }
+    const double times[]={0,.025,.05,.075,.1,.2};
+    const float blends[]={0,.103515625f,.5f,.896484375f,1,1};
+    for (unsigned k=0;k<sizeof times/sizeof times[0];++k) {
+        assert(FiveMIT_Sample(&plan,times[k],&x,g_five_mit_hw,&bare));
+        assert(FiveMIT_SampleFeedback(&plan,times[k],&x,g,&active));
+        for (unsigned i=0;i<5;++i) {
+            const DM_Motor_MIT_Command_t *cmd=&active.motor[i];
+            const float pd=g_five_mit_tracking[i].kp*(cmd->position_rad-x.raw_rad[i])+
+                g_five_mit_tracking[i].kd*(cmd->velocity_rad_s-x.velocity_rad_s[i]);
+            const float expected=bare.motor[i].torque_ff_nm+g[i]-nominal[i]+blends[k]*pd;
+            assert(fabsf(cmd->torque_ff_nm-expected)<2e-6f && cmd->kp==0 && cmd->kd==0);
+            assert(cmd->position_rad==bare.motor[i].position_rad &&
+                   cmd->velocity_rad_s==bare.motor[i].velocity_rad_s);
+        }
+    }
+    const FiveMIT_Output saved=active;
+    x.software_deg[0]+=60;
+    assert(!FiveMIT_SampleFeedback(&plan,.2,&x,g,&active) &&
+           !memcmp(&saved,&active,sizeof saved)); /* Original effort budget, no clipping. */
+    x.software_deg[0]-=60;x.velocity_rad_s[0]=NAN;
+    assert(!FiveMIT_SampleFeedback(&plan,0,&x,g,&active) &&
+           !memcmp(&saved,&active,sizeof saved)); /* Blend must not hide invalid feedback. */
+
+    assert(FiveControl_Move(to,1000)==BSP_CAN_OK);
+    for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
+    FiveControl_Tick(test_tick+=2);
+    assert(s->phase==FIVE_MOTION && !s->fault && s->submitted==31);
+    FiveControl_Gravity();FiveControl_Tick(test_tick+=2);
+    assert(s->phase==FIVE_GRAVITY);assert_gravity_frames(s,31);
+    assert(FiveControl_Move(to,1000)==BSP_CAN_OK);
+    can_io[1].free_slots=0;FiveControl_Tick(test_tick+=2);
+    assert(s->phase==FIVE_DEGRADED && (s->fault & FIVE_TX) && s->submitted==0x1c);
+    assert_gravity_frames(s,0x1c); /* Fault G handover is immediate, not ramped. */
+    for (unsigned i=1;i<=5;++i) { assert(!motor_enable_calls[i] && !motor_disable_calls[i]); }
+    puts("PASS: 500 Hz cadence, quintic PD entry, unchanged G/budgets/raw feedback and immediate fault handover");
 }
 static void test_j3_read(const char *variant)
 {
@@ -451,12 +525,13 @@ static void test_motion_admission(void)
     const FiveControl_Status *s=FiveControl_StatusNow();
     double target[5]={60,0,0,0,0};
     live_workspace_pose(target);
-    /* The retained zero is now outside raw travel. Support remains valid,
-     * but it must NOT silently recenter that pose to admit a trajectory. */
+    /* The retained zero and the measured +179-degree raw branch are both
+     * inside the new travel. Neither needs a turn shift or a small-angle gate. */
     assert(s->phase==FIVE_GRAVITY && !s->fault && s->submitted==31);
-    assert(FiveControl_Move(target,4000)==BSP_CAN_NOT_READY);
+    assert(FiveControl_Move(target,4000)==BSP_CAN_OK);
+    FiveControl_Gravity();
     for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
-    plant_sample_at(3,1,-179.56567327963523f*.01745329252f);
+    plant_sample_at(3,1,179.1285411727544f*.01745329252f);
     FiveControl_Tick(test_tick+=5);
     assert(s->reference_rad[3]>g_joint_reference_config[3].observed_lower_rad &&
            s->reference_rad[3]<g_joint_reference_config[3].observed_upper_rad);
@@ -490,14 +565,17 @@ static void test_motion_admission(void)
     for (unsigned i=0;i<5;++i) { plant_sample_at_speed(i,1,raw[i],0x800); }
     FiveControl_Tick(test_tick+=5);
     target[0]=NAN;assert(FiveControl_Move(target,2000)==BSP_CAN_INVALID_ARG);
-    target[0]=0;target[3]=0;assert(FiveControl_Move(target,2000)==BSP_CAN_INVALID_ARG);
-    plant_sample_at(3,1,11.f*.01745329252f);
+    target[0]=0;
+    target[3]=(g_joint_reference_config[3].observed_upper_rad-
+               g_joint_reference_config[3].zero_rad)/.01745329251994329577;
+    assert(FiveControl_Move(target,2000)==BSP_CAN_INVALID_ARG);
+    plant_sample_at(3,1,g_joint_reference_config[3].observed_upper_rad+.01745329252f);
     FiveControl_Tick(test_tick+=5);
     assert(FiveControl_Move(target,2000)==BSP_CAN_NOT_READY);
     assert(s->phase==FIVE_GRAVITY && !s->fault && s->submitted==31);
     /* A one-code endpoint discrepancy can only depart inward; no range fault
      * is hidden for a genuinely out-of-range target or further excursion. */
-    plant_sample_at(3,1,-179.56567327963523f*.01745329252f);
+    plant_sample_at(3,1,179.1285411727544f*.01745329252f);
     plant_sample_at(4,1,g_joint_reference_config[4].observed_lower_rad);
     FiveControl_Tick(test_tick+=5);
     for (unsigned i=0;i<5;++i) {
@@ -509,7 +587,7 @@ static void test_motion_admission(void)
     assert(s->phase==FIVE_MOTION && !s->fault && s->submitted==31);
     FiveControl_Gravity();
     for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
-    plant_sample_at(3,1,-179.56567327963523f*.01745329252f);
+    plant_sample_at(3,1,179.1285411727544f*.01745329252f);
     FiveControl_Tick(test_tick+=5);
     for (unsigned i=0;i<5;++i) {
         target[i]=(s->reference_rad[i]-g_joint_reference_config[i].zero_rad)/.01745329251994329577;
@@ -517,7 +595,7 @@ static void test_motion_admission(void)
     target[4]+=2;assert(FiveControl_Move(target,2000)==BSP_CAN_OK);
     for (unsigned elapsed=5;elapsed<=4000;elapsed+=5) {
         for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
-        plant_sample_at(3,1,-179.56567327963523f*.01745329252f);
+        plant_sample_at(3,1,179.1285411727544f*.01745329252f);
         FiveControl_Tick(test_tick+=5);
         if (elapsed==2000) { assert(s->phase==FIVE_POSITION && !s->fault); }
     }
@@ -674,9 +752,10 @@ static void test_control(void)
         assert_gravity_frames(s,31);
     }
     for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
+    plant_sample_at(3,1,g_joint_reference_config[3].observed_upper_rad+.01745329252f);
     FiveControl_Tick(test_tick+=5);
     double goal[5]={1,0,0,0,0};live_workspace_pose(goal);
-    assert(FiveControl_Move(goal,2000)==BSP_CAN_NOT_READY); /* J4 datum outside new raw range. */
+    assert(FiveControl_Move(goal,2000)==BSP_CAN_NOT_READY); /* Actual J4 feedback outside raw range. */
     FiveControl_Tick(test_tick+=5);
     assert(s->phase==FIVE_GRAVITY && s->submitted==31);
     can_io[1].free_slots=0; FiveControl_Tick(test_tick+=5);

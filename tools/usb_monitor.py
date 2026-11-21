@@ -2,7 +2,7 @@
 
 This CLI is read-only: DTR opens telemetry, no data/control commands sent.
 The GUI also uses Stream.messages for reliable control reply multiplexing.
-Five adjacent 48-byte v1 records reuse the CAN3 decoder and assembler.
+Five adjacent 48-byte v1 records share one bounded snapshot decoder/assembler.
 USB Full Speed 12Mbps; the nominal serial baud does not set USB throughput.
 """
 from __future__ import annotations
@@ -11,10 +11,101 @@ import argparse
 import binascii
 import json
 import math
+import struct
 import time
 from contextlib import contextmanager
+from dm_serial import FOCUS_SAMPLE, LENGTHS
 
-from can3_monitor import Collector, HEADER, RECORD, decode, display
+HEADER = struct.Struct("<2sBBIIHBB")
+RECORD = struct.Struct("<BBBBHHIIfffBBBB")
+MASK = 0xFFFFFFFF
+
+
+def decode(data: bytes) -> dict:
+    if len(data) != 48:
+        raise ValueError("Expected one 48-byte motor snapshot record")
+    magic, version, count, sequence, tick, limit, size, index = HEADER.unpack_from(data)
+    if magic != b"YL" or version != 1 or not 1 <= count <= 6 or size != 32 or index >= count:
+        raise ValueError("Unsupported telemetry header")
+    joint, bus, protocol, flags, command, feedback, rx_tick, rx_count, p, v, t, state, mos, rotor, reserved = RECORD.unpack_from(data, 16)
+    if (not 1 <= joint <= 6 or bus not in (1, 2) or protocol not in (0, 1)
+            or flags not in (0, 1, 3) or reserved or command > 0x7FF or feedback > 0x7FF
+            or not limit):
+        raise ValueError("Invalid joint metadata")
+    received = bool(flags & 1)
+    age = (tick - rx_tick) & MASK if received else None
+    if received:
+        if not all(math.isfinite(x) for x in (p, v, t)) or bool(flags & 2) != (age <= limit):
+            raise ValueError("Invalid values/freshness flag")
+    elif rx_count or rx_tick or not all(math.isnan(x) for x in (p, v, t)):
+        raise ValueError("Invalid unreceived record")
+    return dict(sequence=sequence, tick_ms=tick, count=count, max_age_ms=limit, index=index,
+                joint=joint, bus=bus, protocol=protocol, received=received,
+                fresh=bool(flags & 2), command_id=command, feedback_id=feedback,
+                received_tick_ms=rx_tick, received_count=rx_count, age_ms=age,
+                position_rad=p if received else None, velocity_rad_s=v if received else None,
+                torque_nm=t if received else None, state=state if received else None,
+                mos_c=mos if received else None, rotor_c=rotor if received else None)
+
+
+class Collector:
+    """One bounded assembly; never combine records from different snapshots."""
+    def __init__(self):
+        self.key = None
+        self.parts = {}
+        self.first_at = 0.0
+        self.last_seen = 0.0
+        self.complete = False
+        self.incomplete = self.gaps = self.resyncs = self.duplicates = 0
+
+    def add(self, data, now):
+        record = decode(data)
+        key = tuple(record[k] for k in ("sequence", "tick_ms", "count", "max_age_ms"))
+        if self.key is not None and key != self.key:
+            forward = (key[0] - self.key[0]) & MASK
+            if now - self.last_seen <= 0.5:
+                if not 0 < forward < 0x80000000:
+                    raise ValueError("Old/conflicting snapshot")
+                self.gaps += forward - 1
+            else:
+                self.resyncs += 1
+        if key != self.key:
+            if self.key is not None and not self.complete:
+                self.incomplete += 1
+            self.key, self.parts, self.first_at, self.complete = key, {}, now, False
+        self.last_seen = now
+        index = record["index"]
+        if index in self.parts:
+            if self.parts[index] != record:
+                raise ValueError("Conflicting duplicate")
+            self.duplicates += 1
+            return None
+        if any(r["joint"] == record["joint"] for r in self.parts.values()):
+            raise ValueError("Duplicate joint in snapshot")
+        self.parts[index] = record
+        if len(self.parts) != record["count"]:
+            return None
+        self.complete = True
+        if now - self.first_at > record["max_age_ms"] / 1000:
+            self.incomplete += 1
+            return None
+        return dict(sequence=key[0], tick_ms=key[1], max_age_ms=key[3],
+                    first_received_monotonic=self.first_at, unix_s=time.time(),
+                    joints=sorted(self.parts.values(), key=lambda r: r["joint"]))
+
+
+def display(snapshot, now):
+    if snapshot is None:
+        return "Waiting for a complete five-joint snapshot..."
+    extra_ms = max(0, now - snapshot["first_received_monotonic"]) * 1000
+    rows = []
+    for r in snapshot["joints"]:
+        age = None if r["age_ms"] is None else r["age_ms"] + extra_ms
+        label = "NO_FEEDBACK" if age is None else "FRESH" if age <= snapshot["max_age_ms"] else "STALE"
+        position = "--" if age is None else f"{math.degrees(r['position_rad']):.2f}deg"
+        age_text = "--" if age is None else f"{age:.0f}ms"
+        rows.append(f"J{r['joint']} {position} {label} age={age_text} rx={r['received_count']}")
+    return f"seq={snapshot['sequence']} | " + " | ".join(rows)
 
 
 class Stream:
@@ -30,7 +121,7 @@ class Stream:
 
     def messages(self, data):
         """Multiplex unchanged YL snapshots and CRC-protected RPC responses."""
-        # Carry <=47 bytes; at most 4096 incoming bytes held at once.
+        # Carry <=212 bytes; consume incoming data in bounded 4096-byte chunks.
         for offset in range(0, len(data), 4096):
             self.buffer.extend(data[offset:offset + 4096])
             while self.buffer:
@@ -45,8 +136,9 @@ class Stream:
                 if rpc and len(self.buffer) < 5:
                     break
                 total = self.buffer[4] + 7 if rpc else 48
-                if rpc and not (self.buffer[2] == 1 and
-                    (self.buffer[3], self.buffer[4]) in ((0x92, 8), (0x91, 20), (0x93, 18), (0x94, 36))):
+                if rpc and not (self.buffer[2] == 1
+                    and self.buffer[3] in (0x92, 0x91, 0x93, FOCUS_SAMPLE)
+                    and self.buffer[4] == LENGTHS[self.buffer[3]]):
                     self.malformed += 1
                     del self.buffer[0]
                     continue
@@ -83,6 +175,14 @@ def serial_port(name):
 
 
 def self_test():
+    golden = bytes.fromhex(
+        "594c010501000000fbffffff64002000"
+        "0102000301001100fbffffff01000000"
+        "00004841000a20bb001ce03b001e1f00")
+    r = decode(golden)
+    assert r["position_rad"] == 12.5 and r["fresh"] and r["joint"] == 1
+    assert r["velocity_rad_s"] == -0.002442002296447754
+    assert r["torque_nm"] == 0.006839275360107422
     def group(seq, count=5):
         return b"".join(
             HEADER.pack(b"YL", 1, count, seq, 10, 100, 32, j - 1)
@@ -90,6 +190,30 @@ def self_test():
                           0, 0, math.nan, math.nan, math.nan, 255, 255, 255, 0)
             for j in range(1, count + 1))
 
+    # Preserve the common assembly checks when removing the old FD adapter tool.
+    collector = Collector()
+    first = group(1)[:48]
+    assert collector.add(first, 0) is None
+    assert collector.add(first, .001) is None and collector.duplicates == 1
+    conflict = bytearray(first);conflict[20] = 2
+    try:
+        collector.add(conflict, .002)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Conflicting duplicate accepted")
+    collector.add(group(2)[:48], .01)
+    assert collector.incomplete == 1
+    try:
+        collector.add(first, .02)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Old snapshot accepted")
+    collector.add(group(0)[:48], 1)
+    assert collector.resyncs == 1
+    wrap = Collector();wrap.add(group(MASK)[:48], 0);wrap.add(group(0)[:48], .01)
+    assert wrap.gaps == 0
     payload = group(1) + group(2) + group(4, 6)
     for size in (1, 7, 48, 64, 240, 4096):
         stream, collector, snapshots = Stream(), Collector(), []

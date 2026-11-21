@@ -23,8 +23,13 @@ const FiveMIT_Axis g_five_mit_hw[FIVE_AXES] = {
  * bounded effort. These are commissioning limits, not a mechanism rating.
  * MIT actuator gains stay zero and the whole batch is rejected above max_nm. */
 const FiveMIT_Tracking g_five_mit_tracking[FIVE_AXES] = {
-    {20,1,2}, {30,1.5f,5}, {15,1,1.8f}, {10,.5f,.8f}, {10,.5f,.4f}
+    {20,1,2}, {30,1.5f,5}, {5,.5f,1.8f}, {3,.3f,.8f}, {10,.5f,.4f}
 };
+/* User-requested smoothing candidate: ease active PD in with the same
+ * quintic used by the trajectory. G/dynamics and fault handover are not
+ * filtered/delayed. J3/J4 gains reuse the lower manual-hold baseline;
+ * this is an initial tuning candidate, not a hardware stability result. */
+const float g_five_tracking_ramp_s = .1f;
 /* User-authorized J2 support candidate, 2026-11-20; NOT hardware validated.
  * G2 = G2_CAD + (Yg(qCAD)*delta)_2, using all five measured angles.
  * Effective potential residual [kg, kg*m X/Y/Z] per link; never scale M/c.

@@ -11,7 +11,6 @@
 #include "motor_tuning.h"
 #include "motor_serial.h"
 #include "motor_telemetry.h"
-#include "can3_telemetry.h"
 #include "bsp_usb.h"
 #include "usb_telemetry.h"
 #include "robot_model.h"
@@ -30,7 +29,6 @@
 #include "motor_task.h"
 
 static_assert(sizeof(BSP_CAN_Frame_t::data) == 8, "Classic CAN payload");
-static_assert(sizeof(BSP_CAN_FDFrame_t::data) == 64, "CAN3 FD capacity");
 
 extern "C" int bsp_cpp_headers_check(void)
 {

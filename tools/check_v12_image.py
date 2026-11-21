@@ -104,7 +104,7 @@ def reference_bytes():
 
 
 def support_bytes():
-    """Match the configured support candidate, not just its function names."""
+    """Match support and active smoothing configuration, not just function names."""
     text = (REFS.parent / "five_mit.c").read_text(encoding="utf-8")
     table = re.search(r"g_five_j2_gravity_delta\[FIVE_AXES\]\[4\]\s*=\s*\{(.*?)\};", text, re.S)
     if not table:
@@ -114,7 +114,16 @@ def support_bytes():
     if len(rows) != 5 or any(len(row) != 4 for row in rows):
         raise ValueError("invalid configured J2 gravity residual")
     result = {"g_five_j2_gravity_delta": struct.pack("<20f", *(v for row in rows for v in row))}
-    for name in ("g_five_j3_gravity_scale", "g_five_j3_gravity_cosine_nm"):
+    tracking = re.search(r"g_five_mit_tracking\[FIVE_AXES\]\s*=\s*\{(.*?)\};", text, re.S)
+    if not tracking:
+        raise ValueError("missing configured active tracking profile")
+    gains = [[float(v.strip().rstrip("f")) for v in row.split(",")]
+             for row in re.findall(r"\{([^{}]+)\}", tracking[1])]
+    if len(gains) != 5 or any(len(row) != 3 for row in gains):
+        raise ValueError("invalid configured active tracking profile")
+    result["g_five_mit_tracking"] = struct.pack("<15f", *(v for row in gains for v in row))
+    for name in ("g_five_j3_gravity_scale", "g_five_j3_gravity_cosine_nm",
+                 "g_five_tracking_ramp_s"):
         match = re.search(name+r"\s*=\s*([-+.\deE]+)f?\s*;", text)
         if not match:
             raise ValueError(f"missing configured {name}")

@@ -13,6 +13,8 @@ extern const FiveMIT_Axis g_five_mit_hw[FIVE_AXES];
 typedef struct { float kp, kd, max_nm; } FiveMIT_Tracking;
 /* Active commissioning only; never used by pure G or manual impedance hold. */
 extern const FiveMIT_Tracking g_five_mit_tracking[FIVE_AXES];
+/* Seconds, >=0. Active PD only; 0 disables the entry blend, not supervision. */
+extern const float g_five_tracking_ramp_s;
 #ifdef YLAMP_HOST_FIXTURES
 extern const FiveMIT_Axis g_five_mit_sim[FIVE_AXES];
 #endif
@@ -44,6 +46,8 @@ bool FiveMIT_Sample(const FiveMIT_Plan *plan,double elapsed_s,const FiveMIT_Stat
                     const FiveMIT_Axis profile[5],FiveMIT_Output *out);
 /* Active commissioning only: measured support G + nominal dynamics +
  * software position/velocity feedback using the active tracking profile.
+ * PD builds smoothly from zero over g_five_tracking_ramp_s after plan start;
+ * G/dynamics remain direct. No interpolation of feedback or its source time.
  * MIT gains stay zero; reject the batch before exceeding torque budgets. */
 bool FiveMIT_SampleFeedback(const FiveMIT_Plan *plan,double elapsed_s,
     const FiveMIT_State *state,const float support_gravity_nm[5],FiveMIT_Output *out);

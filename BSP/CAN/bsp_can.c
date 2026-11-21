@@ -18,13 +18,13 @@ typedef struct {
 } CAN_RxEntry;
 
 static CAN_RxEntry rx_entries[CAN_CALLBACK_COUNT];
-static bool initialized[3];
-static bool init_attempted[3];
+static bool initialized[2];
+static bool init_attempted[2];
 /* Explicit task-driven recovery: 0 normal, 1 flush verification, 2 bus sync. */
-static uint8_t recovery[3];
+static uint8_t recovery[2];
 /* Temporary fault capture: remove with IRQ sampling/UART branch once the
  * Bus-Off root cause is fixed and verified. Do not turn this into recovery. */
-static BSP_CAN_Diagnostics_t diagnostics[3];
+static BSP_CAN_Diagnostics_t diagnostics[2];
 #ifdef YLAMP_CAN_CAPTURE_ONLY
 /* Bench-only SWD ring, before ID dispatch. No new bus traffic or filtering.
  * One receive-ISR writer per slot; both CAN IRQs have the same preempt priority.
@@ -63,7 +63,6 @@ static int bus_index(const FDCAN_HandleTypeDef *bus)
 {
     if (bus == &hfdcan1) { return 0; }
     if (bus == &hfdcan2) { return 1; }
-    if (bus == &hfdcan3) { return 2; }
     return -1;
 }
 
@@ -161,10 +160,7 @@ BSP_CAN_Status_t BSP_CAN_Init(FDCAN_HandleTypeDef *bus)
         return BSP_CAN_ERROR;
     }
     if (bus->State != HAL_FDCAN_STATE_READY ||
-        (bus->Init.FrameFormat != FDCAN_FRAME_CLASSIC &&
-         !(bus == &hfdcan3 && bus->Init.FrameFormat == FDCAN_FRAME_FD_BRS &&
-           bus->Init.RxFifo0ElmtSize == FDCAN_DATA_BYTES_64 &&
-           bus->Init.TxElmtSize == FDCAN_DATA_BYTES_64)) ||
+        bus->Init.FrameFormat != FDCAN_FRAME_CLASSIC ||
         bus->Init.Mode != FDCAN_MODE_NORMAL ||
         bus->Init.StdFiltersNbr == 0U ||
         bus->Init.RxFifo0ElmtsNbr == 0U ||
@@ -202,7 +198,7 @@ BSP_CAN_Status_t BSP_CAN_Init(FDCAN_HandleTypeDef *bus)
 }
 
 static BSP_CAN_Status_t submit(FDCAN_HandleTypeDef *bus, int index,
-    uint32_t id, const uint8_t *data, uint32_t length_code, bool fd)
+    uint32_t id, const uint8_t *data, uint32_t length_code)
 {
     if (!initialized[index] || recovery[index] != 0U ||
         bus->State != HAL_FDCAN_STATE_BUSY) {
@@ -232,8 +228,8 @@ static BSP_CAN_Status_t submit(FDCAN_HandleTypeDef *bus, int index,
     header.TxFrameType = FDCAN_DATA_FRAME;
     header.DataLength = length_code;
     header.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    header.BitRateSwitch = fd ? FDCAN_BRS_ON : FDCAN_BRS_OFF;
-    header.FDFormat = fd ? FDCAN_FD_CAN : FDCAN_CLASSIC_CAN;
+    header.BitRateSwitch = FDCAN_BRS_OFF;
+    header.FDFormat = FDCAN_CLASSIC_CAN;
     header.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
     const HAL_StatusTypeDef result =
         HAL_FDCAN_AddMessageToTxFifoQ(bus, &header, data);
@@ -250,29 +246,7 @@ BSP_CAN_Status_t BSP_CAN_Send(FDCAN_HandleTypeDef *bus,
         frame->len > BSP_CAN_MAX_DATA_LENGTH || __get_IPSR() != 0U) {
         return BSP_CAN_INVALID_ARG;
     }
-    return submit(bus, index, frame->id, frame->data, dlc[frame->len], false);
-}
-
-BSP_CAN_Status_t BSP_CAN_SendFD(FDCAN_HandleTypeDef *bus,
-                                const BSP_CAN_FDFrame_t *frame)
-{
-    static const uint8_t lengths[] = {12U, 16U, 20U, 24U, 32U, 48U, 64U};
-    static const uint32_t codes[] = {
-        FDCAN_DLC_BYTES_12, FDCAN_DLC_BYTES_16, FDCAN_DLC_BYTES_20,
-        FDCAN_DLC_BYTES_24, FDCAN_DLC_BYTES_32, FDCAN_DLC_BYTES_48,
-        FDCAN_DLC_BYTES_64
-    };
-    if (bus != &hfdcan3 || frame == NULL || frame->id > BSP_CAN_MAX_STD_ID ||
-        __get_IPSR() != 0U) { return BSP_CAN_INVALID_ARG; }
-    uint32_t code = UINT32_MAX;
-    if (frame->len <= 8U) { code = dlc[frame->len]; }
-    for (unsigned i = 0U; i < sizeof(lengths); ++i) {
-        if (frame->len == lengths[i]) { code = codes[i]; break; }
-    }
-    if (code == UINT32_MAX) { return BSP_CAN_INVALID_ARG; }
-    if (bus->Init.FrameFormat != FDCAN_FRAME_FD_BRS ||
-        bus->Init.TxElmtSize != FDCAN_DATA_BYTES_64) { return BSP_CAN_NOT_READY; }
-    return submit(bus, 2, frame->id, frame->data, code, true);
+    return submit(bus, index, frame->id, frame->data, dlc[frame->len]);
 }
 
 BSP_CAN_Status_t BSP_CAN_RecoverBusOff(FDCAN_HandleTypeDef *bus)

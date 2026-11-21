@@ -18,7 +18,7 @@ int main(void)
         {-88.7282485f, -201.6521075f, 201.6521075f, MOTOR_REFERENCE_MIDPOINT},
         {146.180992f, -35.377224f, 46.564378f, MOTOR_REFERENCE_USER_APPROVED},
         {17.291375f, -86.610664f, 115.456767f, MOTOR_REFERENCE_USER_APPROVED},
-        {55.7024265f, -555.7024265f, -45.7024265f, MOTOR_REFERENCE_USER_APPROVED},
+        {55.7024265f, -235.7024265f, 294.2975735f, MOTOR_REFERENCE_USER_APPROVED},
         {-57.024737f, -22.632856f, 22.632856f, MOTOR_REFERENCE_MIDPOINT}
     };
     for (unsigned i = 0U; i < MOTOR_CAN_JOINT_COUNT; ++i) {
@@ -54,12 +54,14 @@ int main(void)
     assert(isnan(JointCoordinates_Angle(0.0f, INFINITY)));
     assert(isnan(JointCoordinates_Angle(INFINITY, 0.0f)));
     const MotorJointReference_Config_t *j4 = &g_joint_reference_config[3];
-    assert(fabsf(j4->observed_lower_rad-radians(-500.f))<1e-6f);
-    assert(fabsf(j4->observed_upper_rad-radians(10.f))<1e-6f);
-    assert(j4->zero_rad>j4->observed_upper_rad);
-    const float j4_raw=radians(-179.56567327963523f);
-    assert(JointCoordinates_Reference(j4_raw,j4->observed_lower_rad,
-                                     j4->observed_upper_rad)==j4_raw);
+    assert(fabsf(j4->observed_lower_rad-radians(-180.f))<1e-6f);
+    assert(fabsf(j4->observed_upper_rad-radians(350.f))<1e-6f);
+    assert(j4->zero_rad>j4->observed_lower_rad && j4->zero_rad<j4->observed_upper_rad);
+    const float j4_raw[]={radians(-180.f),radians(179.12854f),radians(350.f)};
+    for (unsigned i=0;i<sizeof j4_raw/sizeof j4_raw[0];++i) {
+        assert(JointCoordinates_Reference(j4_raw[i],j4->observed_lower_rad,
+                                         j4->observed_upper_rad)==j4_raw[i]);
+    }
     const MotorJointReference_Config_t *j2 = &g_joint_reference_config[1];
     const float before = JointCoordinates_Reference(3.1414f,
         j2->observed_lower_rad, j2->observed_upper_rad);

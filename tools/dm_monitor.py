@@ -2165,7 +2165,7 @@ def joint_reference_self_test():
         1: (-88.7282485, -201.6521075, 201.6521075),
         2: (146.18099179755507, -35.37722379755507, 46.56437820244493),
         3: (17.291374640739114, -86.61066364073912, 115.45676735926089),
-        4: (55.7024265, -555.7024265, -45.7024265),
+        4: (55.7024265, -235.7024265, 294.2975735),
         5: (-57.024737, -22.632856, 22.632856),
     }
     base = Sample(1, 0., 1_700_000_000., .1, 0., 0., 25, 26, 0, b"", source="USB")
@@ -2206,8 +2206,9 @@ def joint_reference_self_test():
     assert all(JOINT_REFERENCES[j].upper_rad - JOINT_REFERENCES[j].lower_rad > math.tau
                for j in (1, 4))
     j4 = JOINT_REFERENCES[4]
-    assert j4.zero_rad > j4.raw_upper_rad  # Preserved datum, not a new midpoint.
-    for raw in (-500., -179.56567327963523, 10.):
+    assert j4.raw_lower_rad < j4.zero_rad < j4.raw_upper_rad
+    assert not math.isclose(j4.zero_rad, (j4.raw_lower_rad+j4.raw_upper_rad)/2)
+    for raw in (-180., 179.1285411727544, 350.):
         assert math.isclose(j4.angle(math.radians(raw)), math.radians(raw-55.7024265),
                             abs_tol=1e-12)  # No clamp, whole-turn shift or recenter.
     assert all(value is None for value in csv_row(base)[-7:])

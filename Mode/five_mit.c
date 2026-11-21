@@ -7,6 +7,17 @@
 #define RAD (0.01745329251994329577)
 _Static_assert(FIVE_AXES==MOTOR_CAN_JOINT_COUNT,"one MIT command per CAN joint");
 
+/* Zero first/second endpoint derivatives; symmetric near 1 to avoid overshoot.
+ * Reuse for target progress and PD entry, never for measured feedback. */
+static double quintic_progress(double t)
+{
+    if (t<=0) { return 0; }
+    if (t>=1) { return 1; }
+    const double z=t<=.5 ? t : 1-t;
+    const double ramp=z*z*z*(10+z*(-15+6*z));
+    return t<=.5 ? ramp : 1-ramp;
+}
+
 static bool prepare_checked(FiveMIT_Plan *p,const double from[5],const double to[5],double seconds)
 {
     if (!isfinite(seconds) || seconds<=0) {
@@ -62,8 +73,7 @@ bool FiveMIT_Sample(const FiveMIT_Plan *p,double elapsed,const FiveMIT_State *x,
         !isfinite(elapsed) || elapsed<0 || elapsed>p->seconds) { return false; }
     const double t=elapsed/p->seconds, u=1-t;
     /* Use symmetric evaluation near the end; no overshoot at either end. */
-    double z=t<=.5?t:u;
-    double ramp=z*z*z*(10+z*(-15+6*z)), s=t<=.5?ramp:1-ramp;
+    const double s=quintic_progress(t);
     double ds=30*t*t*u*u/p->seconds, dds=60*t*u*(1-2*t)/p->seconds/p->seconds;
     float q[5],acc[5],tau[5];
     FiveMIT_Output next={0};
@@ -100,7 +110,8 @@ bool FiveMIT_Sample(const FiveMIT_Plan *p,double elapsed,const FiveMIT_State *x,
 bool FiveMIT_SampleFeedback(const FiveMIT_Plan *p,double elapsed,const FiveMIT_State *x,
                             const float support_g[5],FiveMIT_Output *out)
 {
-    if (!support_g || !out) { return false; }
+    if (!support_g || !out || !isfinite(g_five_tracking_ramp_s) ||
+        g_five_tracking_ramp_s<0) { return false; }
     FiveMIT_Output next;
     FiveMIT_Axis active[5];memcpy(active,g_five_mit_hw,sizeof active);
     for (unsigned i=0;i<5;++i) { active[i].model_max_nm=g_five_mit_tracking[i].max_nm; }
@@ -110,12 +121,15 @@ bool FiveMIT_SampleFeedback(const FiveMIT_Plan *p,double elapsed,const FiveMIT_S
         q[i]=(float)((x->software_deg[i]+g_five_mit_hw[i].cad_offset_deg)*RAD);
     }
     if (!FiveDynamics_Inverse(q,zero,zero,nominal_g)) { return false; }
+    const float blend=g_five_tracking_ramp_s>0 ?
+        (float)quintic_progress(elapsed/g_five_tracking_ramp_s) : 1.f;
     for (unsigned i=0;i<5;++i) {
         DM_Motor_MIT_Command_t *cmd=&next.motor[i];
         const FiveMIT_Tracking *gain=&g_five_mit_tracking[i];
         const float error=cmd->position_rad-x->raw_rad[i];
-        cmd->torque_ff_nm+=support_g[i]-nominal_g[i]+gain->kp*error+
+        const float feedback=gain->kp*error+
             gain->kd*(cmd->velocity_rad_s-x->velocity_rad_s[i]);
+        cmd->torque_ff_nm+=support_g[i]-nominal_g[i]+blend*feedback;
         /* Keep formal G and actuator-side gains unchanged. */
         cmd->kp=cmd->kd=0;
         if (!isfinite(gain->kp) || gain->kp<0 || !isfinite(gain->kd) || gain->kd<0 ||

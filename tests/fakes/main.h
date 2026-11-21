@@ -122,8 +122,6 @@ typedef struct {
     uint32_t TxEventsNbr, TxBuffersNbr, TxFifoQueueMode, TxElmtSize;
 } FDCAN_InitTypeDef;
 typedef struct {uint32_t IR, IE, TXBRP, CCCR;} FDCAN_GlobalTypeDef;
-extern FDCAN_GlobalTypeDef test_fdcan3_instance;
-#define FDCAN3 (&test_fdcan3_instance)
 #define DISABLE 0U
 typedef struct {
     FDCAN_GlobalTypeDef *Instance;
@@ -146,7 +144,7 @@ typedef struct {
 typedef struct {
     uint32_t TxErrorCnt, RxErrorCnt, RxErrorPassive, ErrorLogging;
 } FDCAN_ErrorCountersTypeDef;
-extern FDCAN_HandleTypeDef hfdcan1, hfdcan2, hfdcan3;
+extern FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 #define HAL_FDCAN_STATE_READY 1U
 #define HAL_FDCAN_STATE_BUSY 2U
 #define FDCAN_FRAME_CLASSIC 0U
