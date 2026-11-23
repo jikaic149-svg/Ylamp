@@ -13,6 +13,27 @@ extern const FiveMIT_Axis g_five_mit_hw[FIVE_AXES];
 typedef struct { float kp, kd, max_nm; } FiveMIT_Tracking;
 /* Active commissioning only; never used by pure G or manual impedance hold. */
 extern const FiveMIT_Tracking g_five_mit_tracking[FIVE_AXES];
+typedef struct { float kp, ki; } FiveMIT_SpeedPI;
+/* Velocity trial axis only: kp [Nm*s/rad], ki [Nm/rad]. Effort ceilings remain
+ * g_five_mit_tracking[].max_nm; zero-travel/held axes keep normal tracking. */
+extern const FiveMIT_SpeedPI g_five_speed_pi[FIVE_AXES];
+typedef struct {
+    float log_amplitude_nm, speed_exponent, hinge_016, hinge_048;
+} FiveMIT_SpeedFriction;
+/* URDF-informed TOTAL friction: log amplitude at .08 rad/s, log speed slope,
+ * and slope increments above .16/.48. Replaces all old base/fast/high terms.
+ * Speed bounds freeze only amplitude, never motion admission or velocity. */
+extern const FiveMIT_SpeedFriction g_five_speed_friction[FIVE_AXES];
+extern const float g_five_speed_friction_range_rad_s[2];
+extern const float g_five_speed_friction_knots_rad_s[2];
+/* J2 log-amplitude coefficients [bend, abs nominal G], both 1/Nm.
+ * PCA centering is already folded into J2 log_amplitude_nm. These nominal
+ * CAD wrench proxies are not measured bearing normal forces. */
+extern const float g_five_speed_friction_j2[2];
+/* Pure finite calculation; smooth reference sign, never measured sign chatter.
+ * At zero reference speed the result is zero. Output unchanged on failure. */
+bool FiveMIT_SpeedFrictionTorque(unsigned axis,float reference_rad_s,
+    float nominal_gravity_nm,float bending_nm,float *torque_nm);
 /* Seconds, >=0. Active PD only; 0 disables the entry blend, not supervision. */
 extern const float g_five_tracking_ramp_s;
 #ifdef YLAMP_HOST_FIXTURES
@@ -20,6 +41,7 @@ extern const FiveMIT_Axis g_five_mit_sim[FIVE_AXES];
 #endif
 typedef struct {
     double start_deg[5], end_deg[5], seconds;
+    double cruise_ramp_s; /* 0: original quintic; >0: smooth velocity ramps + plateau. */
 } FiveMIT_Plan; /* caller-owned; initialize through Prepare only, then read-only */
 typedef struct {
     double software_deg[5]; /* measured reference coordinates; never wrap J4 */
@@ -32,6 +54,13 @@ typedef struct {
 /* Nonperiodic travel/protocol-speed checks, NOT a collision or dynamic proof.
  * A rejected replan invalidates the plan. */
 bool FiveMIT_Prepare(FiveMIT_Plan *plan,const double from[5],const double to[5],double seconds);
+/* Finite velocity trial: ramp seconds >0, total seconds >2*ramp.
+ * Plateau velocity[i] = (to[i]-from[i])*pi/180/(seconds-ramp).
+ * Position is the analytic integral of the same smooth velocity reference.
+ * Speed feedback uses its configured P/I, with position error providing the
+ * speed-error integral. No second integrator; held axes keep normal gains. */
+bool FiveMIT_PrepareCruise(FiveMIT_Plan *plan,const double from[5],const double to[5],
+                           double seconds,double ramp_s);
 typedef struct { double lo[5],hi[5]; bool valid; } FiveMIT_Box;
 /* Initialize once via CheckBox; treat the result as immutable. PrepareInBox
  * performs bounded endpoint and speed checks; neither is a collision check. */
@@ -45,7 +74,9 @@ bool FiveMIT_PrepareInBox(FiveMIT_Plan *p,const FiveMIT_Box *box,const double fr
 bool FiveMIT_Sample(const FiveMIT_Plan *plan,double elapsed_s,const FiveMIT_State *state,
                     const FiveMIT_Axis profile[5],FiveMIT_Output *out);
 /* Active commissioning only: measured support G + nominal dynamics +
- * software position/velocity feedback using the active tracking profile.
+ * software feedback plus local reference-velocity friction on a nonzero-travel
+ * cruise axis: speed PI there, original
+ * position/velocity tracking on ordinary moves and zero-travel held axes.
  * PD builds smoothly from zero over g_five_tracking_ramp_s after plan start;
  * G/dynamics remain direct. No interpolation of feedback or its source time.
  * MIT gains stay zero; reject the batch before exceeding torque budgets. */

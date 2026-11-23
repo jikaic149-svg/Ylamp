@@ -11,6 +11,7 @@
 #include "bsp_rgb.h"
 #include "bsp_uart.h"
 #include "five_control.h"
+#include "five_history.h"
 #include "bmi088_port.h"
 #include "motor_usb.h"
 #include "usb_telemetry.h"
@@ -185,6 +186,9 @@ int main(void)
     /* 用户确认：CAN1/PC14（VCC_OUT0）、CAN2/PC13（VCC_OUT1）电源联动。
      * 两路 EN 同次置高，不改变前面已开启的对外5V/PC15。
      * 上电先只读角度，Task 不因收到反馈就使能，不自动拉回区间外的关节。 */
+    /* External W25Q64: JEDEC/read-only scan before motor power. Absence is
+     * reported by history diagnostics, not an excuse to enable/recover. */
+    FiveHistory_Init();
     if (BSP_POWER_SetMotorPower(true) != HAL_OK) { Error_Handler(); }
     const uint32_t powered_at_ms = HAL_GetTick();
     while (HAL_GetTick() - powered_at_ms < 1000U) {

@@ -9,6 +9,28 @@ extern "C" {
 #define MOTOR_COLD_SUPPORTED 0x434F4C44UL /* Explicit declaration, not a status query. */
 #define MOTOR_J3_READ_VERSION 0x594C4A01UL
 #define MOTOR_J3_READ_SUPPORTED 0x4A335244UL /* Explicit supported legacy acquisition. */
+/* op16 scope0/field252/value0 queries finite velocity-trial support.
+ * field12/scope1..5 stages signed float rad/s for that joint; field14/scope0
+ * stages ramp_ms; field13/scope0=total_ms commits once. Start/held pose is
+ * captured by FiveControl, not stale host targets. Same 2s staging/500ms age;
+ * commit (including rejection), cancel and session loss consume staged data. */
+#define MOTOR_CRUISE_VERSION 0x594C5601UL
+/* op16 scope0/field251/value0 queries persistent manual-idle support (v2).
+ * field15/value DRAG selects healthy G/DRAG, idempotently, never enables/clears.
+ * field7 explicitly selects persistent pure G. KEY toggles drag/impedance;
+ * session release preserves idle selection, or cancels an active task to drag.
+ * This op16 capability is distinct from retired op11 tuning diagnostics. */
+#define MOTOR_DRAG_VERSION 0x594C4402UL
+#define MOTOR_DRAG_REQUEST 0x44524147UL
+/* Read-only op16/value0: scope0/field250=capability; scope0 fields16 flags,
+ * 17 committed sequence,18 errors,19 boot-local successful writes,
+ * 20 saved_mask | restored_mask<<8. Flags: ready1,loaded2,writing4,erasing8,
+ * io_error16,foreign32,no_chip64. scope1..5 fields16 continuous reference rad,
+ * 17 saved reference rad (requires saved bit),18 trigger degrees,
+ * 19 running whole-turn corrections,20 signed turn N,21 single-turn rad [0,2pi).
+ * q_reference = phase + 2*pi*N. Original raw telemetry remains untouched.
+ * These queries never format storage, reset, move, enable or clear faults. */
+#define MOTOR_HISTORY_VERSION 0x594C4801UL
 #ifdef YLAMP_J3_REVERSE_TEST
 /* op16 scope0/field254/value0 queries this optional capability.
  * scope3/field10/value J3RV requests one target-timed trial, never enables. */

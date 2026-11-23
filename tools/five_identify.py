@@ -94,6 +94,7 @@ def load_run(path, *, with_time=False):
     """Audit old logs too; only complete, labelled V1.2 motor data may enter the regression."""
     h = hashlib.sha256()
     meta, status, fast, end, ack, handover = {}, [], [], None, None, None
+    test_gravity = None
     issues, last, updates = [], [None]*5, np.zeros(5, int)
     seen = all_enabled = 0
     with path.open("rb") as src:
@@ -111,6 +112,8 @@ def load_run(path, *, with_time=False):
                 ack = obj.get("action")
             elif stage == "handover":
                 handover = obj
+            elif stage == "test_gravity_handover":
+                test_gravity = obj
             if stage in ("before", "sample"):
                 status.append(obj)
             t = snapshot(obj)
@@ -141,16 +144,23 @@ def load_run(path, *, with_time=False):
         issues.append("external torque / hand or support contact not excluded")
     if not fast or not end or ack not in ("gravity", "status", "move") or ack != meta.get("action"):
         issues.append("not a completed high-rate measurement run")
+    if end and (end.get("malformed", 0) or end.get("incomplete", 0)):
+        issues.append("malformed or incomplete telemetry")
     if not all_enabled:
         issues.append("no fresh, enabled five-axis snapshot")
     if not status or status[0]["stage"] != "before" or len(status) < 3:
         issues.append("insufficient controller observations")
     def healthy(s):
-        return (s["phase"] in ("GRAVITY", "MOTION", "POSITION") and not s["fault"] and not s["limited"]
+        phase_ok = (s["phase"] in ("GRAVITY", "MOTION", "POSITION") or
+                    (s.get("stage") == "before" and s["phase"] == "DRAG"))
+        return (phase_ok and not s["fault"] and not s["limited"]
                 and s["fresh"] == s["enabled"] == s["submitted"] == 31
                 and s["gravity_age_ms"] is not None and 0 <= s["gravity_age_ms"] <= 100)
     if any(not healthy(s) for s in status):
         issues.append("controller not supplying all five axes throughout")
+    if status and status[0]["phase"] == "DRAG" and (
+            not test_gravity or test_gravity["phase"] != "GRAVITY" or not healthy(test_gravity)):
+        issues.append("manual idle was not explicitly handed to pure gravity")
     if ack == "move" and (not handover or not healthy(handover) or handover["phase"] != "GRAVITY"
             or not any(s["phase"] == "MOTION" for s in status) or status[-1]["phase"] != "POSITION"):
         issues.append("trajectory or handover not confirmed")
@@ -163,6 +173,8 @@ def load_run(path, *, with_time=False):
         issues.append("invalid MCU clock span")
         return report, None
     report["unix_interval"] = [status[1]["telemetry"]["unix_s"], status[-1]["telemetry"]["unix_s"]]
+    report["analysis_origin_tick_ms"] = start
+    report["command_components_same_tick"] = meta.get("command_components_same_tick")
     return align_feedback(fast, start, length, report, with_time=with_time)
 
 

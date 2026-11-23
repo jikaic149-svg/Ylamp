@@ -12,6 +12,11 @@ extern "C" {
  * Reflected armature included; no friction, passive damping or contact. */
 bool FiveDynamics_Inverse(const float q[FIVE_AXES], const float v[FIVE_AXES],
                           const float a[FIVE_AXES], float tau[FIVE_AXES]);
+/* Same nominal static G, plus subtree moment perpendicular to each joint axis
+ * [Nm]. These CAD wrench proxies are NOT measured bearing normal forces.
+ * All pointers required; both outputs remain unchanged on failure. */
+bool FiveDynamics_GravityLoad(const float q[FIVE_AXES], float tau[FIVE_AXES],
+                              float bending[FIVE_AXES]);
 /* Static potential residual only: delta rows are effective [kg, kg*m X/Y/Z]
  * per link, not identified physical masses or inertia parameters. No division
  * by mass, dynamics, clipping or hardware. Inputs must be finite; all pointers

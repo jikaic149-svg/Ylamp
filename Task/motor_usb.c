@@ -6,6 +6,7 @@
 #include "yummy_imu.h"
 #include "usb_config.h"
 #include "motor_snapshot.h"
+#include "five_history.h"
 #include <string.h>
 #include <math.h>
 
@@ -23,7 +24,9 @@ static struct {
     uint32_t epoch, last_byte_ms, last_id;
     double target[FIVE_AXES];
     unsigned staged;
-    uint32_t staged_at;
+    uint32_t staged_at, cruise_ramp_ms;
+    unsigned speed_joint;
+    float speed_rad_s;
     YummyIMU_Status_t imu_snapshot;
     uint32_t imu_snapshot_at;
     bool imu_snapshot_valid;
@@ -34,8 +37,9 @@ static struct {
 
 static void end_session(void)
 {
-    if (link.session_valid) { FiveControl_Gravity(); }
+    if (link.session_valid) { FiveControl_Release(); }
     link.session_valid=false; link.staged=0; link.used=0; link.response_length=0;
+    link.cruise_ramp_ms=0;link.speed_joint=0;
     link.focus_mode=0;
     if (link.focus_owns_bmi) {
         (void)JointCalibration_SetIMU(false,HAL_GetTick());
@@ -193,6 +197,35 @@ static void five_request(const uint8_t *r,uint32_t arrived,uint32_t now,uint8_t 
     else if (!scope && !arg && field==254) { rc=BSP_CAN_OK;value=MOTOR_J3_REVERSE_VERSION; }
 #endif
     else if (!scope && !arg && field==253) { rc=BSP_CAN_OK;value=MOTOR_J3_READ_VERSION; }
+    else if (!scope && !arg && field==252) { rc=BSP_CAN_OK;value=MOTOR_CRUISE_VERSION; }
+    else if (!scope && !arg && field==251) { rc=BSP_CAN_OK;value=MOTOR_DRAG_VERSION; }
+    else if (!scope && !arg && field==250) { rc=BSP_CAN_OK;value=MOTOR_HISTORY_VERSION; }
+    else if (!arg && field>=16 && field<=21) {
+        const FiveHistory_Status *history=FiveHistory_StatusNow();
+        if (!scope && field<=20) {
+            rc=BSP_CAN_OK;
+            if (field==16) { value=history->flags; }
+            else if (field==17) { value=history->sequence; }
+            else if (field==18) { value=history->errors; }
+            else if (field==19) { value=history->writes; }
+            else { value=history->saved_mask|((uint32_t)history->restored_mask<<8); }
+        } else if (scope>=1 && scope<=5) {
+            const unsigned i=scope-1;
+            float scalar=NAN;
+            if (field==18) { scalar=history->step_deg[i]; }
+            else if (field==19) { value=history->corrections[i];rc=BSP_CAN_OK; }
+            else if (field==17 && (history->saved_mask&(1U<<i))) { scalar=history->saved_rad[i]; }
+            else if (s->fresh&(1U<<i)) {
+                const float q=s->reference_rad[i];
+                const float turns=floorf(q/6.2831853071795864769f);
+                if (field==16) { scalar=q; }
+                else if (field==20 && isfinite(turns) && fabsf(turns)<2147483000.f) {
+                    value=(uint32_t)(int32_t)turns;rc=BSP_CAN_OK;
+                } else if (field==21) { scalar=q-turns*6.2831853071795864769f; }
+            }
+            if (isfinite(scalar)) { memcpy(&value,&scalar,4);rc=BSP_CAN_OK; }
+        }
+    }
     else if (!scope && !arg && (field<=3 || field==255)) {
         rc=BSP_CAN_OK;
         if (field==255) { value=MOTOR_FIVE_VERSION; }
@@ -203,18 +236,45 @@ static void five_request(const uint8_t *r,uint32_t arrived,uint32_t now,uint8_t 
     } else if (scope>=1 && scope<=5 && !arg && field==4) {
         rc=s->gravity_valid ? BSP_CAN_OK : BSP_CAN_NOT_READY;
         if (rc==BSP_CAN_OK) { memcpy(&value,&s->gravity_nm[scope-1],4); }
-    } else if (now-arrived>500U) { rc=BSP_CAN_NOT_READY; }
+    } else if (now-arrived>500U) {
+        rc=BSP_CAN_NOT_READY;
+        if (!scope && (field==6 || field==13)) {
+            link.staged=0;link.cruise_ramp_ms=0;link.speed_joint=0;
+        }
+    }
     else if (scope>=1 && scope<=5 && field==5) {
         float deg; memcpy(&deg,&arg,sizeof deg);
         if (isfinite(deg)) {
-            if (!link.staged || now-link.staged_at>2000U) { link.staged=0;link.staged_at=now; }
+            if (!link.staged || now-link.staged_at>2000U) {
+                link.staged=0;link.staged_at=now;link.cruise_ramp_ms=0;link.speed_joint=0;
+            }
             link.target[scope-1]=deg; link.staged|=1U<<(scope-1); rc=BSP_CAN_OK;
         }
     } else if (!scope && field==6) {
         rc=(link.staged==FIVE_ALL && now-link.staged_at<=2000U) ? FiveControl_Move(link.target,arg) : BSP_CAN_NOT_READY;
-        link.staged=0;
-    } else if (!scope && !arg && field==7) { FiveControl_Gravity(); link.staged=0;rc=BSP_CAN_OK; }
+        link.staged=0;link.cruise_ramp_ms=0;link.speed_joint=0;
+    } else if (scope>=1 && scope<=5 && field==12) {
+        float velocity;memcpy(&velocity,&arg,sizeof velocity);
+        link.staged=0;link.speed_joint=0;link.cruise_ramp_ms=0;
+        if (isfinite(velocity) && velocity!=0) {
+            link.speed_joint=scope;link.speed_rad_s=velocity;link.staged_at=now;rc=BSP_CAN_OK;
+        }
+    } else if (!scope && field==14) {
+        if (link.speed_joint && now-link.staged_at<=2000U && arg>0 && arg<60000U) {
+            link.cruise_ramp_ms=arg;rc=BSP_CAN_OK;
+        } else { link.cruise_ramp_ms=0; }
+    } else if (!scope && field==13) {
+        rc=(link.speed_joint && now-link.staged_at<=2000U && link.cruise_ramp_ms) ?
+            FiveControl_Speed(link.speed_joint,link.speed_rad_s,arg,link.cruise_ramp_ms) : BSP_CAN_NOT_READY;
+        link.staged=0;link.cruise_ramp_ms=0;link.speed_joint=0;
+    } else if (!scope && !arg && field==7) {
+        FiveControl_Gravity();link.staged=0;link.cruise_ramp_ms=0;link.speed_joint=0;rc=BSP_CAN_OK;
+    }
     else if (!scope && !arg && field==8) { rc=FiveControl_Acknowledge(); }
+    else if (!scope && field==15 && arg==MOTOR_DRAG_REQUEST) {
+        rc=FiveControl_Drag();
+        link.staged=0;link.cruise_ramp_ms=0;link.speed_joint=0;
+    }
     else if (!scope && field==9 && arg==MOTOR_COLD_SUPPORTED) { rc=FiveControl_ColdStart(); }
     else if (scope==3 && field==11 && arg==MOTOR_J3_READ_SUPPORTED) { rc=FiveControl_ReadLegacyJ3(); }
 #ifdef YLAMP_J3_REVERSE_TEST

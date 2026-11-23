@@ -31,12 +31,13 @@ static Vec rigid_accel(Vec alpha, Vec omega, Vec r)
     return add(cross(alpha,r),cross(omega,cross(omega,r)));
 }
 
-bool FiveDynamics_Inverse(const float q[5], const float v[5], const float a[5], float tau[5])
+static bool inverse(const float q[5],const float v[5],const float a[5],
+                    float tau[5],float bending[5])
 {
     if (!q || !v || !a || !tau) { return false; }
     Mat rotation[5];
     Vec force[5], moment[5], omega={0}, alpha={0}, acc={0,-9.81f,0};
-    float result[5];
+    float result[5], bend[5];
     for (int i=0; i<5; ++i) {
         if (!isfinite(q[i]) || !isfinite(v[i]) || !isfinite(a[i])) { return false; }
         const Link *l=&links[i];
@@ -57,6 +58,10 @@ bool FiveDynamics_Inverse(const float q[5], const float v[5], const float a[5], 
     for (int i=4; i>=0; --i) {
         result[i]=-moment[i].y+links[i].armature*a[i];
         if (!isfinite(result[i])) { return false; }
+        if (bending) {
+            bend[i]=hypotf(moment[i].x,moment[i].z);
+            if (!isfinite(bend[i])) { return false; }
+        }
         if (i) {
             const Vec f=rotate(&rotation[i],force[i]);
             force[i-1]=add(force[i-1],f);
@@ -64,7 +69,20 @@ bool FiveDynamics_Inverse(const float q[5], const float v[5], const float a[5], 
         }
     }
     memcpy(tau,result,sizeof result);
+    if (bending) { memcpy(bending,bend,sizeof bend); }
     return true;
+}
+
+bool FiveDynamics_Inverse(const float q[5],const float v[5],const float a[5],float tau[5])
+{
+    return inverse(q,v,a,tau,NULL);
+}
+
+bool FiveDynamics_GravityLoad(const float q[5],float tau[5],float bending[5])
+{
+    const float zero[5]={0};
+    if (!bending) { return false; }
+    return inverse(q,zero,zero,tau,bending);
 }
 
 bool FiveDynamics_GravityResidual(const float q[5],const float delta[5][4],float tau[5])

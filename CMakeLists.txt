@@ -24,14 +24,14 @@ add_library(ylamp_bsp STATIC
     BSP/POWER/bsp_power.c
 )
 target_include_directories(ylamp_bsp PUBLIC
-    BSP/CAN BSP/USB BSP/UART BSP/RGB BSP/KEY BSP/POWER
+    BSP/CAN BSP/USB BSP/UART BSP/RGB BSP/KEY BSP/POWER BSP/OSPI
 )
 target_compile_options(ylamp_bsp PRIVATE -Wall -Wextra -Werror)
-add_library(ylamp_device STATIC Device/DM_Motor/Common/dm_motor.c
+add_library(ylamp_device STATIC Device/DM_Motor/Common/dm_motor.c Device/Storage/w25q64.c
     Device/IMU/BMI088/bmi088.c Device/IMU/BMI088/bmi088_port.c
     Device/IMU/yummyIMU/yummy_imu.c Device/Telemetry/motor_snapshot.c Device/USB/usb_telemetry.c)
 target_include_directories(ylamp_device PUBLIC Device/DM_Motor/Common Device/DM_Motor Device/IMU/BMI088
-    Device/IMU/yummyIMU Device/Telemetry Device/USB)
+    Device/IMU/yummyIMU Device/Telemetry Device/USB Device/Storage)
 target_link_libraries(ylamp_device PUBLIC ylamp_bsp)
 target_compile_options(ylamp_device PRIVATE -Wall -Wextra -Werror)
 
@@ -39,7 +39,7 @@ add_library(ylamp_model STATIC Model/five_workspace.c Model/five_dynamics.c)
 target_include_directories(ylamp_model PUBLIC Model PRIVATE config)
 target_compile_options(ylamp_model PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(ylamp_model PUBLIC m)
-add_library(ylamp_task STATIC Task/five_control.c Task/five_mit_send.c Mode/five_mit.c Mode/five_support.c
+add_library(ylamp_task STATIC Task/five_control.c Task/five_history.c Task/five_mit_send.c Mode/five_mit.c Mode/five_support.c Mode/five_drag.c
     config/five_mit.c config/motor_config.c config/calibration_config.c
     Task/joint_calibration.c Task/motor_usb.c Task/motor_telemetry.c)
 target_include_directories(ylamp_task PUBLIC Task Mode Model config)
@@ -50,6 +50,7 @@ if(YLAMP_J3_REVERSE_TEST)
 endif()
 if(BSP_HOST_TEST)
     enable_testing()
+    target_sources(ylamp_bsp PRIVATE tests/fakes/ospi_absent.c)
     target_compile_definitions(ylamp_task PUBLIC YLAMP_HOST_FIXTURES=1)
     add_executable(bsp_tests tests/test_bsp.c)
     target_link_libraries(bsp_tests PRIVATE ylamp_task)
@@ -58,7 +59,7 @@ if(BSP_HOST_TEST)
     if(YLAMP_J3_REVERSE_TEST)
         add_test(NAME five-j3-reverse COMMAND bsp_tests five-j3-reverse)
     endif()
-    foreach(suite can-startup can-start-failure can-motor-config can-five-axis five-mit five-control five-key five-motion-admission five-smooth-control five-cold five-cold-silent
+    foreach(suite can-startup can-start-failure can-motor-config can-five-axis five-mit five-control five-key five-drag five-motion-admission five-smooth-control five-cold five-cold-silent
                   five-j3-read five-j3-read-timeout five-j3-read-cancel five-j3-read-tx
                   can-diagnostics can-recovery key-boot dm-motor dm-motor-full)
         add_test(NAME ${suite} COMMAND bsp_tests ${suite})
@@ -100,11 +101,20 @@ if(BSP_HOST_TEST)
     target_link_libraries(usb_focus_tests PRIVATE ylamp_task)
     target_compile_options(usb_focus_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
     add_test(NAME usb_focus COMMAND usb_focus_tests)
+    add_executable(history_tests tests/test_five_history.c Task/five_history.c
+        Device/Storage/w25q64.c config/motor_config.c)
+    target_include_directories(history_tests PRIVATE Task Model config
+        Device/Storage Device/DM_Motor/Common Device/DM_Motor BSP/OSPI BSP/CAN tests/fakes)
+    target_compile_definitions(history_tests PRIVATE YLAMP_HOST_FIXTURES=1)
+    target_compile_options(history_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+    target_link_libraries(history_tests PRIVATE m)
+    add_test(NAME five_history COMMAND history_tests)
 else()
     if(NOT EXISTS "${BSP_CUBE_ROOT}/Core/Inc/main.h")
         message(FATAL_ERROR "Set BSP_CUBE_ROOT to the existing H7_BSP-HEAD directory")
     endif()
     target_compile_definitions(ylamp_bsp PUBLIC USE_HAL_DRIVER STM32H723xx)
+    target_sources(ylamp_bsp PRIVATE BSP/OSPI/bsp_ospi.c)
     target_include_directories(ylamp_bsp PUBLIC
         "${BSP_CUBE_ROOT}/Core/Inc"
         "${BSP_CUBE_ROOT}/Drivers/STM32H7xx_HAL_Driver/Inc"
@@ -133,6 +143,7 @@ else()
         "${HAL_DIR}/stm32h7xx_hal_flash.c"
         "${HAL_DIR}/stm32h7xx_hal_flash_ex.c"
         "${HAL_DIR}/stm32h7xx_hal_gpio.c"
+        "${HAL_DIR}/stm32h7xx_hal_ospi.c"
         "${HAL_DIR}/stm32h7xx_hal_pwr.c"
         "${HAL_DIR}/stm32h7xx_hal_pwr_ex.c"
         "${HAL_DIR}/stm32h7xx_hal_pcd.c"
@@ -157,6 +168,9 @@ else()
     # Keep the SDK unchanged, but do not carry unused bus initializers/handles
     # into the image merely because its fdcan.c also supplies CAN1 and CAN2.
     set_source_files_properties("${BSP_CUBE_ROOT}/Core/Src/fdcan.c" PROPERTIES
+        COMPILE_OPTIONS "-ffunction-sections;-fdata-sections")
+    # This application uses polled short OSPI commands, never MDMA/OSPI IRQ.
+    set_source_files_properties("${HAL_DIR}/stm32h7xx_hal_ospi.c" PROPERTIES
         COMPILE_OPTIONS "-ffunction-sections;-fdata-sections")
     file(READ "${BSP_CUBE_ROOT}/STM32H723XG_FLASH.ld" BSP_LINK_SCRIPT)
     if(CMAKE_C_COMPILER_VERSION VERSION_LESS 11)

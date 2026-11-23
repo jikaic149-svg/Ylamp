@@ -4,6 +4,7 @@
 #include "joint_calibration.h"
 #include "motor_telemetry.h"
 #include "yummy_imu.h"
+#include "five_history.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -13,6 +14,10 @@ uint32_t test_ipsr, test_primask, test_tick=100;
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 static uint8_t input[256], output[512];
 static unsigned head, tail, output_size, writes, actuator_calls;
+static unsigned gravity_calls, release_calls;
+static unsigned speed_joint;
+static float speed_value;
+static uint32_t speed_duration, speed_ramp;
 static unsigned sensor_starts, sensor_stops;
 static uint32_t epoch;
 static bool dtr=true, busy;
@@ -22,12 +27,26 @@ static BMI088_Sample_t bmi;
 static uint8_t bmi_flags;
 uint32_t HAL_GetTick(void) { return test_tick; }
 const FiveControl_Status *FiveControl_StatusNow(void) { return &control; }
-void FiveControl_Gravity(void) { ++actuator_calls; }
+const FiveHistory_Status *FiveHistory_StatusNow(void)
+{
+    static const FiveHistory_Status history={.flags=FIVE_HISTORY_READY|FIVE_HISTORY_LOADED,
+        .sequence=7,.writes=3,.saved_mask=31,.restored_mask=5,
+        .saved_rad={0,1,2,3,4},.step_deg={150,150,150,150,150}};
+    return &history;
+}
+void FiveControl_Gravity(void) { ++actuator_calls; ++gravity_calls; }
+void FiveControl_Release(void) { ++actuator_calls; ++release_calls; }
 BSP_CAN_Status_t FiveControl_ColdStart(void) { ++actuator_calls;return BSP_CAN_OK; }
 BSP_CAN_Status_t FiveControl_Acknowledge(void) { ++actuator_calls;return BSP_CAN_OK; }
 BSP_CAN_Status_t FiveControl_ReadLegacyJ3(void) { ++actuator_calls;return BSP_CAN_OK; }
+BSP_CAN_Status_t FiveControl_Drag(void) { ++actuator_calls;return BSP_CAN_OK; }
 BSP_CAN_Status_t FiveControl_Move(const double q[5],uint32_t ms)
 { (void)q;(void)ms;++actuator_calls;return BSP_CAN_OK; }
+BSP_CAN_Status_t FiveControl_Speed(unsigned joint,float speed,uint32_t ms,uint32_t ramp)
+{
+    speed_joint=joint;speed_value=speed;speed_duration=ms;speed_ramp=ramp;
+    ++actuator_calls;return BSP_CAN_OK;
+}
 #ifdef YLAMP_J3_REVERSE_TEST
 BSP_CAN_Status_t FiveControl_ReverseJ3(void) { ++actuator_calls;return BSP_CAN_OK; }
 #endif
@@ -67,6 +86,19 @@ static void crc(uint8_t *p,unsigned n)
 {
     uint16_t value=MotorTelemetry_CRC16(p+2,n-4);
     p[n-2]=(uint8_t)value;p[n-1]=(uint8_t)(value>>8);
+}
+static void set32(uint8_t *p,uint32_t value)
+{ for (unsigned i=0;i<4;++i) { p[i]=(uint8_t)(value>>(8*i)); } }
+static unsigned reliable(unsigned id,unsigned scope,unsigned field,uint32_t value)
+{
+    uint8_t frame[31]={0xA5,0x5A,1,0x11,24,1,2,3,4,5,6,7,8};
+    set32(frame+13,id);set32(frame+17,test_tick);
+    frame[21]=(uint8_t)id;frame[22]=16;frame[23]=(uint8_t)scope;frame[24]=(uint8_t)field;
+    set32(frame+25,value);crc(frame,sizeof frame);
+    memcpy(input,frame,sizeof frame);head=sizeof frame;tail=0;
+    assert(!MotorUSB_Run() && !MotorUSB_Run());
+    assert(output_size==27 && output[3]==0x91 && u32(output+13)==id);
+    return output[18];
 }
 static void command(uint8_t mode)
 {
@@ -166,6 +198,46 @@ int main(void)
     assert(sensor_starts==2 && sensor_stops==2 && !actuator_calls);
     bmi_flags=0;command(1);assert(sensor_starts==3);
     dtr=false;++epoch;assert(MotorUSB_Run() && sensor_stops==3 && !actuator_calls);
+    /* Velocity trials use the reliable session, not observation mode.
+     * Missing/expired stages cannot execute; replay gets cached ACK only. */
+    dtr=true;MotorUSB_Init();
+    uint8_t session[15]={0xA5,0x5A,1,0x12,8,1,2,3,4,5,6,7,8};
+    crc(session,sizeof session);
+    memcpy(input,session,sizeof session);head=sizeof session;tail=0;
+    assert(!MotorUSB_Run() && !MotorUSB_Run() && !actuator_calls);
+    assert(reliable(1,0,252,0)==BSP_CAN_OK && u32(output+21)==MOTOR_CRUISE_VERSION);
+    assert(reliable(2,0,13,5000)==BSP_CAN_NOT_READY && !actuator_calls);
+    const float speed=-.08f;uint32_t speed_bits;memcpy(&speed_bits,&speed,4);
+    assert(reliable(3,4,12,speed_bits)==BSP_CAN_OK);
+    assert(reliable(4,0,14,1000)==BSP_CAN_OK);
+    assert(reliable(5,0,13,5000)==BSP_CAN_OK && actuator_calls==1);
+    assert(speed_joint==4 && speed_value==speed && speed_duration==5000 && speed_ramp==1000);
+    assert(reliable(5,0,13,5000)==BSP_CAN_OK && actuator_calls==1);
+    assert(reliable(6,0,13,5000)==BSP_CAN_NOT_READY && actuator_calls==1);
+    assert(reliable(7,4,12,speed_bits)==BSP_CAN_OK);
+    assert(reliable(8,0,14,1000)==BSP_CAN_OK);
+    test_tick+=2001;
+    assert(reliable(9,0,13,5000)==BSP_CAN_NOT_READY && actuator_calls==1);
+    assert(reliable(10,4,12,speed_bits)==BSP_CAN_OK);
+    assert(reliable(11,0,14,1000)==BSP_CAN_OK);
+    assert(reliable(12,0,7,0)==BSP_CAN_OK && actuator_calls==2);
+    assert(reliable(13,0,13,5000)==BSP_CAN_NOT_READY && actuator_calls==2);
+    assert(reliable(14,0,251,0)==BSP_CAN_OK && u32(output+21)==MOTOR_DRAG_VERSION);
+    assert(reliable(15,0,15,0)==BSP_CAN_INVALID_ARG && actuator_calls==2);
+    assert(reliable(16,1,15,MOTOR_DRAG_REQUEST)==BSP_CAN_INVALID_ARG && actuator_calls==2);
+    assert(reliable(17,0,15,MOTOR_DRAG_REQUEST)==BSP_CAN_OK && actuator_calls==3);
+    assert(reliable(17,0,15,MOTOR_DRAG_REQUEST)==BSP_CAN_OK && actuator_calls==3);
+    assert(reliable(18,0,250,0)==BSP_CAN_OK && u32(output+21)==MOTOR_HISTORY_VERSION);
+    assert(reliable(19,0,16,0)==BSP_CAN_OK &&
+        u32(output+21)==(FIVE_HISTORY_READY|FIVE_HISTORY_LOADED));
+    assert(reliable(20,0,20,0)==BSP_CAN_OK && u32(output+21)==(31U|(5U<<8)));
+    control.fresh=31;control.reference_rad[0]=-.1f;
+    assert(reliable(21,1,20,0)==BSP_CAN_OK && u32(output+21)==0xffffffffU);
+    assert(reliable(22,1,21,0)==BSP_CAN_OK && scalar(output+21)>6.f);
+    assert(reliable(23,1,18,0)==BSP_CAN_OK && scalar(output+21)==150.f);
+    assert(actuator_calls==3); /* History/turn diagnostics are read only. */
+    dtr=false;++epoch;assert(MotorUSB_Run() && actuator_calls==4);
+    assert(gravity_calls==1 && release_calls==1); /* Session exit != pure-G selection. */
     puts("USB unified: five motors/both Pitches/start/pause/warmup/ownership/DTR/CRC/no motor control PASS");
     return 0;
 }

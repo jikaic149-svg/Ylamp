@@ -42,7 +42,7 @@ def reachable(graph, root):
     return seen
 
 
-def check_calls(graph, reverse_test=False):
+def check_calls(graph, reverse_test=False, velocity_loop=False, manual_drag=False):
     # FreeRTOS starts control_task by pointer; check the registration separately.
     required = {
         "Reset_Handler": ("main",),
@@ -62,6 +62,16 @@ def check_calls(graph, reverse_test=False):
     if reverse_test:
         required["MotorUSB_Run"] += ("FiveControl_ReverseJ3",)
         required["FiveControl_Tick"] += ("FiveSupport_ApplyReverseJ3",)
+    if velocity_loop:
+        required["MotorUSB_Run"] += ("FiveControl_Speed",)
+        required["FiveControl_Speed"] = ("FiveMIT_PrepareCruise",)
+        required["FiveMIT_SampleFeedback"] = ("FiveMIT_SpeedFrictionTorque",
+                                             "FiveDynamics_GravityLoad")
+    if manual_drag:
+        required["MotorUSB_Run"] += ("FiveControl_Drag", "FiveControl_Gravity", "FiveControl_Release")
+        required["FiveControl_Drag"] = ("FiveDrag_Enter",)
+        required["FiveControl_Tick"] += ("FiveDrag_Sample", "FiveDrag_Enter")
+        required["FiveDrag_Sample"] = ("FiveMIT_SpeedFrictionTorque", "FiveDynamics_GravityLoad")
     failures = []
     for root, targets in required.items():
         calls = reachable(graph, root)
@@ -103,7 +113,7 @@ def reference_bytes():
     return b"".join(rows)
 
 
-def support_bytes():
+def support_bytes(manual_drag=False):
     """Match support and active smoothing configuration, not just function names."""
     text = (REFS.parent / "five_mit.c").read_text(encoding="utf-8")
     table = re.search(r"g_five_j2_gravity_delta\[FIVE_AXES\]\[4\]\s*=\s*\{(.*?)\};", text, re.S)
@@ -122,16 +132,64 @@ def support_bytes():
     if len(gains) != 5 or any(len(row) != 3 for row in gains):
         raise ValueError("invalid configured active tracking profile")
     result["g_five_mit_tracking"] = struct.pack("<15f", *(v for row in gains for v in row))
+    speed_pi = re.search(r"g_five_speed_pi\[FIVE_AXES\]\s*=\s*\{(.*?)\};", text, re.S)
+    if not speed_pi:
+        raise ValueError("missing configured finite velocity PI gains")
+    speeds = [[float(v.strip().rstrip("f")) for v in row.split(",")]
+              for row in re.findall(r"\{([^{}]+)\}", speed_pi[1])]
+    if len(speeds) != 5 or any(len(row) != 2 for row in speeds):
+        raise ValueError("invalid configured finite velocity PI gains")
+    result["g_five_speed_pi"] = struct.pack("<10f", *(v for row in speeds for v in row))
+    friction = re.search(r"g_five_speed_friction\[FIVE_AXES\]\s*=\s*\{(.*?)\};", text, re.S)
+    if not friction:
+        raise ValueError("missing configured velocity-trial friction overlay")
+    values = [[float(v.strip().rstrip("f")) for v in row.split(",")]
+              for row in re.findall(r"\{([^{}]+)\}", friction[1])]
+    if (len(values) != 5 or any(len(row) != 4 for row in values) or
+            any(not all(map(math.isfinite,row)) for row in values)):
+        raise ValueError("invalid configured velocity-trial friction overlay")
+    result["g_five_speed_friction"] = struct.pack("<20f", *(v for row in values for v in row))
+    for name in ("g_five_speed_friction_range_rad_s",
+                 "g_five_speed_friction_knots_rad_s", "g_five_speed_friction_j2"):
+        match = re.search(name+r"\[2\]\s*=\s*\{([^}]+)\};", text, re.S)
+        if not match:
+            raise ValueError(f"missing configured {name}")
+        row = [float(v.strip().rstrip("f")) for v in match[1].split(",")]
+        if len(row)!=2 or not all(map(math.isfinite,row)):
+            raise ValueError(f"invalid configured {name}")
+        if name!="g_five_speed_friction_j2" and not 0<row[0]<row[1]:
+            raise ValueError(f"invalid amplitude-domain bounds in {name}")
+        result[name] = struct.pack("<2f", *row)
+    lo, hi = struct.unpack("<2f", result["g_five_speed_friction_range_rad_s"])
+    k16, k48 = struct.unpack("<2f", result["g_five_speed_friction_knots_rad_s"])
+    if not lo<k16<k48<hi:
+        raise ValueError("friction shape knots must lie inside its amplitude domain")
     for name in ("g_five_j3_gravity_scale", "g_five_j3_gravity_cosine_nm",
                  "g_five_tracking_ramp_s"):
         match = re.search(name+r"\s*=\s*([-+.\deE]+)f?\s*;", text)
         if not match:
             raise ValueError(f"missing configured {name}")
         result[name] = struct.pack("<f", float(match[1]))
+    if manual_drag:
+        match = re.search(r"g_five_drag\[FIVE_AXES\]\s*=\s*\{(.*?)\};", text, re.S)
+        if not match:
+            raise ValueError("missing configured manual-drag profile")
+        rows = [[float(v.strip().rstrip("f")) for v in row.split(",")]
+                for row in re.findall(r"\{([^{}]+)\}", match[1])]
+        if (len(rows)!=5 or any(len(row)!=5 or not all(map(math.isfinite,row)) or
+                not 0<=row[0]<1 or row[1]<0 or row[2]<=0 or row[3]<0 or row[4]<=0
+                for row in rows)):
+            raise ValueError("invalid manual-drag profile")
+        result["g_five_drag"] = struct.pack("<25f", *(v for row in rows for v in row))
+        for name in ("g_five_drag_filter_s", "g_five_drag_ramp_s"):
+            match = re.search(name+r"\s*=\s*([-+.\deE]+)f?\s*;", text)
+            if not match or not math.isfinite(float(match[1])) or float(match[1])<=0:
+                raise ValueError(f"invalid configured {name}")
+            result[name] = struct.pack("<f", float(match[1]))
     return result
 
 
-def inspect(elf, binary, objdump, objcopy, reverse_test=False):
+def inspect(elf, binary, objdump, objcopy, reverse_test=False, velocity_loop=False, manual_drag=False):
     def dump(*flags):
         return subprocess.check_output([objdump, *flags, elf], encoding="utf-8", errors="replace")
 
@@ -146,14 +204,14 @@ def inspect(elf, binary, objdump, objcopy, reverse_test=False):
         if extracted.read_bytes() != image:
             raise ValueError("BIN differs from ELF load image")
     asm, symbols = dump("-d"), dump("-t")
-    failures = check_calls(call_graph(asm), reverse_test)
+    failures = check_calls(call_graph(asm), reverse_test, velocity_loop, manual_drag)
     if not control_registered(asm, image):
         failures.append("cannot verify control_task is registered with FreeRTOS")
     reset = re.search(r"^([\da-fA-F]+) <Reset_Handler>:$", asm, re.M)
     sp, entry = struct.unpack_from("<II", image)
     if not reset or entry != int(reset[1], 16) | 1 or sp != 0x20020000:
         failures.append("unexpected H723 reset vector / initial stack")
-    for name, expected in {"g_joint_reference_config": reference_bytes(), **support_bytes()}.items():
+    for name, expected in {"g_joint_reference_config": reference_bytes(), **support_bytes(manual_drag)}.items():
         table = re.search(r"^([\da-fA-F]+)\s+g\s+O\s+\.rodata\s+([\da-fA-F]+)\s+"+name+"$", symbols, re.M)
         offset = int(table[1], 16) - FLASH if table else -1
         if not table or int(table[2], 16) != len(expected) or offset < 0 or image[offset:offset+len(expected)] != expected:
@@ -168,9 +226,12 @@ def main():
     p.add_argument("--objdump", default="arm-none-eabi-objdump")
     p.add_argument("--objcopy", default="arm-none-eabi-objcopy")
     p.add_argument("--j3-reverse-test", action="store_true", help="also require the optional test call chains")
+    p.add_argument("--velocity-loop", action="store_true", help="also require native finite velocity-PI call chains")
+    p.add_argument("--manual-drag", action="store_true", help="also require manual-drag call chains and profile")
     args = p.parse_args()
     try:
-        failures, digest = inspect(args.elf, args.bin, args.objdump, args.objcopy, args.j3_reverse_test)
+        failures, digest = inspect(args.elf, args.bin, args.objdump, args.objcopy,
+                                   args.j3_reverse_test, args.velocity_loop, args.manual_drag)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         p.exit(1, f"V1.2 BLOCKED: {exc}\n")
     if failures:

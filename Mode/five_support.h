@@ -16,7 +16,7 @@ extern const float g_five_j3_gravity_scale;
 extern const float g_five_j3_gravity_cosine_nm;
 /* One continuous support formula, before the owner's existing torque budget.
  * qCAD and J3 software angle are radians from the same measured pose.
- * Includes the J2 candidate and the unchanged J3 empirical trim exactly once.
+ * Includes the J2 candidate and the configured J3 empirical trim exactly once.
  * No velocity, PD, enable, clipping or I/O; failure leaves gravity_nm unchanged. */
 bool FiveSupport_GravityModel(const float qCAD[FIVE_AXES],float j3_software_rad,
                              float gravity_nm[FIVE_AXES]);

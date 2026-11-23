@@ -18,17 +18,21 @@ static double quintic_progress(double t)
     return t<=.5 ? ramp : 1-ramp;
 }
 
-static bool prepare_checked(FiveMIT_Plan *p,const double from[5],const double to[5],double seconds)
+static bool prepare_checked(FiveMIT_Plan *p,const double from[5],const double to[5],
+                             double seconds,double ramp)
 {
-    if (!isfinite(seconds) || seconds<=0) {
+    if (!isfinite(seconds) || seconds<=0 || !isfinite(ramp) || ramp<0 ||
+        (ramp>0 && ramp>=seconds*.5)) {
         p->seconds=0; return false;
     }
-    FiveMIT_Plan checked={.seconds=seconds};
+    FiveMIT_Plan checked={.seconds=seconds,.cruise_ramp_s=ramp};
     memcpy(checked.start_deg,from,sizeof checked.start_deg);
     memcpy(checked.end_deg,to,sizeof checked.end_deg);
-    /* Peak speed of the synchronized quintic is (15/8)*|delta|/duration. */
+    /* Ramps each travel v*ramp/2, so the cruise travels v*(total-ramp). */
     for (int i=0;i<5;++i) {
-        if (1.875*RAD*fabs(to[i]-from[i])/seconds>g_motor_can_config[i].vmax) {
+        const double speed=ramp>0 ? RAD*fabs(to[i]-from[i])/(seconds-ramp) :
+                                    1.875*RAD*fabs(to[i]-from[i])/seconds;
+        if (speed>g_motor_can_config[i].vmax) {
             p->seconds=0;return false;
         }
     }
@@ -38,7 +42,14 @@ bool FiveMIT_Prepare(FiveMIT_Plan *p,const double from[5],const double to[5],dou
 {
     if (!p) { return false; }
     if (!FiveWorkspace_Line(from,to)) { p->seconds=0;return false; }
-    return prepare_checked(p,from,to,seconds);
+    return prepare_checked(p,from,to,seconds,0);
+}
+bool FiveMIT_PrepareCruise(FiveMIT_Plan *p,const double from[5],const double to[5],
+                           double seconds,double ramp)
+{
+    if (!p) { return false; }
+    if (!(ramp>0) || !FiveWorkspace_Line(from,to)) { p->seconds=0;return false; }
+    return prepare_checked(p,from,to,seconds,ramp);
 }
 
 /* Validate a per-axis travel box once, not collision clearance. A quintic
@@ -63,18 +74,34 @@ bool FiveMIT_PrepareInBox(FiveMIT_Plan *p,const FiveMIT_Box *box,const double fr
         if (!(from[i]>=box->lo[i] && from[i]<=box->hi[i] &&
               to[i]>=box->lo[i] && to[i]<=box->hi[i])) { return false; }
     }
-    return prepare_checked(p,from,to,seconds);
+    return prepare_checked(p,from,to,seconds,0);
 }
 
 bool FiveMIT_Sample(const FiveMIT_Plan *p,double elapsed,const FiveMIT_State *x,
                     const FiveMIT_Axis profile[5],FiveMIT_Output *out)
 {
     if (!p || !x || !profile || !out || !(p->seconds>0) || !isfinite(p->seconds) ||
-        !isfinite(elapsed) || elapsed<0 || elapsed>p->seconds) { return false; }
+        !isfinite(elapsed) || elapsed<0 || elapsed>p->seconds ||
+        !isfinite(p->cruise_ramp_s) || p->cruise_ramp_s<0 ||
+        (p->cruise_ramp_s>0 && p->cruise_ramp_s>=p->seconds*.5)) { return false; }
     const double t=elapsed/p->seconds, u=1-t;
     /* Use symmetric evaluation near the end; no overshoot at either end. */
-    const double s=quintic_progress(t);
+    double s=quintic_progress(t);
     double ds=30*t*t*u*u/p->seconds, dds=60*t*u*(1-2*t)/p->seconds/p->seconds;
+    if (p->cruise_ramp_s>0) {
+        const double ramp=p->cruise_ramp_s, span=p->seconds-ramp;
+        if (elapsed>=ramp && elapsed<=p->seconds-ramp) {
+            s=(elapsed-.5*ramp)/span;ds=1/span;dds=0;
+        } else {
+            const bool ending=elapsed>ramp;
+            const double z=(ending ? p->seconds-elapsed : elapsed)/ramp, w=1-z;
+            /* Integral of quintic_progress(z); mirror near the final endpoint. */
+            const double distance=ramp/span*z*z*z*z*(2.5+z*(-3+z));
+            s=ending ? 1-distance : distance;
+            ds=quintic_progress(z)/span;
+            dds=(ending ? -1 : 1)*30*z*z*w*w/(ramp*span);
+        }
+    }
     float q[5],acc[5],tau[5];
     FiveMIT_Output next={0};
     for (int i=0;i<5;++i) {
@@ -107,6 +134,38 @@ bool FiveMIT_Sample(const FiveMIT_Plan *p,double elapsed,const FiveMIT_State *x,
     *out=next;return true;
 }
 
+bool FiveMIT_SpeedFrictionTorque(unsigned axis,float reference,float nominal_g,
+                                 float bending,float *out)
+{
+    if (!out || axis>=FIVE_AXES || !isfinite(reference) || !isfinite(nominal_g) ||
+        !isfinite(bending) || bending<0) { return false; }
+    const FiveMIT_SpeedFriction *cfg=&g_five_speed_friction[axis];
+    const float lo=g_five_speed_friction_range_rad_s[0];
+    const float hi=g_five_speed_friction_range_rad_s[1];
+    const float k16=g_five_speed_friction_knots_rad_s[0];
+    const float k48=g_five_speed_friction_knots_rad_s[1];
+    const float smooth=g_five_mit_hw[axis].smooth_rad_s;
+    if (!isfinite(cfg->log_amplitude_nm) ||
+        !isfinite(cfg->speed_exponent) || !isfinite(lo) || !(lo>0) ||
+        !isfinite(hi) || hi<lo || !isfinite(smooth) || !(smooth>0) ||
+        !isfinite(cfg->hinge_016) || !isfinite(cfg->hinge_048) ||
+        !isfinite(k16) || !isfinite(k48) ||
+        !(lo<k16 && k16<k48 && k48<hi)) { return false; }
+    const float speed=fminf(hi,fmaxf(lo,fabsf(reference)));
+    float log_amplitude=cfg->log_amplitude_nm+
+        cfg->speed_exponent*logf(speed/lo)+
+        cfg->hinge_016*fmaxf(0,logf(speed/k16))+
+        cfg->hinge_048*fmaxf(0,logf(speed/k48));
+    if (axis==1) {
+        const float *load=g_five_speed_friction_j2;
+        if (!isfinite(load[0]) || !isfinite(load[1])) { return false; }
+        log_amplitude+=load[0]*bending+load[1]*fabsf(nominal_g);
+    }
+    const float torque=expf(log_amplitude)*tanhf(reference/smooth);
+    if (!isfinite(log_amplitude) || !isfinite(torque)) { return false; }
+    *out=torque;return true;
+}
+
 bool FiveMIT_SampleFeedback(const FiveMIT_Plan *p,double elapsed,const FiveMIT_State *x,
                             const float support_g[5],FiveMIT_Output *out)
 {
@@ -116,23 +175,28 @@ bool FiveMIT_SampleFeedback(const FiveMIT_Plan *p,double elapsed,const FiveMIT_S
     FiveMIT_Axis active[5];memcpy(active,g_five_mit_hw,sizeof active);
     for (unsigned i=0;i<5;++i) { active[i].model_max_nm=g_five_mit_tracking[i].max_nm; }
     if (!FiveMIT_Sample(p,elapsed,x,active,&next)) { return false; }
-    float q[5],nominal_g[5];const float zero[5]={0};
+    float q[5],nominal_g[5],bending[5];
     for (unsigned i=0;i<5;++i) {
         q[i]=(float)((x->software_deg[i]+g_five_mit_hw[i].cad_offset_deg)*RAD);
     }
-    if (!FiveDynamics_Inverse(q,zero,zero,nominal_g)) { return false; }
+    if (!FiveDynamics_GravityLoad(q,nominal_g,bending)) { return false; }
     const float blend=g_five_tracking_ramp_s>0 ?
         (float)quintic_progress(elapsed/g_five_tracking_ramp_s) : 1.f;
     for (unsigned i=0;i<5;++i) {
         DM_Motor_MIT_Command_t *cmd=&next.motor[i];
         const FiveMIT_Tracking *gain=&g_five_mit_tracking[i];
+        const bool speed_axis=p->cruise_ramp_s>0 && p->end_deg[i]!=p->start_deg[i];
+        const float kp=speed_axis ? g_five_speed_pi[i].ki : gain->kp;
+        const float kd=speed_axis ? g_five_speed_pi[i].kp : gain->kd;
+        float friction=0;
+        if (speed_axis && !FiveMIT_SpeedFrictionTorque(i,cmd->velocity_rad_s,
+                nominal_g[i],bending[i],&friction)) { return false; }
         const float error=cmd->position_rad-x->raw_rad[i];
-        const float feedback=gain->kp*error+
-            gain->kd*(cmd->velocity_rad_s-x->velocity_rad_s[i]);
-        cmd->torque_ff_nm+=support_g[i]-nominal_g[i]+blend*feedback;
+        const float feedback=kp*error+kd*(cmd->velocity_rad_s-x->velocity_rad_s[i]);
+        cmd->torque_ff_nm+=support_g[i]-nominal_g[i]+blend*feedback+friction;
         /* Keep formal G and actuator-side gains unchanged. */
         cmd->kp=cmd->kd=0;
-        if (!isfinite(gain->kp) || gain->kp<0 || !isfinite(gain->kd) || gain->kd<0 ||
+        if (!isfinite(kp) || kp<0 || !isfinite(kd) || kd<0 ||
             !isfinite(support_g[i]) || !isfinite(cmd->torque_ff_nm) ||
             fabsf(cmd->torque_ff_nm)>gain->max_nm ||
             DM_Motor_EncodeMIT(&g_motor_can_config[i],cmd,&next.frame[i])!=BSP_CAN_OK) { return false; }
