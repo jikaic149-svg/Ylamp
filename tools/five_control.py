@@ -17,6 +17,7 @@ CONTROL_VERSION = 0x594c3501
 CRUISE_VERSION = 0x594c5601
 DRAG_VERSION = 0x594c4402
 HISTORY_VERSION = 0x594c4801
+IMPEDANCE_TEST_VERSION = 0x594c5402
 
 
 def gravity_output_confirmed(state):
@@ -140,6 +141,26 @@ class Board:
         if self.rpc(251) != DRAG_VERSION:
             raise ValueError("Firmware has no matching manual-drag capability")
         self.rpc(15, value=0x44524147)
+
+    def impedance(self):
+        """Capture raw centers once; repeated entry never recaptures or enables."""
+        if self.rpc(249) != IMPEDANCE_TEST_VERSION:
+            raise ValueError("Firmware has no matching native-impedance test capability")
+        self.rpc(22, value=0x494d4954)
+
+    def impedance_test(self, joint, offset_deg):
+        """One target-timed native cycle; return duration, never retry/enable."""
+        if (joint not in range(1, 6) or not math.isfinite(offset_deg) or not offset_deg):
+            raise ValueError("Invalid native-impedance trial")
+        if self.rpc(249) != IMPEDANCE_TEST_VERSION:
+            raise ValueError("Firmware has no matching native-impedance test capability")
+        return self.rpc(23, scope=joint,
+                        value=struct.unpack("<I", struct.pack("<f", offset_deg))[0])
+
+    def impedance_status(self):
+        """Read current native target and target-side timing within this SESSION."""
+        return dict(test_joint=self.rpc(24), test_started_ms=self.rpc(25),
+                    target_raw_rad=[self.scalar(24, j) for j in range(1, 6)])
 
     def test_gravity(self, state):
         """A measurement explicitly selects pure G; status/connect never does."""

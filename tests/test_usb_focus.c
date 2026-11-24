@@ -14,7 +14,7 @@ uint32_t test_ipsr, test_primask, test_tick=100;
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 static uint8_t input[256], output[512];
 static unsigned head, tail, output_size, writes, actuator_calls;
-static unsigned gravity_calls, release_calls;
+static unsigned gravity_calls, release_calls, impedance_calls, impedance_test_calls;
 static unsigned speed_joint;
 static float speed_value;
 static uint32_t speed_duration, speed_ramp;
@@ -40,6 +40,13 @@ BSP_CAN_Status_t FiveControl_ColdStart(void) { ++actuator_calls;return BSP_CAN_O
 BSP_CAN_Status_t FiveControl_Acknowledge(void) { ++actuator_calls;return BSP_CAN_OK; }
 BSP_CAN_Status_t FiveControl_ReadLegacyJ3(void) { ++actuator_calls;return BSP_CAN_OK; }
 BSP_CAN_Status_t FiveControl_Drag(void) { ++actuator_calls;return BSP_CAN_OK; }
+BSP_CAN_Status_t FiveControl_Impedance(void) { ++actuator_calls;++impedance_calls;return BSP_CAN_OK; }
+BSP_CAN_Status_t FiveControl_ImpedanceTest(unsigned joint,float offset)
+{
+    assert(joint==4 && offset==1.f);
+    control.impedance_test_duration_ms=24000;
+    ++actuator_calls;++impedance_test_calls;return BSP_CAN_OK;
+}
 BSP_CAN_Status_t FiveControl_Move(const double q[5],uint32_t ms)
 { (void)q;(void)ms;++actuator_calls;return BSP_CAN_OK; }
 BSP_CAN_Status_t FiveControl_Speed(unsigned joint,float speed,uint32_t ms,uint32_t ramp)
@@ -236,7 +243,23 @@ int main(void)
     assert(reliable(22,1,21,0)==BSP_CAN_OK && scalar(output+21)>6.f);
     assert(reliable(23,1,18,0)==BSP_CAN_OK && scalar(output+21)==150.f);
     assert(actuator_calls==3); /* History/turn diagnostics are read only. */
-    dtr=false;++epoch;assert(MotorUSB_Run() && actuator_calls==4);
+    assert(reliable(24,0,249,0)==BSP_CAN_OK && u32(output+21)==MOTOR_IMPEDANCE_TEST_VERSION);
+    assert(reliable(25,0,22,0)==BSP_CAN_INVALID_ARG && actuator_calls==3);
+    assert(reliable(26,1,22,MOTOR_IMPEDANCE_REQUEST)==BSP_CAN_INVALID_ARG && actuator_calls==3);
+    assert(reliable(27,0,22,MOTOR_IMPEDANCE_REQUEST)==BSP_CAN_OK && impedance_calls==1);
+    assert(reliable(27,0,22,MOTOR_IMPEDANCE_REQUEST)==BSP_CAN_OK && impedance_calls==1);
+    const float offset=1.f;uint32_t offset_bits;memcpy(&offset_bits,&offset,4);
+    assert(reliable(28,0,23,offset_bits)==BSP_CAN_INVALID_ARG && !impedance_test_calls);
+    assert(reliable(29,4,23,offset_bits)==BSP_CAN_OK && u32(output+21)==24000);
+    assert(reliable(29,4,23,offset_bits)==BSP_CAN_OK && impedance_test_calls==1);
+    control.phase=FIVE_IMPEDANCE;control.impedance_test_joint=4;
+    control.impedance_test_started_ms=1234;control.impedance_target_raw_rad[3]=3.f;
+    assert(reliable(30,0,24,0)==BSP_CAN_OK && u32(output+21)==4);
+    assert(reliable(31,0,25,0)==BSP_CAN_OK && u32(output+21)==1234);
+    assert(reliable(32,4,24,0)==BSP_CAN_OK && scalar(output+21)==3.f);
+    control.phase=FIVE_DRAG;
+    assert(reliable(33,4,24,0)==BSP_CAN_INVALID_ARG && actuator_calls==5);
+    dtr=false;++epoch;assert(MotorUSB_Run() && actuator_calls==6);
     assert(gravity_calls==1 && release_calls==1); /* Session exit != pure-G selection. */
     puts("USB unified: five motors/both Pitches/start/pause/warmup/ownership/DTR/CRC/no motor control PASS");
     return 0;

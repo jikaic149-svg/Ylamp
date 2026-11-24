@@ -1,6 +1,7 @@
 """Offline regression only. No serial port is opened and no capture is marked as measured."""
 import sys
 import struct
+import math
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -9,13 +10,113 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools/urdf_collision"))
-from five_control import Board, CRUISE_VERSION, DRAG_VERSION, gravity_output_confirmed, idle_output_confirmed
+from five_control import Board, CRUISE_VERSION, DRAG_VERSION, IMPEDANCE_TEST_VERSION, gravity_output_confirmed, idle_output_confirmed
 from five_gravity_sweep import angles, baseline_goal
-from five_identify import HW, SCENE, WORKSPACE_CAD, identify, regressors
+from five_identify import HW, REFS, SCENE, WORKSPACE_CAD, identify, regressors
 from check_gravity_capture import pose_diagnostics
 
 
 class FiveAxisTest(unittest.TestCase):
+    def test_remote_impedance_requests_never_use_move_enable_or_ack(self):
+        board = Board(Mock())
+        board.rpc = Mock(side_effect=[IMPEDANCE_TEST_VERSION, 0])
+        board.impedance()
+        self.assertEqual([c.args[0] for c in board.rpc.call_args_list], [249, 22])
+        board.rpc = Mock(side_effect=[IMPEDANCE_TEST_VERSION, 24000])
+        self.assertEqual(board.impedance_test(4, -30), 24000)
+        self.assertEqual([c.args[0] for c in board.rpc.call_args_list], [249, 23])
+        call = board.rpc.call_args_list[-1]
+        self.assertEqual(call.kwargs["scope"], 4)
+        self.assertEqual(struct.unpack("<f", struct.pack("<I", call.kwargs["value"]))[0], -30)
+        for joint, offset in ((0, 1), (6, 1), (1, 0), (1, float("nan"))):
+            board.rpc.reset_mock()
+            with self.assertRaises(ValueError):
+                board.impedance_test(joint, offset)
+            board.rpc.assert_not_called()
+        board.rpc = Mock(return_value=0)
+        with self.assertRaises(ValueError):
+            board.impedance()
+        board.rpc.assert_called_once_with(249)
+
+    def test_impedance_paths_metrics_and_unclipped_g_are_not_physical_claims(self):
+        from five_impedance_test import planned_paths, return_metrics
+        from five_gravity_residual_report import support_gravity
+        center = np.rad2deg(REFS[:, 1:]).mean(axis=1)
+        paths = planned_paths(center, 4, 1)
+        self.assertEqual(len(paths), 16)
+        for a, b in paths:
+            self.assertLessEqual(max(abs(np.asarray(a)-b)), .25+1e-12)
+            np.testing.assert_array_equal(np.delete(a, 3), np.delete(center, 3))
+        edge = center.copy();edge[4] = math.degrees(REFS[4, 2])-1.2
+        with self.assertRaises(ValueError):
+            planned_paths(edge, 5, 1)
+        samples = [[t, k, .5+math.radians(.1 if t<6000 else -.2), 0, .03]
+                   for k, t in enumerate([*range(5500, 6000, 10), *range(11500, 12000, 10)])]
+        report = return_metrics(samples, .5, 0, 1000, 2000)
+        self.assertAlmostEqual(report["return_difference_deg"], .3)
+        self.assertFalse(report["external_release_test"])
+        self.assertFalse(report["position_acceptance_claimed"])
+        q = np.random.default_rng(20261124).uniform(-np.pi, np.pi, (100, 5))
+        simulated_hw = HW.copy()
+        simulated_hw[:, 5] = .001  # Synthetic small ceiling, not a real-board claim.
+        with patch("five_gravity_residual_report.HW", simulated_hw):
+            g = support_gravity(q, clip=False)
+            self.assertTrue(np.any(abs(g)>simulated_hw[:, 5]))
+            np.testing.assert_array_equal(support_gravity(q),
+                                          np.clip(g, -simulated_hw[:, 5], simulated_hw[:, 5]))
+
+    def test_impedance_cli_requires_release_for_motion_before_any_io(self):
+        import subprocess
+        tool = Path(__file__).resolve().parents[1]/"tools/five_impedance_test.py"
+        for flags in (["--execute"], ["--execute", "--released", "--joints", "0"],
+                      ["--hold-only", "--offset-deg", "61"]):
+            run = subprocess.run([sys.executable, "-B", str(tool), "--port", "UNUSED",
+                "--log", "UNUSED_CAPTURE.jsonl", "--firmware", "UNUSED.bin", *flags],
+                capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("error:", run.stderr)
+
+    def test_impedance_preflight_drains_old_observations_without_commands(self):
+        from five_impedance_test import drain_observation
+        board = Mock(spec=Board)
+        board.port = Mock(in_waiting=8192)
+        board.pump.side_effect = lambda: setattr(board.port, "in_waiting", 0)
+        drain_observation(board)
+        board.pump.assert_called_once()
+        board.rpc.assert_not_called()
+        board.port.in_waiting = 8192
+        board.pump.side_effect = None
+        with patch("five_impedance_test.time.monotonic", side_effect=[0., 1.]):
+            with self.assertRaisesRegex(TimeoutError, "no motion"):
+                drain_observation(board)
+        board.rpc.assert_not_called()
+
+    def test_large_native_returns_report_overshoot_settling_and_both_error_bands(self):
+        from five_impedance_test import return_metrics, planned_paths
+        times = np.arange(0, 24000, 10)
+        error = np.interp(times,
+            [0, 4000, 5990, 6000, 6500, 7000, 8000, 11990,
+             12000, 16000, 17990, 18000, 18500, 19000, 20000, 23990],
+            [0, 30, 30, 30, -3, 1.5, .4, .4,
+             .4, -30, -30, -30, 2.5, -1.5, -.3, -.3])
+        samples = np.column_stack((times, np.arange(len(times)),
+                                   .5+np.deg2rad(error), np.zeros(len(times)),
+                                   np.full(len(times), .2)))
+        result = return_metrics(samples, .5, 0, 4000, 2000, 30)
+        a, b = result["after_plus_target"], result["after_minus_target"]
+        self.assertAlmostEqual(a["peak_return_overshoot_deg"], 3)
+        self.assertAlmostEqual(b["peak_return_overshoot_deg"], 2.5)
+        self.assertAlmostEqual(result["return_difference_deg"], .7)
+        for side in (a, b):
+            self.assertTrue(side["return_coverage_sufficient_for_settling"])
+            self.assertTrue(side["steady_p95_within_1_deg"])
+            self.assertLess(side["settling_time_s_by_band_deg"]["2"],
+                            side["settling_time_s_by_band_deg"]["1"])
+        center = np.rad2deg(REFS[:, 1:]).mean(axis=1)
+        self.assertTrue(planned_paths(center, 4, 45))
+        with self.assertRaises(ValueError):
+            planned_paths(center, 5, 30)
+
     def test_position_partial_inertia_recovers_truth_and_rejects_confounding(self):
         from five_friction_global import balanced
         from five_inertia_separate import partial_inertia, position_design

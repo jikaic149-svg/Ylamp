@@ -19,6 +19,9 @@ typedef struct {
     bool gravity_valid;
     DM_Motor_Feedback_t feedback[FIVE_AXES];
     float reference_rad[FIVE_AXES], gravity_nm[FIVE_AXES]; /* G support: J2 candidate + existing J3 trim. */
+    float impedance_target_raw_rad[FIVE_AXES];
+    uint32_t impedance_test_started_ms, impedance_test_duration_ms;
+    uint8_t impedance_test_joint;
 } FiveControl_Status;
 
 /* Sole motor owner, ordinary app task. All setters are explicit, never from USB ISR. */
@@ -33,6 +36,10 @@ BSP_CAN_Status_t FiveControl_Move(const double target_deg[FIVE_AXES],uint32_t du
 BSP_CAN_Status_t FiveControl_Speed(unsigned joint,float velocity_rad_s,
                                   uint32_t duration_ms,uint32_t ramp_ms);
 BSP_CAN_Status_t FiveControl_Drag(void); /* Select healthy manual idle; idempotent, no enable. */
+/* Explicit remote native hold, healthy DRAG/G only; idempotent without
+ * recapturing an existing center. Never cold-start/clear faults/enable. */
+BSP_CAN_Status_t FiveControl_Impedance(void);
+BSP_CAN_Status_t FiveControl_ImpedanceTest(unsigned joint,float offset_deg);
 void FiveControl_Gravity(void); /* Explicit pure-G comparison; cancel without enable/disable. */
 /* End external task ownership: cancel motion/hold into manual idle; preserve
  * existing DRAG or explicitly selected pure G. Never clear faults or enable. */

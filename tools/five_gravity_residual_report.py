@@ -131,8 +131,12 @@ def gravity_transform():
     return transform
 
 
-def support_gravity(q):
-    """Current configured support, not a claim about a capture's flashed image."""
+def support_gravity(q, *, clip=True):
+    """Current configured support; clip=False exposes raw planning demand.
+
+    Not a claim about a capture's flashed image. The default preserves the
+    historical bounded-support analysis, never use it to prove budget margin.
+    """
     basis = gravity_basis(q)
     result = basis @ nominal_parameters()
     config = (ROOT/"config/five_mit.c").read_text(encoding="utf-8")
@@ -148,7 +152,7 @@ def support_gravity(q):
         return float(re.search(name+r"\s*=\s*([-+.\deE]+)f?\s*;", config)[1])
     result[:, 2] *= scalar("g_five_j3_gravity_scale")
     result[:, 2] += scalar("g_five_j3_gravity_cosine_nm")*np.cos(q[:, 2]-math.radians(HW[2, 6]))
-    return np.clip(result, -HW[:, 5], HW[:, 5])
+    return np.clip(result, -HW[:, 5], HW[:, 5]) if clip else result
 
 
 def prepare(data, transform, max_dynamic_nm=.03):

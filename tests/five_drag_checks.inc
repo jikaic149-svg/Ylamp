@@ -106,7 +106,8 @@ static void test_drag_mode(void)
     assert(!FiveDrag_Sample(&mode,&x,g,now+2,out,&limited));
     assert(!memcmp(&saved,&mode,sizeof mode) && !memcmp(out,sentinel,sizeof out) && limited==99);
     x.velocity_rad_s[3]=0;
-    float invalid_g[5];memcpy(invalid_g,g,sizeof g);invalid_g[1]=3.1f;
+    float invalid_g[5];memcpy(invalid_g,g,sizeof g);
+    invalid_g[1]=g_five_mit_hw[1].model_max_nm+.1f;
     assert(!FiveDrag_Sample(&mode,&x,invalid_g,now+2,out,&limited));
     assert(!memcmp(&saved,&mode,sizeof mode) && !memcmp(out,sentinel,sizeof out));
     /* Numerical stress only, not a claim that such speed is physically allowed. */

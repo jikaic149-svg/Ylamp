@@ -200,6 +200,13 @@ static void five_request(const uint8_t *r,uint32_t arrived,uint32_t now,uint8_t 
     else if (!scope && !arg && field==252) { rc=BSP_CAN_OK;value=MOTOR_CRUISE_VERSION; }
     else if (!scope && !arg && field==251) { rc=BSP_CAN_OK;value=MOTOR_DRAG_VERSION; }
     else if (!scope && !arg && field==250) { rc=BSP_CAN_OK;value=MOTOR_HISTORY_VERSION; }
+    else if (!scope && !arg && field==249) { rc=BSP_CAN_OK;value=MOTOR_IMPEDANCE_TEST_VERSION; }
+    else if (!arg && !scope && (field==24 || field==25)) {
+        rc=BSP_CAN_OK;
+        value=field==24 ? s->impedance_test_joint : s->impedance_test_started_ms;
+    } else if (!arg && scope>=1 && scope<=5 && field==24 && s->phase==FIVE_IMPEDANCE) {
+        rc=BSP_CAN_OK;memcpy(&value,&s->impedance_target_raw_rad[scope-1],4);
+    }
     else if (!arg && field>=16 && field<=21) {
         const FiveHistory_Status *history=FiveHistory_StatusNow();
         if (!scope && field<=20) {
@@ -271,6 +278,15 @@ static void five_request(const uint8_t *r,uint32_t arrived,uint32_t now,uint8_t 
         FiveControl_Gravity();link.staged=0;link.cruise_ramp_ms=0;link.speed_joint=0;rc=BSP_CAN_OK;
     }
     else if (!scope && !arg && field==8) { rc=FiveControl_Acknowledge(); }
+    else if (!scope && field==22 && arg==MOTOR_IMPEDANCE_REQUEST) {
+        rc=FiveControl_Impedance();
+        link.staged=0;link.cruise_ramp_ms=0;link.speed_joint=0;
+    } else if (scope>=1 && scope<=5 && field==23) {
+        float offset;memcpy(&offset,&arg,4);
+        rc=FiveControl_ImpedanceTest(scope,offset);
+        if (rc==BSP_CAN_OK) { value=s->impedance_test_duration_ms; }
+        link.staged=0;link.cruise_ramp_ms=0;link.speed_joint=0;
+    }
     else if (!scope && field==15 && arg==MOTOR_DRAG_REQUEST) {
         rc=FiveControl_Drag();
         link.staged=0;link.cruise_ramp_ms=0;link.speed_joint=0;

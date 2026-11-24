@@ -70,9 +70,169 @@ static void test_gravity_formula(void)
     assert(!FiveSupport_GravityModel(q,0,out) && !memcmp(out,saved,sizeof saved));
 }
 
+static void test_native_impedance(void)
+{
+    const FiveSupport_Gains expected[5]={
+        {84.84f,3.1248f},{63.84f,5},{15.75f,1.6054f},{16.66f,.6969f},{16.66f,.4207f}
+    };
+    const FiveSupport_Gains previous_gains[5]={
+        {84.84f,4.464f},{63.84f,5},{15.75f,1.396f},{16.66f,.606f},{16.66f,.601f}
+    };
+    const float damping_ratio[5]={.7f,1,1.15f,1.15f,.7f};
+    for (unsigned i=0;i<5;++i) {
+        assert(g_five_support_gains[i].kp==expected[i].kp &&
+               g_five_support_gains[i].kd==expected[i].kd);
+        assert(expected[i].kp==previous_gains[i].kp &&
+               fabsf(expected[i].kd/previous_gains[i].kd-damping_ratio[i])<1e-6f);
+    }
+    const float g_caps[5]={.6f,4.5f,2.7f,1.2f,.6f};
+    const float key_caps[5]={1.5f,4.5f,2.7f,1.2f,.6f};
+    const float pd_caps[5]={1.f,1.f,.4f,.3f,.25f};
+    for (unsigned i=0;i<5;++i) {
+        assert(g_five_mit_hw[i].model_max_nm==g_caps[i]);
+        assert(g_five_impedance_max_nm[i]==key_caps[i] &&
+               key_caps[i]>=g_caps[i] && key_caps[i]<g_five_mit_tracking[i].max_nm);
+        assert(g_five_impedance_pd_max_nm[i]==pd_caps[i] && pd_caps[i]<key_caps[i]);
+    }
+    FiveMIT_State x={0};
+    FiveSupport_State mode={0};
+    const float g[5]={0,.4f,.2f,.05f,.03f};
+    for (unsigned i=0;i<5;++i) {
+        x.raw_rad[i]=i==1 ? -3.9f : i==3 ? 6.05f : 1.f+.1f*i;
+        x.software_deg[i]=120.+i; /* Deliberately not the drive's raw basis. */
+    }
+    assert(FiveSupport_EnterImpedance(&mode,&x) && mode.impedance);
+    float saved_raw[5];memcpy(saved_raw,x.raw_rad,sizeof saved_raw);
+    for (unsigned i=0;i<5;++i) {
+        x.raw_rad[i]+=.002f;x.velocity_rad_s[i]=.01f;
+        x.software_deg[i]+=360.; /* A history/CAD change cannot move the raw anchor. */
+    }
+    DM_Motor_MIT_Command_t command[5],saved[5];
+    unsigned limited=99;
+    /* Between the old and relaxed G ceilings: valid support, not a second G
+     * multiplier, automatic recovery or a change to the captured raw center. */
+    const float expanded_g[5]={.45f,3.5f,2.f,.9f,.45f};
+    assert(FiveSupport_Sample(&mode,&x,expanded_g,command,&limited) && !limited);
+    for (unsigned i=0;i<5;++i) {
+        assert(command[i].torque_ff_nm==expanded_g[i] &&
+               command[i].position_rad==saved_raw[i]);
+    }
+    assert(FiveSupport_Sample(&mode,&x,g,command,&limited) && !limited);
+    for (unsigned i=0;i<5;++i) {
+        assert(command[i].position_rad==saved_raw[i] && command[i].velocity_rad_s==0);
+        assert(command[i].kp==g_five_support_gains[i].kp &&
+               command[i].kd==g_five_support_gains[i].kd);
+        assert(command[i].torque_ff_nm==g[i]); /* No software spring/damping/F twice. */
+        BSP_CAN_Frame_t frame;
+        assert(DM_Motor_EncodeMIT(&g_motor_can_config[i],&command[i],&frame)==BSP_CAN_OK);
+        assert(((frame.data[3]&15U)<<8 | frame.data[4])>0);
+        assert((frame.data[5]<<4 | frame.data[6]>>4)>0);
+        if (i>=3) {
+            /* .13 Nm sliding-F proxy ONLY, not a measured stiction bound or
+             * hardware return acceptance. Keep its encoded wrist span <1 deg. */
+            const float wire_kp=((frame.data[3]&15U)<<8 | frame.data[4])*500.f/4095.f;
+            assert(2.f*.13f/wire_kp<.0174532925199433f);
+        }
+    }
+    /* Both directions keep the SAME captured center and G. Compare only the
+     * unchanged unsaturated spring slope at zero velocity, not the lower cap. */
+    for (int sign=-1;sign<=1;sign+=2) {
+        for (unsigned i=0;i<5;++i) {
+            x.raw_rad[i]=saved_raw[i]+sign*.001f;
+            x.velocity_rad_s[i]=0;
+        }
+        assert(FiveSupport_Sample(&mode,&x,g,command,&limited) && !limited);
+        for (unsigned i=0;i<5;++i) {
+            const float error=saved_raw[i]-x.raw_rad[i];
+            const float restoring=command[i].kp*error;
+            assert(restoring*sign<0 &&
+                   fabsf(restoring/(previous_gains[i].kp*error)-1.f)<1e-6f);
+            assert(command[i].position_rad==saved_raw[i] &&
+                   command[i].torque_ff_nm==g[i] && command[i].kd==expected[i].kd);
+        }
+    }
+    for (int sign=-1;sign<=1;sign+=2) {
+        x.raw_rad[0]=saved_raw[0]+sign*(float)(2*.0174532925199433);
+        x.velocity_rad_s[0]=0;
+        assert(FiveSupport_Sample(&mode,&x,g,command,&limited) && limited==1);
+        const float restoring=command[0].kp*(command[0].position_rad-x.raw_rad[0]);
+        assert(command[0].kp<g_five_support_gains[0].kp &&
+               restoring*sign<0 &&
+               fabsf(fabsf(restoring)-pd_caps[0])<2e-6f &&
+               fabsf(restoring)>g_five_mit_hw[0].model_max_nm);
+    }
+    for (unsigned i=0;i<5;++i) {
+        x.raw_rad[i]=saved_raw[i]+1.f;x.velocity_rad_s[i]=1;
+    }
+    assert(FiveSupport_Sample(&mode,&x,g,command,&limited) && limited==31);
+    for (unsigned i=0;i<5;++i) {
+        const double predicted=command[i].torque_ff_nm+
+            command[i].kp*((double)command[i].position_rad-x.raw_rad[i])-
+            command[i].kd*x.velocity_rad_s[i];
+        assert(fabs(predicted)<=g_five_impedance_max_nm[i]+1e-6);
+        assert(fabs(predicted-g[i])<=pd_caps[i]+1e-6);
+        assert(command[i].position_rad==saved_raw[i] && command[i].torque_ff_nm==g[i]);
+        assert(command[i].kp>0 && command[i].kp<g_five_support_gains[i].kp);
+        assert(fabsf(command[i].kp/g_five_support_gains[i].kp-
+                     command[i].kd/g_five_support_gains[i].kd)<1e-6f);
+    }
+    /* G near its ceiling still uses the smaller TOTAL room, never reduces G. */
+    assert(FiveSupport_Sample(&mode,&x,expanded_g,command,&limited) && limited==31);
+    for (unsigned i=0;i<5;++i) {
+        const double pd=command[i].kp*((double)command[i].position_rad-x.raw_rad[i])-
+            command[i].kd*x.velocity_rad_s[i];
+        const float room=fminf(pd_caps[i],key_caps[i]-fabsf(expanded_g[i]));
+        assert(fabs(fabs(pd)-room)<2e-6 && command[i].torque_ff_nm==expanded_g[i]);
+    }
+    /* Synthetic direction-residual fixture, NOT an identified stiction bound.
+     * Both signs retain the original equilibrium slope inside the PD ceiling. */
+    const float residual[5]={.75f,.65f,.13f,.13f,.13f};
+    for (int sign=-1;sign<=1;sign+=2) {
+        for (unsigned i=0;i<5;++i) {
+            const float error=residual[i]/expected[i].kp;
+            assert(error<.0174532925199433f && residual[i]<pd_caps[i]);
+            x.raw_rad[i]=saved_raw[i]+sign*error;x.velocity_rad_s[i]=0;
+        }
+        assert(FiveSupport_Sample(&mode,&x,g,command,&limited) && !limited);
+        for (unsigned i=0;i<5;++i) {
+            const float pd=command[i].kp*(command[i].position_rad-x.raw_rad[i]);
+            assert(fabsf(pd+sign*residual[i])<2e-5f &&
+                   command[i].position_rad==saved_raw[i] && command[i].torque_ff_nm==g[i]);
+        }
+    }
+    memcpy(saved,command,sizeof saved);
+    limited=99;x.raw_rad[4]=NAN;
+    assert(!FiveSupport_Sample(&mode,&x,g,command,&limited) &&
+           !memcmp(command,saved,sizeof saved) && limited==99);
+    FiveSupport_State previous;memcpy(&previous,&mode,sizeof previous);
+    assert(!FiveSupport_EnterImpedance(&mode,&x) && !memcmp(&mode,&previous,sizeof mode));
+    x.raw_rad[4]=g_motor_can_config[4].pmax+1;
+    assert(!FiveSupport_EnterImpedance(&mode,&x));
+    assert(!FiveSupport_Sample(&mode,&x,g,command,&limited) && !memcmp(command,saved,sizeof saved));
+    x.raw_rad[4]=saved_raw[4];
+    float invalid_g[5];memcpy(invalid_g,g,sizeof g);invalid_g[4]=1;
+    assert(!FiveSupport_Sample(&mode,&x,invalid_g,command,&limited) &&
+           !memcmp(command,saved,sizeof saved));
+    memcpy(invalid_g,g,sizeof g);invalid_g[0]=g_caps[0]+.1f;
+    assert(!FiveSupport_Sample(&mode,&x,invalid_g,command,&limited) &&
+           !memcmp(command,saved,sizeof saved)); /* KEY budget cannot widen G. */
+    FiveSupport_Gravity(&mode);
+    assert(FiveSupport_Sample(&mode,&x,g,command,&limited) && !limited);
+    for (unsigned i=0;i<5;++i) {
+        assert(command[i].position_rad==0 && command[i].velocity_rad_s==0 &&
+               command[i].kp==0 && command[i].kd==0 && command[i].torque_ff_nm==g[i]);
+    }
+    assert(!FiveSupport_Sample(NULL,&x,g,command,&limited));
+    assert(!FiveSupport_Sample(&mode,NULL,g,command,&limited));
+    assert(!FiveSupport_Sample(&mode,&x,NULL,command,&limited));
+    assert(!FiveSupport_Sample(&mode,&x,g,NULL,&limited));
+    assert(!FiveSupport_Sample(&mode,&x,g,command,NULL));
+}
+
 static void test_five_mit(void)
 {
     test_gravity_formula();
+    test_native_impedance();
     DM_Motor_t *motors[5];five_setup(motors);
     const float q[5]={.1f,.2f,-.7f,1.4f,-.1f}, v[5]={.5f,-.3f,.2f,1,-.4f};
     const float a[5]={-1.4f,3,.7f,.2f,4}, gold[5]={-.04815288f,.53445572f,-.39507084f,.01959310f,-.03791413f};
@@ -461,10 +621,10 @@ static void test_smooth_control(void)
     assert(g_five_mit_tracking[2].kp==5 && g_five_mit_tracking[2].kd==.5f);
     assert(g_five_mit_tracking[3].kp==3 && g_five_mit_tracking[3].kd==.3f);
     const float doubled_active_caps[5]={4,10,3.6f,1.6f,.8f};
-    const float unchanged_support_caps[5]={.4f,3,1.8f,.8f,.4f};
+    const float relaxed_support_caps[5]={.6f,4.5f,2.7f,1.2f,.6f};
     for (unsigned i=0;i<5;++i) {
         assert(g_five_mit_tracking[i].max_nm==doubled_active_caps[i]);
-        assert(g_five_mit_hw[i].model_max_nm==unchanged_support_caps[i]);
+        assert(g_five_mit_hw[i].model_max_nm==relaxed_support_caps[i]);
     }
     assert(g_five_tracking_ramp_s==.1f);
     DM_Motor_t *motors[5];five_setup(motors);
@@ -656,22 +816,24 @@ static void test_key_modes(void)
     for (unsigned i=1;i<=5;++i) { assert(motor_enable_calls[i]==1 && !motor_disable_calls[i]); }
     (void)key_level(false,1,raw);
     assert(key_level(true,1,raw)==BSP_CAN_OK);
-    double anchor[5];
+    float anchor[5];
     for (unsigned i=0;i<5;++i) {
-        anchor[i]=(s->reference_rad[i]-g_joint_reference_config[i].zero_rad)/.01745329251994329577;
+        anchor[i]=s->feedback[i].position_rad;
         raw[i]+=.04f;
         plant_sample_at_speed(i,1,raw[i],0x840);
     }
     FiveControl_Tick(test_tick+=5);
     assert(s->phase==FIVE_IMPEDANCE && !s->fault && s->submitted==31);
     for (unsigned i=0;i<5;++i) {
-        const double angle=(s->reference_rad[i]-g_joint_reference_config[i].zero_rad)/.01745329251994329577;
         const FiveSupport_Gains *gain=&g_five_support_gains[i];
-        const double pd=gain->kp*(anchor[i]-angle)*.01745329251994329577-
+        const double pd=gain->kp*((double)anchor[i]-s->feedback[i].position_rad)-
             gain->kd*s->feedback[i].velocity_rad_s;
-        const float room=g_five_mit_hw[i].model_max_nm-fabsf(s->gravity_nm[i]);
+        const float room=fminf(g_five_impedance_pd_max_nm[i],
+                              g_five_impedance_max_nm[i]-fabsf(s->gravity_nm[i]));
+        const float scale=fabs(pd)>room ? (float)(room/fabs(pd)) : 1.f;
         const DM_Motor_MIT_Command_t cmd={
-            .torque_ff_nm=s->gravity_nm[i]+fmaxf(-room,fminf(room,(float)pd))};
+            .position_rad=anchor[i],.kp=gain->kp*scale,.kd=gain->kd*scale,
+            .torque_ff_nm=s->gravity_nm[i]};
         BSP_CAN_Frame_t expected;
         assert(DM_Motor_EncodeMIT(&g_motor_can_config[i],&cmd,&expected)==BSP_CAN_OK);
         assert(!memcmp(motor_last_mit[i+1],expected.data,8));
@@ -687,14 +849,15 @@ static void test_key_modes(void)
     FiveMIT_State at={0}; FiveSupport_State mode={0};
     for (unsigned i=0;i<5;++i) {
         at.software_deg[i]=(s->reference_rad[i]-g_joint_reference_config[i].zero_rad)/.01745329251994329577;
+        at.raw_rad[i]=s->feedback[i].position_rad;
         at.velocity_rad_s[i]=s->feedback[i].velocity_rad_s;
     }
-    float torque[5];assert(FiveSupport_EnterImpedance(&mode,&at));
-    assert(FiveSupport_Sample(&mode,&at,s->gravity_nm,torque));
+    DM_Motor_MIT_Command_t command[5];unsigned limited;
+    assert(FiveSupport_EnterImpedance(&mode,&at));
+    assert(FiveSupport_Sample(&mode,&at,s->gravity_nm,command,&limited));
     for (unsigned i=0;i<5;++i) {
-        const DM_Motor_MIT_Command_t cmd={.torque_ff_nm=torque[i]};
         BSP_CAN_Frame_t expected;
-        assert(DM_Motor_EncodeMIT(&g_motor_can_config[i],&cmd,&expected)==BSP_CAN_OK);
+        assert(DM_Motor_EncodeMIT(&g_motor_can_config[i],&command[i],&expected)==BSP_CAN_OK);
         assert(!memcmp(motor_last_mit[i+1],expected.data,8));
     }
     can_io[1].free_slots=0;

@@ -22,6 +22,18 @@ extern "C" {
  * This op16 capability is distinct from retired op11 tuning diagnostics. */
 #define MOTOR_DRAG_VERSION 0x594C4402UL
 #define MOTOR_DRAG_REQUEST 0x44524147UL
+/* Remote native-MIT commissioning; still the sole FiveControl output owner.
+ * op16 field249/scope0/value0: capability; field22/scope0/value IMIT:
+ * capture current raw centers (idempotent; no cold/enable/ACK).
+ * v2 field23/scope1..5: float offset_deg starts one finite +/- offset cycle,
+ * ramp outward but STEP to the identical center for both returns;
+ * ACK value is configured duration_ms, NOT physical arrival.
+ * Read-only value0: field24/scope0 active test joint (0 idle);
+ * field24/scope1..5 current native raw target (requires IMPEDANCE);
+ * field25/scope0 actual target-side test start_ms.
+ * Session/KEY/fault exits retain existing manual-idle/G handover semantics. */
+#define MOTOR_IMPEDANCE_TEST_VERSION 0x594C5402UL
+#define MOTOR_IMPEDANCE_REQUEST 0x494D4954UL
 /* Read-only op16/value0: scope0/field250=capability; scope0 fields16 flags,
  * 17 committed sequence,18 errors,19 boot-local successful writes,
  * 20 saved_mask | restored_mask<<8. Flags: ready1,loaded2,writing4,erasing8,

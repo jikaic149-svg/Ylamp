@@ -1446,6 +1446,7 @@ static void test_can_recovery(void)
 
 #include "five_mit_checks.inc"
 #include "five_drag_checks.inc"
+#include "five_impedance_test_checks.inc"
 
 int main(int argc, char **argv)
 {
@@ -1454,6 +1455,7 @@ int main(int argc, char **argv)
     if (argc==2 && strcmp(argv[1],"five-control")==0) { test_control(); return 0; }
     if (argc==2 && strcmp(argv[1],"five-key")==0) { test_key_modes(); return 0; }
     if (argc==2 && strcmp(argv[1],"five-drag")==0) { test_drag_control(); return 0; }
+    if (argc==2 && strcmp(argv[1],"five-impedance-test")==0) { test_remote_impedance(); return 0; }
 #ifdef YLAMP_J3_REVERSE_TEST
     if (argc==2 && strcmp(argv[1],"five-j3-reverse")==0) { test_j3_reverse(); return 0; }
 #endif

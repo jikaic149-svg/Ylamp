@@ -52,13 +52,18 @@ def check_calls(graph, reverse_test=False, velocity_loop=False, manual_drag=Fals
         "Ylamp_ControlStep": ("FiveControl_Tick", "FiveMIT_SendSample", "MotorUSB_Run",
                              "BSP_KEY_Scan", "FiveControl_KeyPress"),
         "FiveControl_Tick": ("FiveDynamics_Inverse", "FiveSupport_GravityModel",
-                             "FiveDynamics_GravityResidual", "DM_Motor_SendTorque", "FiveSupport_Sample"),
+                             "FiveDynamics_GravityResidual", "DM_Motor_SendMIT", "FiveSupport_Sample"),
         "FiveControl_KeyPress": ("FiveControl_ColdStart", "FiveSupport_EnterImpedance"),
+        "FiveSupport_Sample": ("DM_Motor_EncodeMIT",),
         "MotorUSB_Run": ("FiveControl_ColdStart", "FiveControl_Move"),
         "FiveMIT_SendSample": ("FiveMIT_Sample", "DM_Motor_SendMIT"),
         "FiveMIT_Sample": ("FiveDynamics_Inverse",),
         "DM_Motor_SendMIT": ("BSP_CAN_Send",),
     }
+    required["MotorUSB_Run"] += ("FiveControl_Impedance", "FiveControl_ImpedanceTest")
+    required["FiveControl_Impedance"] = ("FiveSupport_EnterImpedance",)
+    required["FiveControl_ImpedanceTest"] = ("FiveMIT_Prepare", "FiveSupport_StartTest")
+    required["FiveControl_Tick"] += ("FiveSupport_TestTick",)
     if reverse_test:
         required["MotorUSB_Run"] += ("FiveControl_ReverseJ3",)
         required["FiveControl_Tick"] += ("FiveSupport_ApplyReverseJ3",)
@@ -140,6 +145,32 @@ def support_bytes(manual_drag=False):
     if len(speeds) != 5 or any(len(row) != 2 for row in speeds):
         raise ValueError("invalid configured finite velocity PI gains")
     result["g_five_speed_pi"] = struct.pack("<10f", *(v for row in speeds for v in row))
+    support = re.search(r"g_five_support_gains\[FIVE_AXES\]\s*=\s*\{(.*?)\};", text, re.S)
+    rows = [[float(v.strip().rstrip("f")) for v in row.split(",")]
+            for row in re.findall(r"\{([^{}]+)\}", support[1])] if support else []
+    if (len(rows)!=5 or any(len(row)!=2 or not all(map(math.isfinite,row)) or
+                           not 0<row[0]<=500 or not 0<=row[1]<=5 for row in rows)):
+        raise ValueError("invalid configured native-MIT impedance gains")
+    result["g_five_support_gains"] = struct.pack("<10f", *(v for row in rows for v in row))
+    impedance = re.search(r"g_five_impedance_max_nm\[FIVE_AXES\]\s*=\s*\{([^}]+)\};", text)
+    caps = [float(v.strip().rstrip("f")) for v in impedance[1].split(",")] if impedance else []
+    if len(caps)!=5 or any(not math.isfinite(v) or v<=0 for v in caps):
+        raise ValueError("invalid configured KEY-only impedance budgets")
+    result["g_five_impedance_max_nm"] = struct.pack("<5f", *caps)
+    pd_limit = re.search(r"g_five_impedance_pd_max_nm\[FIVE_AXES\]\s*=\s*\{([^}]+)\};", text)
+    pd_caps = [float(v.strip().rstrip("f")) for v in pd_limit[1].split(",")] if pd_limit else []
+    if len(pd_caps)!=5 or any(
+            not math.isfinite(v) or not 0<v<=total for v, total in zip(pd_caps, caps)):
+        raise ValueError("invalid configured native-MIT PD-only budgets")
+    result["g_five_impedance_pd_max_nm"] = struct.pack("<5f", *pd_caps)
+    trial = re.search(r"g_five_impedance_test\s*=\s*\{(\d+)U,(\d+)U,([-+.\deE]+)f?\};", text)
+    if not trial:
+        raise ValueError("missing native-impedance trial configuration")
+    ramp, hold, offset = int(trial[1]), int(trial[2]), float(trial[3])
+    if not (ramp>=100 and hold>0 and 4*(ramp+hold)<=120000 and
+            math.isfinite(offset) and offset>0):
+        raise ValueError("invalid native-impedance trial configuration")
+    result["g_five_impedance_test"] = struct.pack("<IIf", ramp, hold, offset)
     friction = re.search(r"g_five_speed_friction\[FIVE_AXES\]\s*=\s*\{(.*?)\};", text, re.S)
     if not friction:
         raise ValueError("missing configured velocity-trial friction overlay")

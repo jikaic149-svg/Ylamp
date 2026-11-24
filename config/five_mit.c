@@ -10,18 +10,23 @@
 /* Gravity-model commissioning: MIT Kp, Kd, Fc and B are all zero.
  * Torque budgets are software ceilings
  * on predicted total torque, NOT motor protocol/rating or a validated hold.
+ * User requested wider effort budgets after a latched FIVE_LIMIT, 2026-11-23:
+ * shared G ceilings +50% from the deployed ADFC baseline, not compounded
+ * with an intermediate candidate; no G formula or fault/exit change.
+ * This shared table affects G, drag and KEY support, not KEY alone.
  * A rejected motion sample falls back to gravity, never to a disable. */
 const FiveMIT_Axis g_five_mit_hw[FIVE_AXES] = {
-    {0,0, 0,0,.02f, .4f,0},
-    {0,0, 0,0,.02f, 3.0f,J2_CAD},
-    {0,0, 0,0,.02f, 1.8f,J3_CAD},
-    {0,0, 0,0,.02f, .8f,0},
-    {0,0, 0,0,.02f, .4f,0}
+    {0,0, 0,0,.02f, .6f,0},
+    {0,0, 0,0,.02f, 4.5f,J2_CAD},
+    {0,0, 0,0,.02f, 2.7f,J3_CAD},
+    {0,0, 0,0,.02f, 1.2f,0},
+    {0,0, 0,0,.02f, .6f,0}
 };
 /* Active identification only: software kp [Nm/rad], kd [Nm*s/rad], total Nm.
  * User explicitly doubled all five active total budgets after the J5 .6 rad/s
  * return hit .4 Nm, 2026-11-22. This changes ceilings, not commanded gains or
- * friction amplitude; pure-G/impedance budgets remain untouched.
+ * friction amplitude. That earlier change was active-only; the later shared
+ * support/KEY budget relaxation is configured separately above/below.
  * These are commissioning limits, not a validated mechanism rating.
  * MIT actuator gains stay zero and the whole batch is rejected above max_nm. */
 const FiveMIT_Tracking g_five_mit_tracking[FIVE_AXES] = {
@@ -69,15 +74,17 @@ const float g_five_speed_friction_j2[2] = {
  * Fraction, positive damping [Nm*s/rad], velocity signal deadband [rad/s],
  * assist cap [Nm], total G+overlay budget [Nm]. Deadbands exceed the drive's
  * half-LSB zero-speed bias. No static kick, gravity change or enable.
- * Total budgets are below existing active budgets; pure-G/impedance budgets
- * remain unchanged. User keeps J3/J4/J5 at exact G, no added damping or assist.
+ * Total budgets stay below existing active budgets. J1 remains 1 Nm;
+ * J2 rises only from 4 to 4.5 Nm to accommodate its relaxed G ceiling.
+ * J3/J4/J5 match their relaxed G ceilings, still exact G with no added
+ * damping or assist. Fractions, assist caps, filter and ramp are unchanged.
  * Initial feel tune, NOT validated passivity or calibration. */
 const FiveDrag_Axis g_five_drag[FIVE_AXES] = {
     {.80f,.04f,.008f,.55f,1.0f},
-    {.65f,.08f,.008f,.55f,4.0f},
-    {0,0,.016f,0,1.8f},
-    {0,0,.016f,0,.8f},
-    {0,0,.016f,0,.4f}
+    {.65f,.08f,.008f,.55f,4.5f},
+    {0,0,.016f,0,2.7f},
+    {0,0,.016f,0,1.2f},
+    {0,0,.016f,0,.6f}
 };
 const float g_five_drag_filter_s = .015f;
 const float g_five_drag_ramp_s = .2f;
@@ -105,19 +112,55 @@ const float g_five_j2_gravity_delta[FIVE_AXES][4] = {
  * Source gravity_from_friction_02.json SHA256
  * 797F798E63E6E6570D4E56B44616652E80299D13E12F96435A81B8BF1AF49049.
  * This is a commissioning candidate, not accepted global gravity calibration.
- * Pure G/impedance/active G base share it; retain the 1.8 Nm G cap, zero PD,
- * all other joints, nominal dynamics, friction and control budgets. */
+ * Pure G/impedance/active G base share it; the formula, zero PD and nominal
+ * dynamics/friction are unchanged. Effort ceilings are configured separately. */
 const float g_five_j3_gravity_scale = 1.2774127431831357f;
 /* Same relative scaling of the previous trim, not a second compensation.
  * Add once after the CAD gain and before the existing owner's effort cap.
  * Software angle is radians; zero/CAD datum and encoder sign stay unchanged. */
 const float g_five_j3_gravity_cosine_nm = -.010825531721891f;
-/* Impedance ONLY: software Kp [Nm/rad], Kd [Nm*s/rad].
- * Reuse the BEE414C8 deployed hold gains, not the high-gain simulation profile.
- * The center is captured on every explicit entry, never the calibrated zero. */
+/* KEY impedance ONLY: native drive Kp [Nm/rad], Kd [Nm*s/rad].
+ * User-approved yielding hold, 2026-11-24: retain deployed 859D Kp to preserve
+ * the near-center spring slope. Finite large-offset screening rejected uniform
+ * Kd*.7 (8.58 deg overshoot): J1/J5 keep *.7, J2 keeps its 859D damping,
+ * J3/J4 use *1.15 for braking. Low PD effort ceilings, not weak return braking,
+ * provide the large-offset yielding; this is still not hardware acceptance.
+ * Independent PD effort ceilings below soften large deflections without
+ * reducing G. No integral, static kick, center drift or second software PD.
+ * The 1-2 deg bidirectional return target still needs real-drive validation.
+ * Original lag-stress source impedance_stress_01.json SHA256
+ * 9309E8E463C219DDB2AC86F672413C4DFA9981CBEA11C0076D485D515484E097.
+ * Offline finite-scenario selection, NOT measured real-drive stability.
+ * Preserve G/F coefficients, drag fractions, speed PI and the mode lifecycle.
+ * Capture each drive's raw position on explicit entry; no duplicate software PD.
+ * Scale gains together for the separate KEY total/PD sampled budgets.
+ * The drive's inner-loop torque between frames is not MCU torque-clamped. */
 const FiveSupport_Gains g_five_support_gains[FIVE_AXES] = {
-    {5,.5f}, {5,.5f}, {5,.5f}, {3,.3f}, {3,.3f}
+    {84.84f,3.1248f}, {63.84f,5}, {15.75f,1.6054f}, {16.66f,.6969f}, {16.66f,.4207f}
 };
+/* User-requested KEY total-effort relaxation, 2026-11-23: previous ceilings
+ * [1,3,1.8,.8,.4] +50% from ADFC, never compounded with a draft candidate.
+ * Shared G ceilings above also rise +50%. The later yielding tune adds a
+ * separate PD ceiling; these TOTAL ceilings and active budgets stay unchanged.
+ * These commissioning ceilings remain below the existing active ceilings;
+ * NOT a measured mechanism rating or a drive-side hard torque clamp.
+ * No automatic fault clear, re-enable or change to the fault handover. */
+const float g_five_impedance_max_nm[FIVE_AXES] = {1.5f,4.5f,2.7f,1.2f,.6f};
+/* Approved hand-yielding tune: maximum sampled |Kp*error-Kd*velocity| [Nm].
+ * room=min(this, total_budget-|G|); never clip G or move the captured center.
+ * Preserve small-error Kp, reduce large-offset pushing; normal yielding is
+ * limited telemetry, not a new fault, time limit or angle gate.
+ * Initial commissioning values, not a drive-side hard torque clamp, measured
+ * breakaway/hand-force bound or a guarantee of static accuracy/stability. */
+const float g_five_impedance_pd_max_nm[FIVE_AXES] = {1.f,1.f,.4f,.3f,.25f};
+/* Remote trial v2, user requested large-angle return/overshoot tests.
+ * Four 6s slots: +target (4s quintic + 2s hold), fixed-center STEP/hold 6s,
+ * -target (4s + 2s), same fixed-center STEP/hold 6s; total 24s.
+ * At most 60 deg REQUESTED offset, still subject to original travel/CAD
+ * planning and unchanged sampled torque budgets, not permission to use 60 deg
+ * on every joint/pose. Physical return speed is not bounded by the outward ramp.
+ * No new manual KEY restriction, gain/force increase or fault/exit change. */
+const FiveSupport_TestConfig g_five_impedance_test = {4000U,2000U,60.f};
 #ifdef YLAMP_J3_REVERSE_TEST
 /* Supported comparison only: total/ramp [ms], absolute J3 torque [N*m].
  * Outside this envelope leave the original five-axis gravity unchanged. */

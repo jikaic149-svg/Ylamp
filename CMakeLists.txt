@@ -59,7 +59,7 @@ if(BSP_HOST_TEST)
     if(YLAMP_J3_REVERSE_TEST)
         add_test(NAME five-j3-reverse COMMAND bsp_tests five-j3-reverse)
     endif()
-    foreach(suite can-startup can-start-failure can-motor-config can-five-axis five-mit five-control five-key five-drag five-motion-admission five-smooth-control five-cold five-cold-silent
+    foreach(suite can-startup can-start-failure can-motor-config can-five-axis five-mit five-control five-key five-drag five-impedance-test five-motion-admission five-smooth-control five-cold five-cold-silent
                   five-j3-read five-j3-read-timeout five-j3-read-cancel five-j3-read-tx
                   can-diagnostics can-recovery key-boot dm-motor dm-motor-full)
         add_test(NAME ${suite} COMMAND bsp_tests ${suite})
