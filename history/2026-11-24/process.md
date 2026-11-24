@@ -138,3 +138,10 @@
 - 已逐范围核对30个待归档文件：原生MIT支持/独立PD让步/KEY与显式有限试验/USB观测契约、配置、主机/Python测试、MuJoCo导出/碰撞/阻抗模型及工具、README/process和11-23/11-24日档，均属于本轮机器人任务；没有删除/移动或夹带新业务改动。4份XML最大约45KB、最大候选文件为旧日档约206KB；按.gitignore保留build、原始采样、固件/备份、缓存、node_modules在本地。根AGENTS在仓库外，不擅自另建副本或移动进仓库。
 - 快检：常见私钥/GitHub token/AWS access-key特征扫描只返回文件名、未发现命中，非完整安全审计；git diff --check通过（既有LF/CRLF提示不当错误）。本次host构建ninja无待编译，35/35C全过、显式指定F447 host后二套Python47/47全过；ARM构建也无待编译，check_v12_image --manual-drag --velocity-loop再PASS，仍BIN F447 SHA全值一致。没有为归档重跑实机/仿真或改变任何固件逻辑/参数。
 - 归档范围与快检结果已先交付，再按embedded-firmware-workflow补本日志；ponytail仅复用原Git/测试入口，不重构或新增发布框架。本轮不连接COM/SWD、复位/刷写、恢复/启控/运动或重开已接受阻抗验收。当前归档进行中，下一步显式暂存上述30文件、提交、普通push origin main并ls-remote复核；上传成功回执另存同分支文档，不把当前计划当已推送完成。
+
+## 18:21 UTC+08／纽约11-24 05:21 UTC−05｜阻抗阶段30文件已推送，远端主体提交核验一致
+
+- 显式暂存已核对的30条路径，集合/数量与预期一致，未含build或.bin/.elf/.jsonl/.dll/.exe等；git diff --cached --check通过。首轮git commit因本机没有user.name/email报Author identity unknown，退出128、未生成提交，已暂存内容保留；未因此丢弃文件、重置或改源码。
+- 查最近3次400c9dc/b5080ba/592541f的author/committer均为现有项目账号jikaic149-svg及其GitHub noreply地址。向用户说明后，仅使用git -c user.name=... -c user.email=...的本次命令临时参数沿用该既有署名；没有git config --global/--local身份改写，没有编造新个人身份。正常提交成功，功能提交`5cfe0aed1dd466f9496c936c745388f8ac666621`，题为Finalize V1.2 native MIT yielding impedance baseline，30文件/3467插入/87删除，暂存/工作树随后为空。
+- 使用非交互原credential helper普通push origin main成功，远端从400c9dc快进至5cfe0ae；独立git ls-remote --heads origin main返回完整`5cfe0aed1dd466f9496c936c745388f8ac666621`，与本地一致。未强推、变更远端、创建新分支/标签或重写旧历史；git ls-files build为空。已先交付主体上传成功结果，再补本回执；回执另以同分支文档提交保存，最终tip由git log及远端核验交付，不为把提交写进自身而amend/强推。
+- 本轮35/35C、47/47Python及ARM/F447门禁通过，无需因仅文档回执重复编译；硬件仍已接受的F447，本轮无COM/SWD/运行状态读取、烧录/复位/启控/运动/G-F/阻抗参数变化。原始采样、固件/回读/烧前备份、仿真原始报告、缓存与本机模型网格均保留本地，4份小型XML/源码生成工具/测试/日档已入库；不把带本机资产依赖的XML宣称为独立网格包。阻抗阶段工程归档完成，五轴联动仅后续建议，无自动新任务。
