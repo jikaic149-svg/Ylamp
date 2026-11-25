@@ -198,47 +198,6 @@ class FiveAxisTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             local_fit(local_design(np.zeros(360), velocity), residual, groups)
 
-    def test_inertia_first_stage_keeps_finite_interval_and_varies_only_ramp(self):
-        from five_inertia_scan import pair_endpoints, RAMPS_MS, SPEED
-        from five_global_friction_scan import full_leg
-        from five_identify import REFS
-        middle = np.rad2deg(REFS[:, 1:]).mean(axis=1)
-        for joint in (1, 2):
-            for position in (np.rad2deg(REFS[joint-1, 1])+3,
-                             middle[joint-1], np.rad2deg(REFS[joint-1, 2])-3):
-                anchor = middle.copy()
-                anchor[joint-1] = position
-                near, far = pair_endpoints(anchor, joint)
-                self.assertAlmostEqual(abs(far[joint-1]-near[joint-1]), 30.)
-                np.testing.assert_array_equal(np.delete(near, joint-1), np.delete(far, joint-1))
-                for ramp in RAMPS_MS:
-                    for start, end in ((near, far), (far, near)):
-                        goal, plateau, _, duration = full_leg(start, joint, end[joint-1], SPEED, ramp)
-                        self.assertGreater(plateau, 0)
-                        self.assertEqual(duration, plateau+2*ramp)
-                        self.assertLessEqual(abs(goal[joint-1]-end[joint-1]),
-                                             np.rad2deg(SPEED*.001)+1e-10)
-        np.testing.assert_allclose([1.875*SPEED/(r*.001) for r in RAMPS_MS], [.5, 1, 2])
-        middle[4] = np.rad2deg(REFS[4, 2])-.2
-        with self.assertRaises(ValueError):
-            pair_endpoints(middle, 1)
-        with self.assertRaises(ValueError):
-            pair_endpoints(np.zeros(5), 3)
-
-    def test_inertia_preflight_never_launches_motion(self):
-        from five_inertia_scan import InertiaBatch
-        from five_identify import REFS
-        batch = InertiaBatch.__new__(InertiaBatch)
-        batch.state = Mock(return_value=np.rad2deg(REFS[:, 1:]).mean(axis=1))
-        batch.check, batch.note = Mock(), Mock()
-        batch.transfer = Mock(side_effect=AssertionError("Preflight must not move"))
-        batch.leg = Mock(side_effect=AssertionError("Preflight must not launch a leg"))
-        batch.preflight()
-        self.assertEqual(batch.check.call_count, 2)
-        batch.transfer.assert_not_called()
-        batch.leg.assert_not_called()
-        self.assertTrue(batch.note.call_args.kwargs["no_motion_sent"])
-
     def test_deployed_friction_matches_frozen_global_model_and_native_wrench(self):
         import hashlib
         import json

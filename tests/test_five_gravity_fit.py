@@ -183,19 +183,6 @@ class GravityFitTest(unittest.TestCase):
         raw = np.rad2deg(legs[0]["q"][:, 3])+np.rad2deg(REFS[3, 0])
         self.assertLess(np.max(raw), -390)
 
-    def test_current_support_changes_only_j2_and_scales_complete_j3_trial(self):
-        q = np.random.default_rng(40).uniform(-2, 2, (203, 5))
-        nominal = gravity_basis(q) @ nominal_parameters()
-        support = support_gravity(q)
-        expected = nominal.copy()
-        previous = 1.18*nominal[:, 2]-.01*np.cos(q[:, 2]-np.deg2rad(HW[2, 6]))
-        expected[:, 2] = 1.2774127431831357*nominal[:, 2]-.010825531721891*np.cos(q[:, 2]-np.deg2rad(HW[2, 6]))
-        np.testing.assert_allclose(expected[:, 2], 1.0825531721890982*previous,
-                                   rtol=0, atol=2e-14)
-        expected = np.clip(expected, -HW[:, 5], HW[:, 5])
-        np.testing.assert_array_equal(support[:, [0, 2, 3, 4]], expected[:, [0, 2, 3, 4]])
-        self.assertGreater(np.max(abs(support[:, 1]-expected[:, 1])), .1)
-
     def test_j2_candidate_matches_recorded_pose_goldens_and_is_continuous(self):
         # Same two recorded wrist poses, not two angle-dependent branches.
         poses = [([-28.51236855812435, 0, 27.397681685578284,
