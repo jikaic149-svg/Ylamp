@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from dm_monitor import JOINT_REFERENCES
-from five_control import CONTROL_VERSION, EXPECTED
+from five_control import CONTROL_VERSION, EXPECTED, PURE_GRAVITY_PHASES
 
 ROOT = Path(__file__).resolve().parents[1]
 NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
@@ -142,7 +142,7 @@ def load_run(path, *, with_time=False):
         issues.append("missing or mismatched board calibration")
     if meta.get("free_space") is not True:
         issues.append("external torque / hand or support contact not excluded")
-    if not fast or not end or ack not in ("gravity", "status", "move") or ack != meta.get("action"):
+    if not fast or not end or ack not in ("idle", "gravity", "status", "move") or ack != meta.get("action"):
         issues.append("not a completed high-rate measurement run")
     if end and (end.get("malformed", 0) or end.get("incomplete", 0)):
         issues.append("malformed or incomplete telemetry")
@@ -151,7 +151,7 @@ def load_run(path, *, with_time=False):
     if not status or status[0]["stage"] != "before" or len(status) < 3:
         issues.append("insufficient controller observations")
     def healthy(s):
-        phase_ok = (s["phase"] in ("GRAVITY", "MOTION", "POSITION") or
+        phase_ok = (s["phase"] in (*PURE_GRAVITY_PHASES, "MOTION", "POSITION") or
                     (s.get("stage") == "before" and s["phase"] == "DRAG"))
         return (phase_ok and not s["fault"] and not s["limited"]
                 and s["fresh"] == s["enabled"] == s["submitted"] == 31
@@ -159,9 +159,9 @@ def load_run(path, *, with_time=False):
     if any(not healthy(s) for s in status):
         issues.append("controller not supplying all five axes throughout")
     if status and status[0]["phase"] == "DRAG" and (
-            not test_gravity or test_gravity["phase"] != "GRAVITY" or not healthy(test_gravity)):
+            not test_gravity or test_gravity["phase"] not in PURE_GRAVITY_PHASES or not healthy(test_gravity)):
         issues.append("manual idle was not explicitly handed to pure gravity")
-    if ack == "move" and (not handover or not healthy(handover) or handover["phase"] != "GRAVITY"
+    if ack == "move" and (not handover or not healthy(handover) or handover["phase"] not in PURE_GRAVITY_PHASES
             or not any(s["phase"] == "MOTION" for s in status) or status[-1]["phase"] != "POSITION"):
         issues.append("trajectory or handover not confirmed")
     report.update(issues=issues, session=meta.get("session"), eligible_samples=0)

@@ -47,6 +47,11 @@ typedef struct {
     double software_deg[5]; /* measured reference coordinates; never wrap J4 */
     float raw_rad[5], velocity_rad_s[5]; /* matching positions, same sample */
 } FiveMIT_State;
+/* One coordinated interpolated target; never interpolated feedback. */
+typedef struct {
+    double position_deg[5];
+    float velocity_rad_s[5], acceleration_rad_s2[5];
+} FiveMIT_Reference;
 typedef struct {
     DM_Motor_MIT_Command_t motor[5]; /* ordered J1..J5 */
     BSP_CAN_Frame_t frame[5];
@@ -74,14 +79,23 @@ bool FiveMIT_PrepareInBox(FiveMIT_Plan *p,const FiveMIT_Box *box,const double fr
 bool FiveMIT_Sample(const FiveMIT_Plan *plan,double elapsed_s,const FiveMIT_State *state,
                     const FiveMIT_Axis profile[5],FiveMIT_Output *out);
 /* Active commissioning only: measured support G + nominal dynamics +
- * software feedback plus local reference-velocity friction on a nonzero-travel
- * cruise axis: speed PI there, original
- * position/velocity tracking on ordinary moves and zero-travel held axes.
+ * software feedback + ONE total reference-velocity F on Move/Speed/Ruckig.
+ * Cruise travel axes use speed PI; ordinary moves/held axes keep their
+ * position/velocity gains. Zero reference speed gives zero F, even if the
+ * measured joint moves; no static kick or measured-sign feedback chatter.
  * PD builds smoothly from zero over g_five_tracking_ramp_s after plan start;
  * G/dynamics remain direct. No interpolation of feedback or its source time.
  * MIT gains stay zero; reject the batch before exceeding torque budgets. */
 bool FiveMIT_SampleFeedback(const FiveMIT_Plan *plan,double elapsed_s,
     const FiveMIT_State *state,const float support_gravity_nm[5],FiveMIT_Output *out);
+/* Continuous ordinary-position tracking, same G/M/C/F/PD/budgets as Move.
+ * elapsed_s is time from the WHOLE trajectory start, not the current knot.
+ * No speed-trial PI, native-drive PD or second entry ramp. */
+bool FiveMIT_SampleReferenceFeedback(const FiveMIT_Reference *reference,double elapsed_s,
+    const FiveMIT_State *state,const float support_gravity_nm[5],FiveMIT_Output *out);
+BSP_CAN_Status_t FiveMIT_SendReference(const FiveMIT_Reference *reference,double elapsed_s,
+    const FiveMIT_State *state,const float support_gravity_nm[5],
+    DM_Motor_t *const motors[5],unsigned *submitted);
 /* Owner-only transport. No automatic enable.
  * Validate all five before sending. On bus failure *submitted is the accepted
  * prefix (not an acknowledgement); stop, never replay an old batch. */

@@ -6,9 +6,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(BSP_HOST_TEST "Build HAL-fake behavioral tests on the host" OFF)
-option(YLAMP_J3_REVERSE_TEST "Temporary supported J3 gravity-direction comparison" OFF)
 set(ylamp_image ylamp_v12_five_axis)
-foreach(retired YLAMP_J5_TEST_ONLY YLAMP_CAN_CHECK_ONLY YLAMP_LEGACY_DUAL_AXIS YLAMP_FIVE_MIT_PREVIEW YLAMP_J25_SHADOW)
+foreach(retired YLAMP_J5_TEST_ONLY YLAMP_CAN_CHECK_ONLY YLAMP_LEGACY_DUAL_AXIS YLAMP_FIVE_MIT_PREVIEW YLAMP_J25_SHADOW YLAMP_J3_REVERSE_TEST)
     if(${retired})
         message(FATAL_ERROR "Retired ${retired} image; start with an empty five-axis build directory.")
     endif()
@@ -39,27 +38,31 @@ add_library(ylamp_model STATIC Model/five_workspace.c Model/five_dynamics.c)
 target_include_directories(ylamp_model PUBLIC Model PRIVATE config)
 target_compile_options(ylamp_model PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(ylamp_model PUBLIC m)
-add_library(ylamp_task STATIC Task/five_control.c Task/five_history.c Task/five_mit_send.c Mode/five_mit.c Mode/five_support.c Mode/five_drag.c
+add_subdirectory(Algorithm)
+add_library(ylamp_task STATIC Task/five_control.c Task/five_history.c Task/five_mit_send.c Mode/five_mit.c Mode/five_support.c Mode/five_drag.c Mode/five_trajectory.cpp
+    Task/lookaround_task.c Task/lookaround_store.c config/five_trajectory.c
     config/five_mit.c config/motor_config.c config/calibration_config.c
     Task/joint_calibration.c Task/motor_usb.c Task/motor_telemetry.c)
 target_include_directories(ylamp_task PUBLIC Task Mode Model config)
-target_link_libraries(ylamp_task PUBLIC ylamp_device ylamp_model m)
+target_link_libraries(ylamp_task PUBLIC ylamp_device ylamp_model m PRIVATE ruckig::ruckig)
 target_compile_options(ylamp_task PRIVATE -Wall -Wextra -Werror -fstack-usage)
-if(YLAMP_J3_REVERSE_TEST)
-    target_compile_definitions(ylamp_task PUBLIC YLAMP_J3_REVERSE_TEST=1)
-endif()
+set_source_files_properties(Mode/five_trajectory.cpp PROPERTIES COMPILE_OPTIONS
+    # Unmodified STM32 LL headers use volatile compound assignments, legal
+    # hardware accesses deprecated (but not removed) by C++20.
+    "-O2;-fno-exceptions;-fno-rtti;-fno-fast-math;-ffunction-sections;-fdata-sections;-Wno-volatile")
 if(BSP_HOST_TEST)
     enable_testing()
+    add_library(five_ruckig_native SHARED tools/five_ruckig_native.cpp)
+    target_link_libraries(five_ruckig_native PRIVATE ylamp_task)
+    target_compile_options(five_ruckig_native PRIVATE -Wall -Wextra -Werror)
     target_sources(ylamp_bsp PRIVATE tests/fakes/ospi_absent.c)
     target_compile_definitions(ylamp_task PUBLIC YLAMP_HOST_FIXTURES=1)
+    target_compile_definitions(ylamp_device PRIVATE YLAMP_HOST_FIXTURES=1)
     add_executable(bsp_tests tests/test_bsp.c)
     target_link_libraries(bsp_tests PRIVATE ylamp_task)
     target_compile_options(bsp_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
     add_test(NAME bsp_behavior COMMAND bsp_tests)
-    if(YLAMP_J3_REVERSE_TEST)
-        add_test(NAME five-j3-reverse COMMAND bsp_tests five-j3-reverse)
-    endif()
-    foreach(suite can-startup can-start-failure can-motor-config can-five-axis five-mit five-control five-key five-drag five-impedance-test five-motion-admission five-smooth-control five-cold five-cold-silent
+    foreach(suite can-startup can-start-failure can-motor-config can-five-axis five-mit five-control five-key five-drag five-impedance-test five-trajectory lookaround five-motion-admission five-smooth-control five-cold five-cold-silent
                   five-j3-read five-j3-read-timeout five-j3-read-cancel five-j3-read-tx
                   can-diagnostics can-recovery key-boot dm-motor dm-motor-full)
         add_test(NAME ${suite} COMMAND bsp_tests ${suite})
@@ -68,7 +71,7 @@ if(BSP_HOST_TEST)
     add_executable(telemetry_tests tests/test_motor_telemetry.c Task/motor_telemetry.c)
     target_include_directories(telemetry_tests PRIVATE Task)
     target_compile_options(telemetry_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
-    add_test(NAME telemetry_records COMMAND telemetry_tests)
+    add_test(NAME telemetry_crc COMMAND telemetry_tests)
     add_executable(joint_reference_tests tests/test_joint_references.c config/motor_config.c)
     target_include_directories(joint_reference_tests PRIVATE
         Model config Device/DM_Motor/Common Device/DM_Motor BSP/CAN tests/fakes)
@@ -93,6 +96,11 @@ if(BSP_HOST_TEST)
     target_include_directories(rtos_tests PRIVATE tests/fakes config App)
     target_compile_options(rtos_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
     add_test(NAME rtos_schedule COMMAND rtos_tests)
+    add_executable(mode_rgb_tests tests/test_mode_rgb.c Task/control_step.c)
+    target_include_directories(mode_rgb_tests PRIVATE App)
+    target_link_libraries(mode_rgb_tests PRIVATE ylamp_task)
+    target_compile_options(mode_rgb_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+    add_test(NAME mode_rgb COMMAND mode_rgb_tests)
     add_executable(fault_tests tests/test_fault.c)
     target_include_directories(fault_tests PRIVATE App)
     target_compile_options(fault_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
@@ -109,6 +117,10 @@ if(BSP_HOST_TEST)
     target_compile_options(history_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
     target_link_libraries(history_tests PRIVATE m)
     add_test(NAME five_history COMMAND history_tests)
+    add_executable(lookaround_store_tests tests/test_lookaround_store.c)
+    target_link_libraries(lookaround_store_tests PRIVATE ylamp_task)
+    target_compile_options(lookaround_store_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+    add_test(NAME lookaround_store COMMAND lookaround_store_tests)
 else()
     if(NOT EXISTS "${BSP_CUBE_ROOT}/Core/Inc/main.h")
         message(FATAL_ERROR "Set BSP_CUBE_ROOT to the existing H7_BSP-HEAD directory")
@@ -180,6 +192,8 @@ else()
     # there, not in the SDK's default .bss (DTCM is inaccessible to DMA1/2).
     string(REPLACE "SECTIONS\n{" "SECTIONS\n{\n  .dma_buffer (NOLOAD) : ALIGN(32)\n  {\n    *(.dma_buffer*)\n    . = ALIGN(32);\n  } >RAM_D1\n  ASSERT(ADDR(.dma_buffer) + SIZEOF(.dma_buffer) <= 0x24010000, \"DMA exceeds MPU non-cacheable region\")"
         BSP_LINK_SCRIPT "${BSP_LINK_SCRIPT}")
+    string(REPLACE "  /* The startup code" "  .trajectory_buffer (NOLOAD) : ALIGN(8)\n  {\n    *(.trajectory_buffer*)\n  } >RAM_D1\n  /* The startup code"
+        BSP_LINK_SCRIPT "${BSP_LINK_SCRIPT}")
     file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bsp_link_check.ld"
         CONTENT "${BSP_LINK_SCRIPT}")
     set(FREERTOS_DIR "${BSP_CUBE_ROOT}/Middlewares/Third_Party/FreeRTOS/Source")
@@ -201,7 +215,7 @@ else()
     # Native CM4F port supports Cortex-M7 r1+; H723 header reports r1p2.
     # No CMSIS-RTOS2, heap, timer task, SEGGER hooks or old reference tasks.
     add_executable(ylamp_firmware
-        App/main.c App/rtos.c App/fault.c App/serial_dma.c
+        App/main.c App/rtos.c App/fault.c App/serial_dma.c Task/control_step.c
         "${BSP_CUBE_ROOT}/Core/Src/stm32h7xx_hal_msp.c"
         "${BSP_CUBE_ROOT}/Core/Src/stm32h7xx_hal_timebase_tim.c"
         "${BSP_CUBE_ROOT}/startup_stm32h723xx.s"

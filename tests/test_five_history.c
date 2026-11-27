@@ -112,14 +112,61 @@ static void thresholds(void)
     for (unsigned axis=0;axis<5;++axis) {
         const unsigned target=FiveHistory_StatusNow()->writes+1;
         const float start=pose[axis];
-        /* Whole single-turn detail need not be recorded every 30 degrees. */
+        float phase=start-floorf(start/JOINT_TURN_RAD)*JOINT_TURN_RAD;
+        const float direction=phase>151*RAD ? -1.f : 1.f;
+        /* Exercise the supplemental 150-deg trigger WITHOUT crossing zero. */
         for (unsigned n=1;n<=149;++n) {
-            pose[axis]=start+n*RAD;step(31);
+            pose[axis]=start+direction*n*RAD;step(31);
             assert(FiveHistory_StatusNow()->writes==target-1);
         }
-        pose[axis]=start+151*RAD;committed(target,31);
+        pose[axis]=start+direction*151*RAD;committed(target,31);
         assert(fabsf(FiveHistory_StatusNow()->saved_rad[axis]-pose[axis])<2e-6f);
     }
+}
+static void encoder_zero_crossings(void)
+{
+    for (unsigned axis=0;axis<5;++axis) {
+        /* Synthetic history inputs, not claims these poses fit mechanical travel. */
+        empty();pose[axis]=-.1f*RAD;committed(1,31);
+        pose[axis]=.1f*RAD;step(31);
+        assert(FiveHistory_StatusNow()->writes==1);
+        assert(FiveHistory_StatusNow()->flags&FIVE_HISTORY_WRITING);
+        committed(2,31);
+        assert(fabsf(FiveHistory_StatusNow()->saved_rad[axis]-.1f*RAD)<2e-6f);
+        for (unsigned n=0;n<10;++n) { step(31); }
+        assert(FiveHistory_StatusNow()->writes==2); /* No repeated write at rest. */
+        pose[axis]=-.1f*RAD;step(31);
+        assert(FiveHistory_StatusNow()->flags&FIVE_HISTORY_WRITING);
+        committed(3,31);
+        assert(fabsf(FiveHistory_StatusNow()->saved_rad[axis]+.1f*RAD)<2e-6f);
+        power_cycle();
+        assert(FiveHistory_StatusNow()->sequence==3);
+        DM_Motor_Feedback_t f={.position_rad=pose[axis],.velocity_rad_s=0,
+            .received_count=1,.received_at_ms=clock_ms,.state=1};
+        assert(fabsf(FiveHistory_Reference(axis,&f)-pose[axis])<2e-6f);
+    }
+}
+static void zero_crossing_during_write(void)
+{
+    empty();pose[3]=-.1f*RAD;committed(1,31);
+    pose[3]=.1f*RAD;step(31); /* Body write for the positive-side record. */
+    pose[3]=-.1f*RAD;step(31); /* Cross back before that record commits. */
+    committed(3,31);
+    assert(fabsf(FiveHistory_StatusNow()->saved_rad[3]-pose[3])<2e-6f);
+    for (unsigned n=0;n<10;++n) { step(31); }
+    assert(FiveHistory_StatusNow()->writes==3);
+}
+static void zero_crossing_is_not_raw_renumbering_or_software_zero(void)
+{
+    initial();
+    pose[3]+=JOINT_TURN_RAD;step(31);
+    for (unsigned n=0;n<10;++n) { step(31); }
+    assert(FiveHistory_StatusNow()->corrections[3]==1);
+    assert(FiveHistory_StatusNow()->writes==1); /* Same continuous phase/turn. */
+    empty();pose[2]=g_joint_reference_config[2].zero_rad-RAD;committed(1,31);
+    pose[2]=g_joint_reference_config[2].zero_rad+RAD;
+    for (unsigned n=0;n<10;++n) { step(31); }
+    assert(FiveHistory_StatusNow()->writes==1); /* Software zero, not encoder zero. */
 }
 static void restore_and_wrap(void)
 {
@@ -158,7 +205,7 @@ static void torn_writes(void)
     for (int cut=0;cut<=60;++cut) {
         memcpy(nor,base,sizeof nor);power_cycle();
         for (unsigned i=0;i<5;++i) { pose[i]=g_joint_reference_config[i].zero_rad; }
-        pose[0]+=160*RAD;cut_after=cut;step(31);
+        pose[0]=.1f*RAD;cut_after=cut;step(31); /* Cross zero, less than 150 deg. */
         assert(FiveHistory_StatusNow()->flags&FIVE_HISTORY_IO_ERROR);
         power_cycle();
         assert(FiveHistory_StatusNow()->flags&FIVE_HISTORY_LOADED);
@@ -167,7 +214,7 @@ static void torn_writes(void)
     }
     for (int cut=0;cut<=4;++cut) {
         memcpy(nor,base,sizeof nor);power_cycle();
-        pose[0]=g_joint_reference_config[0].zero_rad+160*RAD;
+        pose[0]=.1f*RAD;
         step(31); /* Complete body, then interrupt commit. */
         cut_after=cut;step(31);power_cycle();
         assert(FiveHistory_StatusNow()->flags&FIVE_HISTORY_LOADED);
@@ -229,9 +276,12 @@ static void initial_legal_branch(void)
 }
 int main(void)
 {
-    thresholds();restore_and_wrap();partial_axes_and_stale();
+    thresholds();encoder_zero_crossings();zero_crossing_during_write();
+    zero_crossing_is_not_raw_renumbering_or_software_zero();
+    restore_and_wrap();partial_axes_and_stale();
     torn_writes();rollover_and_erase_loss();foreign_and_missing();initial_legal_branch();
-    puts("PASS: five-axis 150deg thresholds, initial/partial checkpoints, turn restore,"
+    puts("PASS: five-axis bidirectional encoder-zero commits, supplemental 150deg,"
+         " crossing during write, raw-renumber/software-zero distinction, turn restore,"
          " live wrap, stale data, all torn-body/commit cuts, rollover/suspend,"
          " erase power loss, foreign-data preservation and absent chip.");
     return 0;

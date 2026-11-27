@@ -8,7 +8,9 @@ set(BUILD_PYTHON_MODULE OFF)
 set(BUILD_BENCHMARK OFF)
 add_subdirectory(ruckig)
 
-add_library(ylamp_trajectory STATIC joint_trajectory.cpp)
+# Retain the retired two-axis adapter for explicit legacy builds only.
+# V1.2 links Ruckig directly from Mode/five_trajectory.cpp, never this adapter.
+add_library(ylamp_trajectory STATIC EXCLUDE_FROM_ALL joint_trajectory.cpp)
 target_include_directories(ylamp_trajectory PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(ylamp_trajectory PRIVATE ruckig::ruckig)
 target_compile_options(ylamp_trajectory PRIVATE -Wall -Wextra -Werror)

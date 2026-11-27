@@ -33,20 +33,7 @@ typedef struct {
     unsigned test_joint; /* 0 idle, otherwise 1..5; same native-MIT support path. */
     uint32_t test_started_ms;
     float test_center_raw_rad, test_offset_rad;
-#ifdef YLAMP_J3_REVERSE_TEST
-    bool reverse_j3;
-    uint32_t reverse_started_ms;
-#endif
 } FiveSupport_State;
-
-#ifdef YLAMP_J3_REVERSE_TEST
-typedef struct { uint32_t total_ms, ramp_ms; float max_nm; } FiveSupport_ReverseConfig;
-extern const FiveSupport_ReverseConfig g_five_j3_reverse;
-/* Explicit entry only, no enable. Target-side elapsed time, not USB timeout.
- * Changes torque direction only; does NOT calibrate qCAD or encoder signs. */
-bool FiveSupport_EnterReverseJ3(FiveSupport_State *mode,uint32_t now,float gravity_j3_nm);
-void FiveSupport_ApplyReverseJ3(FiveSupport_State *mode,uint32_t now,float torque_nm[FIVE_AXES]);
-#endif
 
 /* Pure mode lifecycle, called by the sole motor owner; no CAN or enable. */
 void FiveSupport_Gravity(FiveSupport_State *mode);
@@ -56,7 +43,7 @@ bool FiveSupport_EnterImpedance(FiveSupport_State *mode,const FiveMIT_State *sta
  * Ramp outward only; each return holds the original fixed center for one slot.
  * The ramp duration does not bound physical speed after a center step.
  * No software PD/dynamics/F overlay, enable or I/O. Completion holds the saved
- * center in impedance; Gravity/KEY/session/fault cancellation stops the cycle. */
+ * center in impedance; IDLE/KEY/session/fault cancellation stops the cycle. */
 bool FiveSupport_StartTest(FiveSupport_State *mode,unsigned joint,float offset_deg,uint32_t now);
 void FiveSupport_TestTick(FiveSupport_State *mode,uint32_t now);
 uint32_t FiveSupport_TestDuration(void);

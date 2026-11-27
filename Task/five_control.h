@@ -1,12 +1,14 @@
 #ifndef YLAMP_FIVE_CONTROL_H
 #define YLAMP_FIVE_CONTROL_H
 #include "five_mit.h"
+#include "five_trajectory.h"
 #include "motor_config.h"
 
 enum { FIVE_ALL = (1U << FIVE_AXES) - 1U };
 typedef enum {
-    FIVE_WAIT, FIVE_GRAVITY, FIVE_MOTION, FIVE_POSITION, FIVE_DEGRADED,
-    FIVE_IMPEDANCE, FIVE_REVERSE_J3, FIVE_DRAG /* Append: preserve existing USB phase values. */
+    FIVE_WAIT, FIVE_IDLE, /* Pure gravity; legacy wire value 1. */
+    FIVE_MOTION, FIVE_POSITION, FIVE_DEGRADED,
+    FIVE_IMPEDANCE, FIVE_DRAG = 7 /* Preserve USB phase values; 6 is retired. */
 } FivePhase;
 enum {
     FIVE_BAD_FEEDBACK=1U, FIVE_BAD_STATE=2U, FIVE_HOT=4U, FIVE_RANGE=8U,
@@ -35,19 +37,33 @@ BSP_CAN_Status_t FiveControl_Move(const double target_deg[FIVE_AXES],uint32_t du
  * analytically and checks its endpoint against original travel. No rest gate. */
 BSP_CAN_Status_t FiveControl_Speed(unsigned joint,float velocity_rad_s,
                                   uint32_t duration_ms,uint32_t ramp_ms);
+/* One bounded, fully precomputed five-axis Ruckig trajectory. Upload preserves idle output;
+ * commit captures actual start and uses the SAME Move ownership/gains/G/M/C/
+ * torque budgets/hold/fault and KEY/session cancellation. No enable/retry. */
+BSP_CAN_Status_t FiveControl_TrajectoryBegin(unsigned points);
+BSP_CAN_Status_t FiveControl_TrajectorySet(unsigned axis,unsigned derivative,float value);
+BSP_CAN_Status_t FiveControl_TrajectoryAppend(uint32_t relative_ms);
+BSP_CAN_Status_t FiveControl_TrajectoryAppendPoint(const FiveTrajectory_Point *point);
+BSP_CAN_Status_t FiveControl_TrajectoryStart(void);
+void FiveControl_TrajectoryDiscard(void); /* Incomplete upload only, never an active move. */
+FiveTrajectory_Status FiveControl_TrajectoryStatus(void);
+/* Local preset; capture measured q at KEY acceptance, then use q_key +
+ * (template_q - template_first_q), retaining all v/a and times. Caller advances
+ * at most one planning step per tick. Same Ruckig/travel checks as USB motion.
+ * Normal completion and KEY cancellation go to pure G. USB release ignores it. */
+BSP_CAN_Status_t FiveControl_LocalTrajectoryBegin(unsigned points);
+void FiveControl_LocalTrajectoryStep(const FiveTrajectory_Point *points);
+bool FiveControl_LocalTrajectoryOwned(void);
 BSP_CAN_Status_t FiveControl_Drag(void); /* Select healthy manual idle; idempotent, no enable. */
 /* Explicit remote native hold, healthy DRAG/G only; idempotent without
  * recapturing an existing center. Never cold-start/clear faults/enable. */
 BSP_CAN_Status_t FiveControl_Impedance(void);
 BSP_CAN_Status_t FiveControl_ImpedanceTest(unsigned joint,float offset_deg);
-void FiveControl_Gravity(void); /* Explicit pure-G comparison; cancel without enable/disable. */
+void FiveControl_Idle(void); /* Cancel active work to pure G; no enable, disable or fault clear. */
 /* End external task ownership: cancel motion/hold into manual idle; preserve
  * existing DRAG or explicitly selected pure G. Never clear faults or enable. */
 void FiveControl_Release(void);
-BSP_CAN_Status_t FiveControl_KeyPress(void); /* Explicit cold -> DRAG; DRAG <-> entry-pose hold. */
-#ifdef YLAMP_J3_REVERSE_TEST
-BSP_CAN_Status_t FiveControl_ReverseJ3(void); /* Supported, healthy pure G only; no enable. */
-#endif
+BSP_CAN_Status_t FiveControl_KeyPress(void); /* Existing cold/exit, or cancel a local preset. */
 BSP_CAN_Status_t FiveControl_Acknowledge(void); /* Explicit fault clear -> manual idle; no motion/enable. */
 /* Explicit, supported legacy-J3 acquisition after a controller-only restart:
  * only J3 has never replied; the other four are fresh, enabled and stationary;

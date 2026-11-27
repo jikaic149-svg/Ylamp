@@ -24,7 +24,15 @@ static struct {
     bool j3_read_used;
     FiveDrag_State drag;
     bool return_drag;
+    bool local_trajectory;
+    double local_origin_deg[5];
 } c;
+#ifdef STM32H723xx
+/* CPU-only planning cache, not DMA. NOLOAD is initialized explicitly below. */
+static FiveTrajectory_State trajectory __attribute__((section(".trajectory_buffer"),aligned(8)));
+#else
+static FiveTrajectory_State trajectory;
+#endif
 
 static void cancel(void)
 {
@@ -32,6 +40,8 @@ static void cancel(void)
     FiveSupport_Gravity(&c.support);
     FiveDrag_Stop(&c.drag);
     c.return_drag=false;
+    c.local_trajectory=false;
+    FiveTrajectory_Cancel(&trajectory);
 }
 static void manual_idle(void)
 {
@@ -49,6 +59,7 @@ bool FiveControl_Init(DM_Motor_t *const motors[5], uint32_t now)
     for (unsigned i=0;i<5;++i) {
         if (!DM_Motor_MatchesConfig(motors[i],&g_motor_can_config[i])) { return false; }
     }
+    memset(&trajectory,0,sizeof trajectory);
     FiveHistory_Init(); /* Boot read only; never enables or formats foreign data. */
     memcpy(c.motor,motors,sizeof c.motor);
     c.last=now; c.query=now; c.init=true;
@@ -56,7 +67,7 @@ bool FiveControl_Init(DM_Motor_t *const motors[5], uint32_t now)
 }
 const FiveControl_Status *FiveControl_StatusNow(void) { return c.init ? &c.s : NULL; }
 /* A missed reply is not a disable acknowledgement. Reuse only a previously
- * computed GRAVITY vector, never velocity/acceleration/friction or an old move.
+ * computed gravity vector, never velocity/acceleration/friction or an old move.
  * gravity_at exposes its age: this is degraded support, not a brake. */
 static unsigned observe(bool check_travel)
 {
@@ -138,11 +149,6 @@ static void support(unsigned mask)
             for (unsigned i=0;i<5;++i) { command[i].torque_ff_nm=torque[i]; }
         }
     }
-#ifdef YLAMP_J3_REVERSE_TEST
-    for (unsigned i=0;i<5;++i) { torque[i]=command[i].torque_ff_nm; }
-    FiveSupport_ApplyReverseJ3(&c.support,HAL_GetTick(),torque);
-    for (unsigned i=0;i<5;++i) { command[i].torque_ff_nm=torque[i]; }
-#endif
     /* A full FIFO on CAN2 must not prevent J3/J4/J5 on CAN1 from receiving G. */
     for (unsigned i=0;i<5;++i) {
         const unsigned bit=1U<<i;
@@ -196,16 +202,6 @@ static void read_j3_tick(uint32_t now,unsigned why)
     }
     if (rc!=BSP_CAN_OK) { c.j3_read=0; fault(FIVE_TX); }
 }
-#ifdef YLAMP_J3_REVERSE_TEST
-BSP_CAN_Status_t FiveControl_ReverseJ3(void)
-{
-    if (__get_IPSR() || !c.init || c.cold || c.s.fault || c.moving || c.at_target ||
-        c.drag.active || c.support.impedance || c.support.reverse_j3 || observe(false) ||
-        c.s.enabled!=FIVE_ALL || c.s.submitted!=FIVE_ALL || !still()) { return BSP_CAN_NOT_READY; }
-    return FiveSupport_EnterReverseJ3(&c.support,HAL_GetTick(),c.s.gravity_nm[2]) ?
-        BSP_CAN_OK : BSP_CAN_NOT_READY;
-}
-#endif
 BSP_CAN_Status_t FiveControl_ColdStart(void)
 {
     if (__get_IPSR() || !c.init || c.cold || c.s.fault || c.known_enabled) { return BSP_CAN_NOT_READY; }
@@ -264,48 +260,41 @@ static void cold_tick(uint32_t now,unsigned why)
     }
     c.cold=COLD_WAIT_ACK;
 }
-void FiveControl_Gravity(void)
+void FiveControl_Idle(void)
 {
     if (!__get_IPSR() && c.init) { cancel(); c.cold=COLD_OFF; c.j3_read=0; }
 }
 void FiveControl_Release(void)
 {
-    if (__get_IPSR() || !c.init) { return; }
-    /* A status session must not reset a running drag filter or undo an
-     * explicit pure-G selection. Only an active task needs an idle handover.
+    if (__get_IPSR() || !c.init || c.local_trajectory) { return; }
+    /* A status session must not reset a running drag filter. Only an active
+     * task needs an idle handover.
      * No observation/model computation here: USB may call with IRQs masked. */
-    if (c.moving || c.at_target || c.support.impedance
-#ifdef YLAMP_J3_REVERSE_TEST
-        || c.support.reverse_j3
-#endif
-    ) { manual_idle(); }
+    if (c.moving || c.at_target || c.support.impedance) { manual_idle(); }
+    FiveTrajectory_Cancel(&trajectory);
     c.cold=COLD_OFF; c.j3_read=0;
 }
 BSP_CAN_Status_t FiveControl_Drag(void)
 {
-#ifdef YLAMP_J3_REVERSE_TEST
-    if (c.support.reverse_j3) { return BSP_CAN_NOT_READY; }
-#endif
-    if (__get_IPSR() || !c.init || c.cold || c.j3_read || c.s.fault ||
+    if (__get_IPSR() || !c.init || c.cold || c.j3_read || c.s.fault || c.local_trajectory ||
         c.moving || c.at_target || c.support.impedance ||
-        (c.s.phase!=FIVE_GRAVITY && c.s.phase!=FIVE_DRAG) ||
+        (c.s.phase!=FIVE_IDLE && c.s.phase!=FIVE_DRAG) ||
         observe(false) || c.s.enabled!=FIVE_ALL ||
         c.s.submitted!=FIVE_ALL) { return BSP_CAN_NOT_READY; }
     /* Idempotent selection preserves an already-running filter/ramp. */
+    FiveTrajectory_Cancel(&trajectory);
     if (c.drag.active) { return BSP_CAN_OK; }
     c.return_drag=false;
     return FiveDrag_Enter(&c.drag,&c.x,HAL_GetTick()) ? BSP_CAN_OK : BSP_CAN_NOT_READY;
 }
 BSP_CAN_Status_t FiveControl_Impedance(void)
 {
-#ifdef YLAMP_J3_REVERSE_TEST
-    if (c.support.reverse_j3) { return BSP_CAN_NOT_READY; }
-#endif
-    if (__get_IPSR() || !c.init || c.cold || c.j3_read || c.s.fault ||
+    if (__get_IPSR() || !c.init || c.cold || c.j3_read || c.s.fault || c.local_trajectory ||
         c.moving || c.at_target || observe(false) ||
         c.s.enabled!=FIVE_ALL || c.s.submitted!=FIVE_ALL) { return BSP_CAN_NOT_READY; }
     if (c.support.impedance) { return BSP_CAN_OK; } /* Never move a saved center. */
     if (!FiveSupport_EnterImpedance(&c.support,&c.x)) { return BSP_CAN_NOT_READY; }
+    FiveTrajectory_Cancel(&trajectory);
     FiveDrag_Stop(&c.drag);c.return_drag=false;
     return BSP_CAN_OK;
 }
@@ -345,12 +334,8 @@ BSP_CAN_Status_t FiveControl_KeyPress(void)
     if (__get_IPSR() || !c.init || c.cold || c.s.fault) { return BSP_CAN_NOT_READY; }
     if (!c.known_enabled) { return FiveControl_ColdStart(); }
     if (observe(false) || c.s.enabled!=FIVE_ALL || c.s.submitted!=FIVE_ALL) { return BSP_CAN_NOT_READY; }
-#ifdef YLAMP_J3_REVERSE_TEST
-    if (c.support.reverse_j3) { manual_idle(); return BSP_CAN_OK; }
-#endif
-    if (c.drag.active) {
-        return FiveControl_Impedance();
-    }
+    if (c.local_trajectory) { FiveControl_Idle(); return BSP_CAN_OK; }
+    if (c.drag.active) { return BSP_CAN_NOT_READY; } /* Local task owns this branch. */
     if (c.support.impedance || c.moving || c.at_target || !c.return_drag) {
         manual_idle();
         return BSP_CAN_OK;
@@ -368,13 +353,10 @@ static BSP_CAN_Status_t move(const double target[5],uint32_t duration,uint32_t r
 {
     if ((!target && !joint) || __get_IPSR() || duration<100U || duration>120000U ||
         (ramp && ramp>=duration*.5)) { return BSP_CAN_INVALID_ARG; }
-#ifdef YLAMP_J3_REVERSE_TEST
-    if (c.support.reverse_j3) { return BSP_CAN_NOT_READY; }
-#endif
     /* Motion/waypoint admission has no all-axis instantaneous-rest gate.
      * The user's current commissioning stage does not require every joint
      * velocity to be below the startup/legacy-handshake rest threshold. */
-    if (!c.init || c.s.fault || c.moving || c.support.test_joint || c.cold || observe(true) ||
+    if (!c.init || c.s.fault || c.moving || c.local_trajectory || c.support.test_joint || c.cold || observe(true) ||
         c.s.enabled!=FIVE_ALL || c.s.submitted!=FIVE_ALL) { return BSP_CAN_NOT_READY; }
     const double seconds=duration*.001;
     double endpoint[5];
@@ -388,6 +370,7 @@ static BSP_CAN_Status_t move(const double target[5],uint32_t duration,uint32_t r
                  FiveMIT_Prepare(&plan,c.x.software_deg,target,seconds))) { return BSP_CAN_INVALID_ARG; }
     FiveSupport_Gravity(&c.support);
     FiveDrag_Stop(&c.drag);
+    FiveTrajectory_Cancel(&trajectory);
     c.return_drag=false;
     c.plan=plan; c.start=HAL_GetTick(); c.duration=duration; c.moving=true; c.at_target=false;
     return BSP_CAN_OK;
@@ -402,6 +385,95 @@ BSP_CAN_Status_t FiveControl_Speed(unsigned joint,float velocity,uint32_t durati
         return BSP_CAN_INVALID_ARG;
     }
     return move(NULL,duration,ramp,joint,velocity);
+}
+static bool trajectory_idle(void)
+{
+    return !__get_IPSR() && c.init && !c.cold && !c.j3_read && !c.s.fault &&
+        !c.moving && !c.at_target && !c.support.impedance && !c.support.test_joint &&
+        !observe(true) && c.s.enabled==FIVE_ALL && c.s.submitted==FIVE_ALL;
+}
+BSP_CAN_Status_t FiveControl_TrajectoryBegin(unsigned points)
+{
+    if (c.local_trajectory || !trajectory_idle()) { return BSP_CAN_NOT_READY; }
+    return FiveTrajectory_Begin(&trajectory,points) ? BSP_CAN_OK : BSP_CAN_INVALID_ARG;
+}
+BSP_CAN_Status_t FiveControl_TrajectorySet(unsigned axis,unsigned derivative,float value)
+{
+    if (__get_IPSR() || !c.init || c.local_trajectory) { return BSP_CAN_NOT_READY; }
+    return FiveTrajectory_Set(&trajectory,axis,derivative,value) ?
+        BSP_CAN_OK : BSP_CAN_INVALID_ARG;
+}
+BSP_CAN_Status_t FiveControl_TrajectoryAppend(uint32_t at)
+{
+    if (__get_IPSR() || !c.init || c.local_trajectory) { return BSP_CAN_NOT_READY; }
+    return FiveTrajectory_Append(&trajectory,at) ? BSP_CAN_OK : BSP_CAN_INVALID_ARG;
+}
+BSP_CAN_Status_t FiveControl_TrajectoryAppendPoint(const FiveTrajectory_Point *point)
+{
+    if (__get_IPSR() || !c.init || c.local_trajectory) { return BSP_CAN_NOT_READY; }
+    return FiveTrajectory_AppendPoint(&trajectory,point) ? BSP_CAN_OK : BSP_CAN_INVALID_ARG;
+}
+static BSP_CAN_Status_t trajectory_start(void)
+{
+    if (!trajectory_idle()) { return BSP_CAN_NOT_READY; }
+    if (!FiveTrajectory_PrepareStart(&trajectory,&c.x)) {
+        return BSP_CAN_INVALID_ARG;
+    }
+    /* Clock starts after the one initial-state calculation; all interior
+     * profiles were calculated during staging, never in the moving tick. */
+    const uint32_t now=HAL_GetTick();
+    if (!FiveTrajectory_Start(&trajectory,now)) { return BSP_CAN_NOT_READY; }
+    const FiveTrajectory_Status status=FiveTrajectory_StatusNow(&trajectory);
+    FiveSupport_Gravity(&c.support);FiveDrag_Stop(&c.drag);c.return_drag=false;
+    c.start=now;c.duration=status.duration_ms;c.moving=true;c.at_target=false;
+    return BSP_CAN_OK;
+}
+BSP_CAN_Status_t FiveControl_TrajectoryStart(void)
+{
+    if (__get_IPSR() || !c.init || c.local_trajectory) { return BSP_CAN_NOT_READY; }
+    const BSP_CAN_Status_t result=trajectory_start();
+    if (result!=BSP_CAN_OK) { FiveControl_TrajectoryDiscard(); }
+    return result;
+}
+void FiveControl_TrajectoryDiscard(void)
+{
+    if (!__get_IPSR() && !c.local_trajectory && !FiveTrajectory_Active(&trajectory)) {
+        FiveTrajectory_Cancel(&trajectory);
+    }
+}
+FiveTrajectory_Status FiveControl_TrajectoryStatus(void)
+{
+    return FiveTrajectory_StatusNow(c.local_trajectory ? NULL : &trajectory);
+}
+bool FiveControl_LocalTrajectoryOwned(void) { return c.local_trajectory; }
+BSP_CAN_Status_t FiveControl_LocalTrajectoryBegin(unsigned points)
+{
+    if (c.local_trajectory || c.s.phase!=FIVE_DRAG || !c.drag.active ||
+        trajectory.uploading || !trajectory_idle()) {
+        return BSP_CAN_NOT_READY;
+    }
+    if (!FiveTrajectory_Begin(&trajectory,points)) { return BSP_CAN_INVALID_ARG; }
+    memcpy(c.local_origin_deg,c.x.software_deg,sizeof c.local_origin_deg);
+    c.local_trajectory=true;
+    return BSP_CAN_OK;
+}
+void FiveControl_LocalTrajectoryStep(const FiveTrajectory_Point *points)
+{
+    if (__get_IPSR() || !c.local_trajectory) { return; }
+    if (c.at_target) { FiveControl_Idle(); return; }
+    if (c.moving) { return; }
+    bool ok=false;
+    if (points && trajectory.uploading) {
+        if (trajectory.count<trajectory.expected) {
+            FiveTrajectory_Point target;
+            ok=FiveTrajectory_RelativePoint(&target,&points[trajectory.count],
+                &points[0],c.local_origin_deg) && FiveTrajectory_AppendPoint(&trajectory,&target);
+        } else { ok=trajectory_start()==BSP_CAN_OK; }
+    }
+    if (!ok) {
+        c.local_trajectory=false;
+        FiveTrajectory_Cancel(&trajectory); /* A rejected preset leaves DRAG alone. */
+    }
 }
 void FiveControl_Tick(uint32_t now)
 {
@@ -422,8 +494,16 @@ void FiveControl_Tick(uint32_t now)
         if (c.s.enabled!=FIVE_ALL) { fault(FIVE_BAD_STATE); }
         if (c.moving || c.at_target) {
             unsigned sent=0;
-            BSP_CAN_Status_t result=FiveMIT_SendSample(&c.plan,elapsed*.001,&c.x,
-                g_five_mit_hw,c.s.gravity_nm,c.motor,&sent);
+            BSP_CAN_Status_t result;
+            if (FiveTrajectory_Active(&trajectory)) {
+                FiveMIT_Reference reference;
+                result=FiveTrajectory_Sample(&trajectory,elapsed,&reference) ?
+                    FiveMIT_SendReference(&reference,elapsed*.001,&c.x,c.s.gravity_nm,c.motor,&sent) :
+                    BSP_CAN_INVALID_ARG;
+            } else {
+                result=FiveMIT_SendSample(&c.plan,elapsed*.001,&c.x,
+                    g_five_mit_hw,c.s.gravity_nm,c.motor,&sent);
+            }
             if (result==BSP_CAN_OK && sent==5) {
                 c.s.submitted=FIVE_ALL;
                 /* POSITION means timed trajectory complete, feedback hold
@@ -448,12 +528,9 @@ void FiveControl_Tick(uint32_t now)
             if (i!=2 && !(c.s.submitted & (1U<<i))) { (void)DM_Motor_RequestFeedback(c.motor[i]); }
         }
     }
-#ifdef YLAMP_J3_REVERSE_TEST
-    if (c.support.reverse_j3) { c.s.phase=FIVE_REVERSE_J3; return; }
-#endif
     c.s.phase=c.s.fault ? FIVE_DEGRADED : c.moving ? FIVE_MOTION : c.at_target ? FIVE_POSITION :
         c.s.enabled==FIVE_ALL && c.s.submitted==FIVE_ALL ?
-            (c.drag.active ? FIVE_DRAG : c.support.impedance ? FIVE_IMPEDANCE : FIVE_GRAVITY) : FIVE_WAIT;
+            (c.drag.active ? FIVE_DRAG : c.support.impedance ? FIVE_IMPEDANCE : FIVE_IDLE) : FIVE_WAIT;
     memcpy(c.s.impedance_target_raw_rad,c.support.anchor_raw_rad,sizeof c.s.impedance_target_raw_rad);
     c.s.impedance_test_joint=(uint8_t)c.support.test_joint;
     c.s.impedance_test_started_ms=c.support.test_started_ms;

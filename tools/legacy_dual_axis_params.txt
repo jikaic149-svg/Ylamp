@@ -1,4 +1,4 @@
-#include "robot_model.h"
+/* Historical dual-axis fit data, read only by dm_fit_identification.py. */
 
 /* 刚体惯量保留CAD名义初值，附加输出侧等效惯量单列；J3视为固定负载。
  * 2026-11-09重力sin项由双向运动/独立轨迹的电流估算力矩辨识，

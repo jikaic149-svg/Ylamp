@@ -14,10 +14,24 @@ MAGIC = b"\xa5\x5a"
 TELEMETRY, REQUEST, RESPONSE = 0x01, 0x10, 0x90
 RELIABLE_REQUEST, RELIABLE_RESPONSE, SESSION, SESSION_ACK = 0x11, 0x91, 0x12, 0x92
 FOCUS_REQUEST, FOCUS_ACK, FOCUS_SAMPLE = 0x13, 0x93, 0x94
+TRAJ_BEGIN, TRAJ_POINT, TRAJ_START, MOTION_QUERY = 0x18, 0x19, 0x1a, 0x1b
+TRAJ_ACK, TRAJ_RESULT, MOTION_STATE = 0x98, 0x99, 0x9a
+PRESET_BEGIN, PRESET_POINT, PRESET_SAVE, PRESET_QUERY = 0x1c, 0x1d, 0x1e, 0x1f
+PRESET_ACK, PRESET_STATE = 0x9c, 0x9f
+PRESET_READ, PRESET_DATA = 0x20, 0xa0
 LENGTHS = {TELEMETRY: 144, REQUEST: 8, RESPONSE: 8, RELIABLE_REQUEST: 24,
            RELIABLE_RESPONSE: 20, SESSION: 8, SESSION_ACK: 8,
-           FOCUS_REQUEST: 9, FOCUS_ACK: 18, FOCUS_SAMPLE: 206}
+           FOCUS_REQUEST: 9, FOCUS_ACK: 18, FOCUS_SAMPLE: 206,
+           TRAJ_BEGIN: 17, TRAJ_POINT: 85, TRAJ_START: 24, MOTION_QUERY: 12,
+           TRAJ_ACK: 24, TRAJ_RESULT: (180, 244), MOTION_STATE: (180, 244),
+           PRESET_BEGIN: 17, PRESET_POINT: 85, PRESET_SAVE: 24, PRESET_QUERY: 12,
+           PRESET_ACK: 40, PRESET_STATE: 40, PRESET_READ: 16, PRESET_DATA: 244}
 MAX_JOINTS, HEADER_SIZE, RECORD_SIZE = 6, 64, 64
+
+
+def valid_v1_length(kind, length):
+    expected = LENGTHS.get(kind)
+    return length in expected if isinstance(expected, tuple) else length == expected
 
 
 def encode(kind, payload, *, version=1):
@@ -25,7 +39,7 @@ def encode(kind, payload, *, version=1):
             HEADER_SIZE + RECORD_SIZE <= len(payload) <= HEADER_SIZE + MAX_JOINTS*RECORD_SIZE
             and (len(payload) - HEADER_SIZE) % RECORD_SIZE == 0):
         body = struct.pack("<BBH", version, kind, len(payload)) + bytes(payload)
-    elif version == 1 and kind in LENGTHS and len(payload) == LENGTHS[kind]:
+    elif version == 1 and kind in LENGTHS and valid_v1_length(kind, len(payload)):
         body = bytes((1, kind, len(payload))) + bytes(payload)
     else:
         raise ValueError("Invalid serial frame type/length")
@@ -60,7 +74,7 @@ class Parser:
                     break
                 length = (struct.unpack_from("<H", self.buffer, 4)[0]
                           if version == 2 else self.buffer[4])
-                valid = (version == 1 and LENGTHS.get(kind) == length or
+                valid = (version == 1 and valid_v1_length(kind, length) or
                          version == 2 and kind == TELEMETRY and
                          HEADER_SIZE + RECORD_SIZE <= length <= HEADER_SIZE + MAX_JOINTS*RECORD_SIZE
                          and (length - HEADER_SIZE) % RECORD_SIZE == 0)

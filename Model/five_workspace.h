@@ -15,6 +15,10 @@ bool FiveWorkspace_J3Band(const double at[5], double band[2]);
 /* Ordered per-axis box; endpoints must use the same valid seed J3. */
 bool FiveWorkspace_BoxJ3Band(const double lower[5], const double upper[5], double band[2]);
 bool FiveWorkspace_Line(const double start[5], const double end[5]);
+/* Exact per-axis trajectory extrema. Only an actual start outside the inset
+ * may extend the envelope to that start, never farther outward. */
+bool FiveWorkspace_TrajectoryBounds(const double start[5],const double end[5],
+                                    const double minimum[5],const double maximum[5]);
 #ifdef __cplusplus
 }
 #endif

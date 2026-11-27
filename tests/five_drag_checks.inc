@@ -130,7 +130,7 @@ static void test_drag_control(void)
     assert(s->phase==FIVE_WAIT && !s->submitted);
     for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
     FiveControl_Tick(test_tick+=2);
-    assert(s->phase==FIVE_GRAVITY && !s->fault);
+    assert(s->phase==FIVE_IDLE && !s->fault);
     test_ipsr=1;assert(FiveControl_Drag()==BSP_CAN_NOT_READY);test_ipsr=0;
     /* A moving handover does not restore the deleted all-axis rest gate. */
     for (unsigned i=0;i<5;++i) {
@@ -167,18 +167,15 @@ static void test_drag_control(void)
     assert(s->phase==FIVE_DRAG && !s->fault);assert_gravity_frames(s,0x1c);
     for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
     FiveControl_Tick(test_tick+=2);
-#ifdef YLAMP_J3_REVERSE_TEST
-    assert(FiveControl_ReverseJ3()==BSP_CAN_NOT_READY);
-#endif
-    assert(FiveControl_KeyPress()==BSP_CAN_OK);
+    assert(FiveControl_Impedance()==BSP_CAN_OK);
     FiveControl_Tick(test_tick+=2);
     assert(s->phase==FIVE_IMPEDANCE && !s->fault);
     FiveControl_Release();FiveControl_Tick(test_tick+=2);
     assert(s->phase==FIVE_DRAG && !s->fault);
-    FiveControl_Gravity();FiveControl_Tick(test_tick+=2);
-    assert(s->phase==FIVE_GRAVITY);assert_gravity_frames(s,31);
+    FiveControl_Idle();FiveControl_Tick(test_tick+=2);
+    assert(s->phase==FIVE_IDLE);assert_gravity_frames(s,31);
     FiveControl_Release();FiveControl_Tick(test_tick+=2);
-    assert(s->phase==FIVE_GRAVITY);assert_gravity_frames(s,31);
+    assert(s->phase==FIVE_IDLE);assert_gravity_frames(s,31);
     assert(FiveControl_Drag()==BSP_CAN_OK);
     double target[5];
     for (unsigned i=0;i<5;++i) {
@@ -219,7 +216,7 @@ static void test_drag_control(void)
     assert(s->phase==FIVE_POSITION && !s->fault);
     FiveControl_Release();FiveControl_Tick(test_tick+=2);
     assert(s->phase==FIVE_DRAG && !s->fault);
-    FiveControl_Gravity();FiveControl_Tick(test_tick+=2);
+    FiveControl_Idle();FiveControl_Tick(test_tick+=2);
     assert(FiveControl_Drag()==BSP_CAN_OK);
     can_io[1].free_slots=0;
     FiveControl_Tick(test_tick+=2);
@@ -227,6 +224,7 @@ static void test_drag_control(void)
     assert_gravity_frames(s,0x1c);
     assert(FiveControl_Drag()==BSP_CAN_NOT_READY);
     can_io[1].free_slots=8;
+    FiveControl_Idle(); /* Pure-G selection must not turn a fault into healthy IDLE. */
     FiveControl_Release();
     for (unsigned k=0;k<20;++k) {
         for (unsigned i=0;i<5;++i) { plant_sample(i,1); }

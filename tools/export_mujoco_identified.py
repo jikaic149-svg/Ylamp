@@ -39,7 +39,7 @@ def numbers(values):
 
 def parameters():
     """Read the production C tables, excluding host-only high-gain fixtures."""
-    text = CONFIG.read_text(encoding="utf-8").split("#ifdef YLAMP_J3_REVERSE_TEST")[0]
+    text = CONFIG.read_text(encoding="utf-8")
     result = {}
     for name, body in re.findall(
             r"const\s+\w+\s+(g_five_\w+)(?:\[[^\]]+\])*\s*=\s*([^;]+);", text):

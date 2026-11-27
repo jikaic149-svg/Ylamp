@@ -9,7 +9,7 @@ import subprocess
 
 import numpy as np
 
-from five_control import Board, DRAG_VERSION, idle_output_confirmed
+from five_control import Board, DRAG_VERSION, PURE_GRAVITY_PHASES, idle_output_confirmed
 from five_friction_campaign import Campaign
 from five_gravity_sweep import baseline_goal
 from five_identify import REFS, ROOT
@@ -49,7 +49,7 @@ def source_clock_audit(capture, *, require_free_space=True):
                 end = r
     if (not header or (require_free_space and header.get("free_space") is not True) or not end or
             end["malformed"] or end["incomplete"] or not final or
-            final["phase"] != "GRAVITY" or lower is None or upper is None or upper < lower):
+            final["phase"] not in PURE_GRAVITY_PHASES or lower is None or upper is None or upper < lower):
         raise ValueError("Incomplete capture; cannot skip or relabel a failed movement")
     return dict(capture=str(capture), capture_sha256=digest.hexdigest(),
                 free_space_confirmed=header.get("free_space") is True,

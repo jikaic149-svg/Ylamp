@@ -42,7 +42,8 @@ def reachable(graph, root):
     return seen
 
 
-def check_calls(graph, reverse_test=False, velocity_loop=False, manual_drag=False):
+def check_calls(graph, velocity_loop=False, manual_drag=False,
+                continuous_trajectory=False, active_friction=False, lookaround=False):
     # FreeRTOS starts control_task by pointer; check the registration separately.
     required = {
         "Reset_Handler": ("main",),
@@ -50,10 +51,10 @@ def check_calls(graph, reverse_test=False, velocity_loop=False, manual_drag=Fals
         "Ylamp_StartScheduler": ("xTaskCreateStatic", "vTaskStartScheduler"),
         "control_task": ("Ylamp_ControlStep",),
         "Ylamp_ControlStep": ("FiveControl_Tick", "FiveMIT_SendSample", "MotorUSB_Run",
-                             "BSP_KEY_Scan", "FiveControl_KeyPress"),
+                             "BSP_KEY_Scan", "LookaroundTask_Run" if lookaround else "FiveControl_KeyPress"),
         "FiveControl_Tick": ("FiveDynamics_Inverse", "FiveSupport_GravityModel",
                              "FiveDynamics_GravityResidual", "DM_Motor_SendMIT", "FiveSupport_Sample"),
-        "FiveControl_KeyPress": ("FiveControl_ColdStart", "FiveSupport_EnterImpedance"),
+        "FiveControl_KeyPress": ("FiveControl_ColdStart",),
         "FiveSupport_Sample": ("DM_Motor_EncodeMIT",),
         "MotorUSB_Run": ("FiveControl_ColdStart", "FiveControl_Move"),
         "FiveMIT_SendSample": ("FiveMIT_Sample", "DM_Motor_SendMIT"),
@@ -64,23 +65,63 @@ def check_calls(graph, reverse_test=False, velocity_loop=False, manual_drag=Fals
     required["FiveControl_Impedance"] = ("FiveSupport_EnterImpedance",)
     required["FiveControl_ImpedanceTest"] = ("FiveMIT_Prepare", "FiveSupport_StartTest")
     required["FiveControl_Tick"] += ("FiveSupport_TestTick",)
-    if reverse_test:
-        required["MotorUSB_Run"] += ("FiveControl_ReverseJ3",)
-        required["FiveControl_Tick"] += ("FiveSupport_ApplyReverseJ3",)
+    if lookaround:
+        required["LookaroundTask_Run"] = ("FiveControl_KeyPress", "FiveControl_LocalTrajectoryBegin",
+                                          "FiveControl_LocalTrajectoryStep", "LookaroundStore_Points")
+        required["main"] += ("LookaroundStore_Init", "W25Q64_Read")
+        required["LookaroundTask_Run"] += ("LookaroundStore_Run",)
+        required["MotorUSB_Run"] += ("LookaroundStore_Begin", "LookaroundStore_Append", "LookaroundStore_Save")
+        required["FiveControl_LocalTrajectoryBegin"] = ("FiveTrajectory_Begin",)
+        # ARM Release inlines FiveControl_Idle here; inspect its gravity/cancel calls.
+        required["FiveControl_LocalTrajectoryStep"] = ("FiveTrajectory_AppendPoint",
+            "FiveTrajectory_RelativePoint", "FiveTrajectory_PrepareStart", "FiveTrajectory_Start",
+            "FiveSupport_Gravity", "FiveDrag_Stop", "FiveTrajectory_Cancel")
+    else:
+        required["FiveControl_KeyPress"] += ("FiveSupport_EnterImpedance",)
     if velocity_loop:
         required["MotorUSB_Run"] += ("FiveControl_Speed",)
         required["FiveControl_Speed"] = ("FiveMIT_PrepareCruise",)
         required["FiveMIT_SampleFeedback"] = ("FiveMIT_SpeedFrictionTorque",
                                              "FiveDynamics_GravityLoad")
     if manual_drag:
-        required["MotorUSB_Run"] += ("FiveControl_Drag", "FiveControl_Gravity", "FiveControl_Release")
+        required["MotorUSB_Run"] += ("FiveControl_Drag", "FiveControl_Idle", "FiveControl_Release")
         required["FiveControl_Drag"] = ("FiveDrag_Enter",)
         required["FiveControl_Tick"] += ("FiveDrag_Sample", "FiveDrag_Enter")
         required["FiveDrag_Sample"] = ("FiveMIT_SpeedFrictionTorque", "FiveDynamics_GravityLoad")
+    if continuous_trajectory:
+        required["MotorUSB_Run"] += ("FiveControl_TrajectoryBegin", "FiveControl_TrajectorySet",
+                                    "FiveControl_TrajectoryAppend", "FiveControl_TrajectoryStart")
+        required["FiveControl_TrajectoryAppend"] = ("FiveTrajectory_Append",)
+        required["FiveControl_TrajectoryStart"] = ("FiveTrajectory_PrepareStart","FiveTrajectory_Start")
+        required["FiveControl_Tick"] += ("FiveTrajectory_Sample", "FiveMIT_SendReference")
+        required["FiveMIT_SendReference"] = ("FiveMIT_SampleReferenceFeedback", "DM_Motor_SendMIT")
+    if active_friction:
+        required["FiveMIT_SampleFeedback"] = ("FiveMIT_SpeedFrictionTorque", "FiveDynamics_GravityLoad")
+        required["FiveMIT_SampleReferenceFeedback"] = ("FiveMIT_SpeedFrictionTorque",
+                                                      "FiveDynamics_GravityLoad")
     failures = []
     for root, targets in required.items():
         calls = reachable(graph, root)
         failures.extend(f"missing {root} -> {target}" for target in targets if target not in calls)
+    if lookaround:
+        calls = reachable(graph, "LookaroundTask_Run")
+        if "FiveSupport_EnterImpedance" in calls:
+            failures.append("KEY still enters impedance")
+        if {"DM_Motor_SendMIT", "BSP_CAN_Send"} & reachable(graph, "FiveControl_LocalTrajectoryStep"):
+            failures.append("local trajectory preparation has its own CAN output")
+    if continuous_trajectory:
+        # Mangled native solver names deliberately inspected; a renamed custom
+        # spline or a dead uncalled Ruckig archive must not pass this check.
+        planning = reachable(graph,"FiveControl_TrajectoryAppend") | reachable(
+            graph,"FiveControl_TrajectoryStart")
+        if not any("ruckig" in name and "PositionThirdOrderStep" in name for name in planning):
+            failures.append("five-axis path has no reachable native Ruckig third-order solver")
+        if not any("TargetCalculatorILj5E" in name or "TargetCalculatorILm5E" in name
+                   for name in planning):
+            failures.append("Ruckig is not instantiated for five DOFs")
+        if any("ruckig" in name and "calculate" in name
+               for name in reachable(graph,"FiveControl_Tick")):
+            failures.append("Ruckig replanning appears in the 500Hz motion tick")
     old = {"MotorTask_Run", "J25Shadow_Tick", "CanCheck_Run", "J5Test_Run",
            "DM_Motor_Disable", "BSP_CAN_RecoverBusOff", "NVIC_SystemReset"}
     failures.extend(f"wrong control owner: {name}" for name in sorted(old & reachable(graph, "Ylamp_ControlStep")))
@@ -220,7 +261,8 @@ def support_bytes(manual_drag=False):
     return result
 
 
-def inspect(elf, binary, objdump, objcopy, reverse_test=False, velocity_loop=False, manual_drag=False):
+def inspect(elf, binary, objdump, objcopy, velocity_loop=False, manual_drag=False,
+            continuous_trajectory=False, active_friction=False, lookaround=False):
     def dump(*flags):
         return subprocess.check_output([objdump, *flags, elf], encoding="utf-8", errors="replace")
 
@@ -235,14 +277,27 @@ def inspect(elf, binary, objdump, objcopy, reverse_test=False, velocity_loop=Fal
         if extracted.read_bytes() != image:
             raise ValueError("BIN differs from ELF load image")
     asm, symbols = dump("-d"), dump("-t")
-    failures = check_calls(call_graph(asm), reverse_test, velocity_loop, manual_drag)
+    failures = check_calls(call_graph(asm), velocity_loop, manual_drag,
+                           continuous_trajectory or lookaround, active_friction, lookaround)
+    if re.search(r"\b(?:FiveControl_ReverseJ3|FiveSupport_ApplyReverseJ3)\b", symbols):
+        failures.append("retired J3 reverse trial present")
+    if lookaround and re.search(r"\bFiveTrajectory_EntryWithin\b", symbols):
+        failures.append("retired fixed-preset entry window present")
     if not control_registered(asm, image):
         failures.append("cannot verify control_task is registered with FreeRTOS")
     reset = re.search(r"^([\da-fA-F]+) <Reset_Handler>:$", asm, re.M)
     sp, entry = struct.unpack_from("<II", image)
     if not reset or entry != int(reset[1], 16) | 1 or sp != 0x20020000:
         failures.append("unexpected H723 reset vector / initial stack")
-    for name, expected in {"g_joint_reference_config": reference_bytes(), **support_bytes(manual_drag)}.items():
+    tables = {"g_joint_reference_config": reference_bytes(), **support_bytes(manual_drag)}
+    if lookaround:
+        if re.search(r"\bg_five_lookaround$", symbols, re.M):
+            failures.append("built-in lookaround point fallback present")
+        cache = re.search(r"^([\da-fA-F]+)\s+l\s+O\s+\.trajectory_buffer\s+([\da-fA-F]+)\s+trajectory$",
+                          symbols, re.M)
+        if not cache or not 0x24000000<=int(cache[1],16)<0x24050000 or int(cache[2],16)<120*1024:
+            failures.append("32-profile cache is not in bounded AXI SRAM")
+    for name, expected in tables.items():
         table = re.search(r"^([\da-fA-F]+)\s+g\s+O\s+\.rodata\s+([\da-fA-F]+)\s+"+name+"$", symbols, re.M)
         offset = int(table[1], 16) - FLASH if table else -1
         if not table or int(table[2], 16) != len(expected) or offset < 0 or image[offset:offset+len(expected)] != expected:
@@ -256,13 +311,19 @@ def main():
     p.add_argument("bin", type=Path)
     p.add_argument("--objdump", default="arm-none-eabi-objdump")
     p.add_argument("--objcopy", default="arm-none-eabi-objcopy")
-    p.add_argument("--j3-reverse-test", action="store_true", help="also require the optional test call chains")
     p.add_argument("--velocity-loop", action="store_true", help="also require native finite velocity-PI call chains")
     p.add_argument("--manual-drag", action="store_true", help="also require manual-drag call chains and profile")
+    p.add_argument("--continuous-trajectory", action="store_true",
+                   help="also require preloaded five-axis Ruckig and existing output-owner call chains")
+    p.add_argument("--active-friction", action="store_true",
+                   help="also require total F reachable from ordinary Move and Ruckig feedback")
+    p.add_argument("--lookaround", action="store_true",
+                   help="require KEY/W25Q64 preset loader, explicit save and AXI planning cache")
     args = p.parse_args()
     try:
         failures, digest = inspect(args.elf, args.bin, args.objdump, args.objcopy,
-                                   args.j3_reverse_test, args.velocity_loop, args.manual_drag)
+                                   args.velocity_loop, args.manual_drag,
+                                   args.continuous_trajectory, args.active_friction, args.lookaround)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         p.exit(1, f"V1.2 BLOCKED: {exc}\n")
     if failures:

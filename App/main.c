@@ -12,6 +12,7 @@
 #include "bsp_uart.h"
 #include "five_control.h"
 #include "five_history.h"
+#include "lookaround_store.h"
 #include "bmi088_port.h"
 #include "motor_usb.h"
 #include "usb_telemetry.h"
@@ -92,44 +93,27 @@ static void configure_clock(void)
     if (HAL_RCCEx_PeriphCLKConfig(&peripheral) != HAL_OK) { Error_Handler(); }
 }
 
-void Ylamp_ControlStep(uint32_t now)
+static void init_mcu(void)
 {
-    static uint32_t report;
-    g_fault_stage=YLAMP_STAGE_MOTOR;
-    FiveControl_Tick(now);
-    if (BSP_KEY_Scan(now)==BSP_KEY_EVENT_PRESSED) { (void)FiveControl_KeyPress(); }
-    g_fault_stage=YLAMP_STAGE_IMU;
-    BMI088_Run(now);
-    YummyIMU_Run();
-    g_fault_stage=YLAMP_STAGE_CALIBRATION;
-    JointCalibration_Run(now);
-    if (MotorUSB_Run()) { USBTelemetry_Run(HAL_GetTick()); }
-    if (now-report>=500U) {
-        report=now;
-        const FiveControl_Status *s=FiveControl_StatusNow();
-        (void)BSP_RGB_Set(s->fault?8U:s->phase==FIVE_IMPEDANCE || s->phase==FIVE_REVERSE_J3?5U:0U,
-                          s->phase==FIVE_GRAVITY || s->phase==FIVE_POSITION || s->phase==FIVE_IMPEDANCE?5U:0U,
-                          s->phase==FIVE_MOTION || s->phase==FIVE_WAIT?5U:0U);
-    }
-    g_fault_stage=YLAMP_STAGE_WAIT;
-}
-
-int main(void)
-{
-    YlampFault_Boot();
     configure_mpu();
     SCB_EnableICache();
     SCB_EnableDCache();
     if (HAL_Init() != HAL_OK) { Error_Handler(); }
     g_fault_stage = YLAMP_STAGE_CLOCK;
     configure_clock();
+}
+
+static void init_board_gpio(void)
+{
     MX_GPIO_Init();
     if (BSP_POWER_Init() != HAL_OK ||
         BSP_KEY_Init(20U) != HAL_OK) {
         Error_Handler();
     }
-    /* 用户确认：UART10/YummyIMU所接共享对外5V开机常开，独立于电机电源。 */
-    if (BSP_POWER_Set(BSP_POWER_EXT_5V, true) != HAL_OK) { Error_Handler(); }
+}
+
+static void init_board_io(void)
+{
     MX_SPI6_Init();
     MX_USART1_UART_Init();
     /* Apply project baud before registering UART RX/TX; keep the SDK unchanged. */
@@ -138,9 +122,12 @@ int main(void)
     if (YlampSerialDMA_Init() != HAL_OK) { Error_Handler(); }
     if (BSP_RGB_Init() != HAL_OK) { Error_Handler(); }
     /* SPI2 generated MSP initializes DMA handles; enable its clock, but runtime
-     * IMU acquisition uses SPI interrupts only, no DMA buffers/cache changes.
-     * All blocking sensor setup happens while motor power is still OFF. */
+     * IMU acquisition uses SPI interrupts only, no DMA buffers/cache changes. */
     __HAL_RCC_DMA1_CLK_ENABLE();
+}
+
+static void init_yummy_imu(void)
+{
     /* UART10: PE2 RX / PE3 TX, YummyIMU factory 921600/8N1 USE output.
      * Receive only via BSP IT; no commands or changes to the module's flash. */
     MX_USART10_UART_Init();
@@ -148,12 +135,18 @@ int main(void)
     if (HAL_UART_Init(&huart10) == HAL_OK) {
         (void)YummyIMU_Init(&huart10, YUMMY_IMU_USE);
     }
-    g_fault_stage = YLAMP_STAGE_IMU_INIT;
+}
+
+static void init_bmi088(void)
+{
     MX_SPI2_Init();
     /* IMU is optional for the saved-reference drag mode. Failure leaves it
      * unavailable (calibration status/op10), not a successful zero capture. */
     if (BMI088_Port_Init() == HAL_OK) { (void)BMI088_Init(); }
-    g_fault_stage = YLAMP_STAGE_CAN_INIT;
+}
+
+static void init_board_transport(void)
+{
     MX_FDCAN1_Init();
     if (BSP_CAN_Init(&hfdcan1) != BSP_CAN_OK) { Error_Handler(); }
     /* V1.2 needs two independent buses. The generated RAM offsets are 0/853
@@ -163,7 +156,10 @@ int main(void)
     /* Existing SDK port selects HSI48, IRQ priority 5, embedded FS PHY, no DMA.
      * No generated usb_device.c/cdc_if.c or reference C++ application is used. */
     (void)BSP_USB_Init();
-    g_fault_stage = YLAMP_STAGE_MOTOR_INIT;
+}
+
+static void init_motor_devices(void)
+{
     for (unsigned i = 0U; i < MOTOR_CAN_JOINT_COUNT; ++i) {
         if (DM_Motor_Init(&g_motor_can_config[i], &motors[i]) != BSP_CAN_OK) {
             Error_Handler();
@@ -183,21 +179,60 @@ int main(void)
     }
     (void)USBTelemetry_Init(usb_sources, MOTOR_CAN_JOINT_COUNT,
         USB_TELEMETRY_PERIOD_MS, USB_TELEMETRY_MAX_AGE_MS, HAL_GetTick());
+}
+
+static void power_motors_and_wait(void)
+{
     /* 用户确认：CAN1/PC14（VCC_OUT0）、CAN2/PC13（VCC_OUT1）电源联动。
      * 两路 EN 同次置高，不改变前面已开启的对外5V/PC15。
      * 上电先只读角度，Task 不因收到反馈就使能，不自动拉回区间外的关节。 */
-    /* External W25Q64: JEDEC/read-only scan before motor power. Absence is
-     * reported by history diagnostics, not an excuse to enable/recover. */
-    FiveHistory_Init();
     if (BSP_POWER_SetMotorPower(true) != HAL_OK) { Error_Handler(); }
     const uint32_t powered_at_ms = HAL_GetTick();
     while (HAL_GetTick() - powered_at_ms < 1000U) {
         (void)BSP_KEY_Scan(HAL_GetTick()); /* 丢弃供电稳定阶段的按键动作。 */
         HAL_Delay(1U);
     }
-    if (!FiveControl_Init(motors,HAL_GetTick()) || JointCalibration_Init()!=BSP_CAN_OK) { Error_Handler(); }
+}
+
+static void init_control_services(void)
+{
+    if (!FiveControl_Init(motors, HAL_GetTick()) || JointCalibration_Init() != BSP_CAN_OK) {
+        Error_Handler();
+    }
     MotorUSB_Init();
+}
+
+static void ylamp_init(void)
+{
+    YlampFault_Boot();
+    init_mcu();
+    init_board_gpio();
+
+    /* UART10/YummyIMU 的共享对外 5V 开机常开，独立于电机电源。 */
+    if (BSP_POWER_Set(BSP_POWER_EXT_5V, true) != HAL_OK) { Error_Handler(); }
+    init_board_io();
+
+    /* 阻塞式传感器初始化必须在电机供电前完成。 */
+    init_yummy_imu();
+    g_fault_stage = YLAMP_STAGE_IMU_INIT;
+    init_bmi088();
+
+    g_fault_stage = YLAMP_STAGE_CAN_INIT;
+    init_board_transport();
+    g_fault_stage = YLAMP_STAGE_MOTOR_INIT;
+    init_motor_devices();
+    /* External W25Q64: JEDEC/read-only scan before motor power. Absence is
+     * reported by history diagnostics, not an excuse to enable/recover. */
+    FiveHistory_Init();
+    LookaroundStore_Init(); /* Dedicated preset scan, no program/erase or autoplay. */
+    power_motors_and_wait();
+    init_control_services();
     g_fault_stage = YLAMP_STAGE_SCHEDULER;
+}
+
+int main(void)
+{
+    ylamp_init();
     Ylamp_StartScheduler();
     Error_Handler();
 }

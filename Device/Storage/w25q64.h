@@ -3,6 +3,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 enum { W25Q64_SIZE=0x800000U, W25Q64_SECTOR=4096U, W25Q64_PAGE=256U };
+typedef enum { W25Q64_HISTORY=1, W25Q64_LOOKAROUND=2 } W25Q64_Owner;
+/* Same application thread only. Hold across WIP and suspended erases, not
+ * just the short SPI transfer. An unavailable owner is never preempted. */
+bool W25Q64_TryLock(W25Q64_Owner owner);
+void W25Q64_Unlock(W25Q64_Owner owner);
+#ifdef YLAMP_HOST_FIXTURES
+void W25Q64_ResetLockForTest(void);
+#endif
 /* One owner; no chip erase, QE/parameter writes, resets or busy-wait loops.
  * The caller must check WIP/SUS and own the addressed storage partition. */
 bool W25Q64_Init(void);

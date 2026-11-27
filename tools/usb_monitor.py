@@ -14,7 +14,8 @@ import math
 import struct
 import time
 from contextlib import contextmanager
-from dm_serial import FOCUS_SAMPLE, LENGTHS
+from dm_serial import (FOCUS_SAMPLE, LENGTHS, TRAJ_ACK, TRAJ_RESULT, MOTION_STATE,
+                       PRESET_ACK, PRESET_STATE, PRESET_DATA, valid_v1_length)
 
 HEADER = struct.Struct("<2sBBIIHBB")
 RECORD = struct.Struct("<BBBBHHIIfffBBBB")
@@ -121,7 +122,7 @@ class Stream:
 
     def messages(self, data):
         """Multiplex unchanged YL snapshots and CRC-protected RPC responses."""
-        # Carry <=212 bytes; consume incoming data in bounded 4096-byte chunks.
+        # Carry <=250 bytes; consume incoming data in bounded 4096-byte chunks.
         for offset in range(0, len(data), 4096):
             self.buffer.extend(data[offset:offset + 4096])
             while self.buffer:
@@ -137,8 +138,9 @@ class Stream:
                     break
                 total = self.buffer[4] + 7 if rpc else 48
                 if rpc and not (self.buffer[2] == 1
-                    and self.buffer[3] in (0x92, 0x91, 0x93, FOCUS_SAMPLE)
-                    and self.buffer[4] == LENGTHS[self.buffer[3]]):
+                    and self.buffer[3] in (0x92, 0x91, 0x93, FOCUS_SAMPLE,
+                                           TRAJ_ACK, TRAJ_RESULT, MOTION_STATE, PRESET_ACK, PRESET_STATE, PRESET_DATA)
+                    and valid_v1_length(self.buffer[3], self.buffer[4])):
                     self.malformed += 1
                     del self.buffer[0]
                     continue

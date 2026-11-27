@@ -77,6 +77,42 @@ bool FiveMIT_PrepareInBox(FiveMIT_Plan *p,const FiveMIT_Box *box,const double fr
     return prepare_checked(p,from,to,seconds,0);
 }
 
+static bool sample_reference(const FiveMIT_Reference *r,const FiveMIT_State *x,
+                              const FiveMIT_Axis profile[5],FiveMIT_Output *out)
+{
+    if (!r || !x || !profile || !out) { return false; }
+    float q[5],tau[5];
+    FiveMIT_Output next={0};
+    for (int i=0;i<5;++i) {
+        const FiveMIT_Axis *cfg=&profile[i];
+        if (!isfinite(x->software_deg[i]) || !isfinite(x->raw_rad[i]) ||
+            fabsf(x->raw_rad[i])>g_motor_can_config[i].pmax ||
+            !isfinite(x->velocity_rad_s[i]) || fabsf(x->velocity_rad_s[i])>g_motor_can_config[i].vmax ||
+            !isfinite(r->position_deg[i]) || !isfinite(r->velocity_rad_s[i]) ||
+            fabsf(r->velocity_rad_s[i])>g_motor_can_config[i].vmax ||
+            !isfinite(r->acceleration_rad_s2[i]) ||
+            !isfinite(cfg->coulomb_nm) || cfg->coulomb_nm<0 ||
+            !isfinite(cfg->viscous_nm_s_rad) || cfg->viscous_nm_s_rad<0 ||
+            !isfinite(cfg->smooth_rad_s) || cfg->smooth_rad_s<=0 ||
+            !isfinite(cfg->model_max_nm) || cfg->model_max_nm<=0) { return false; }
+        q[i]=(float)((x->software_deg[i]+cfg->cad_offset_deg)*RAD);
+        next.motor[i]=(DM_Motor_MIT_Command_t){
+            .position_rad=(float)(x->raw_rad[i]+(r->position_deg[i]-x->software_deg[i])*RAD),
+            .velocity_rad_s=r->velocity_rad_s[i], .kp=cfg->kp, .kd=cfg->kd};
+    }
+    if (!FiveDynamics_Inverse(q,x->velocity_rad_s,r->acceleration_rad_s2,tau)) { return false; }
+    for (int i=0;i<5;++i) {
+        const FiveMIT_Axis *cfg=&profile[i]; const float v=x->velocity_rad_s[i];
+        DM_Motor_MIT_Command_t *c=&next.motor[i];
+        c->torque_ff_nm=tau[i]+cfg->viscous_nm_s_rad*v+
+            (cfg->coulomb_nm!=0 ? cfg->coulomb_nm*tanhf(v/cfg->smooth_rad_s) : 0);
+        const float predicted=c->kp*(c->position_rad-x->raw_rad[i])+c->kd*(c->velocity_rad_s-v)+c->torque_ff_nm;
+        if (!isfinite(predicted) || fabsf(predicted)>cfg->model_max_nm ||
+            DM_Motor_EncodeMIT(&g_motor_can_config[i],c,&next.frame[i])!=BSP_CAN_OK) { return false; }
+    }
+    *out=next;return true;
+}
+
 bool FiveMIT_Sample(const FiveMIT_Plan *p,double elapsed,const FiveMIT_State *x,
                     const FiveMIT_Axis profile[5],FiveMIT_Output *out)
 {
@@ -102,36 +138,14 @@ bool FiveMIT_Sample(const FiveMIT_Plan *p,double elapsed,const FiveMIT_State *x,
             dds=(ending ? -1 : 1)*30*z*z*w*w/(ramp*span);
         }
     }
-    float q[5],acc[5],tau[5];
-    FiveMIT_Output next={0};
+    FiveMIT_Reference reference;
     for (int i=0;i<5;++i) {
-        const FiveMIT_Axis *cfg=&profile[i];
-        if (!isfinite(x->software_deg[i]) || !isfinite(x->raw_rad[i]) ||
-            fabsf(x->raw_rad[i])>g_motor_can_config[i].pmax ||
-            !isfinite(x->velocity_rad_s[i]) || fabsf(x->velocity_rad_s[i])>g_motor_can_config[i].vmax ||
-            !isfinite(cfg->coulomb_nm) || cfg->coulomb_nm<0 ||
-            !isfinite(cfg->viscous_nm_s_rad) || cfg->viscous_nm_s_rad<0 ||
-            !isfinite(cfg->smooth_rad_s) || cfg->smooth_rad_s<=0 ||
-            !isfinite(cfg->model_max_nm) || cfg->model_max_nm<=0) { return false; }
         const double delta=p->end_deg[i]-p->start_deg[i];
-        const double goal=t==1?p->end_deg[i]:p->start_deg[i]+s*delta;
-        q[i]=(float)((x->software_deg[i]+cfg->cad_offset_deg)*RAD);
-        acc[i]=(float)(RAD*delta*dds);
-        next.motor[i]=(DM_Motor_MIT_Command_t){
-            .position_rad=(float)(x->raw_rad[i]+(goal-x->software_deg[i])*RAD),
-            .velocity_rad_s=(float)(RAD*delta*ds), .kp=cfg->kp, .kd=cfg->kd};
+        reference.position_deg[i]=t==1 ? p->end_deg[i] : p->start_deg[i]+s*delta;
+        reference.velocity_rad_s[i]=(float)(RAD*delta*ds);
+        reference.acceleration_rad_s2[i]=(float)(RAD*delta*dds);
     }
-    if (!FiveDynamics_Inverse(q,x->velocity_rad_s,acc,tau)) { return false; }
-    for (int i=0;i<5;++i) {
-        const FiveMIT_Axis *cfg=&profile[i]; const float v=x->velocity_rad_s[i];
-        DM_Motor_MIT_Command_t *c=&next.motor[i];
-        c->torque_ff_nm=tau[i]+cfg->viscous_nm_s_rad*v+
-            (cfg->coulomb_nm!=0 ? cfg->coulomb_nm*tanhf(v/cfg->smooth_rad_s) : 0);
-        const float predicted=c->kp*(c->position_rad-x->raw_rad[i])+c->kd*(c->velocity_rad_s-v)+c->torque_ff_nm;
-        if (!isfinite(predicted) || fabsf(predicted)>cfg->model_max_nm ||
-            DM_Motor_EncodeMIT(&g_motor_can_config[i],c,&next.frame[i])!=BSP_CAN_OK) { return false; }
-    }
-    *out=next;return true;
+    return sample_reference(&reference,x,profile,out);
 }
 
 bool FiveMIT_SpeedFrictionTorque(unsigned axis,float reference,float nominal_g,
@@ -166,15 +180,11 @@ bool FiveMIT_SpeedFrictionTorque(unsigned axis,float reference,float nominal_g,
     *out=torque;return true;
 }
 
-bool FiveMIT_SampleFeedback(const FiveMIT_Plan *p,double elapsed,const FiveMIT_State *x,
-                            const float support_g[5],FiveMIT_Output *out)
+static bool feedback(FiveMIT_Output *next,double elapsed,const FiveMIT_State *x,
+                      const float support_g[5],unsigned speed_mask,FiveMIT_Output *out)
 {
-    if (!support_g || !out || !isfinite(g_five_tracking_ramp_s) ||
-        g_five_tracking_ramp_s<0) { return false; }
-    FiveMIT_Output next;
-    FiveMIT_Axis active[5];memcpy(active,g_five_mit_hw,sizeof active);
-    for (unsigned i=0;i<5;++i) { active[i].model_max_nm=g_five_mit_tracking[i].max_nm; }
-    if (!FiveMIT_Sample(p,elapsed,x,active,&next)) { return false; }
+    if (!support_g || !out || !isfinite(elapsed) || elapsed<0 ||
+        !isfinite(g_five_tracking_ramp_s) || g_five_tracking_ramp_s<0) { return false; }
     float q[5],nominal_g[5],bending[5];
     for (unsigned i=0;i<5;++i) {
         q[i]=(float)((x->software_deg[i]+g_five_mit_hw[i].cad_offset_deg)*RAD);
@@ -183,13 +193,15 @@ bool FiveMIT_SampleFeedback(const FiveMIT_Plan *p,double elapsed,const FiveMIT_S
     const float blend=g_five_tracking_ramp_s>0 ?
         (float)quintic_progress(elapsed/g_five_tracking_ramp_s) : 1.f;
     for (unsigned i=0;i<5;++i) {
-        DM_Motor_MIT_Command_t *cmd=&next.motor[i];
+        DM_Motor_MIT_Command_t *cmd=&next->motor[i];
         const FiveMIT_Tracking *gain=&g_five_mit_tracking[i];
-        const bool speed_axis=p->cruise_ramp_s>0 && p->end_deg[i]!=p->start_deg[i];
+        const bool speed_axis=(speed_mask&(1U<<i))!=0;
         const float kp=speed_axis ? g_five_speed_pi[i].ki : gain->kp;
         const float kd=speed_axis ? g_five_speed_pi[i].kp : gain->kd;
         float friction=0;
-        if (speed_axis && !FiveMIT_SpeedFrictionTorque(i,cmd->velocity_rad_s,
+        /* One TOTAL F for every active reference, including Move/Ruckig.
+         * speed_mask selects PI gains only; held/final v_ref=0 gives F=0. */
+        if (!FiveMIT_SpeedFrictionTorque(i,cmd->velocity_rad_s,
                 nominal_g[i],bending[i],&friction)) { return false; }
         const float error=cmd->position_rad-x->raw_rad[i];
         const float feedback=kp*error+kd*(cmd->velocity_rad_s-x->velocity_rad_s[i]);
@@ -199,7 +211,30 @@ bool FiveMIT_SampleFeedback(const FiveMIT_Plan *p,double elapsed,const FiveMIT_S
         if (!isfinite(kp) || kp<0 || !isfinite(kd) || kd<0 ||
             !isfinite(support_g[i]) || !isfinite(cmd->torque_ff_nm) ||
             fabsf(cmd->torque_ff_nm)>gain->max_nm ||
-            DM_Motor_EncodeMIT(&g_motor_can_config[i],cmd,&next.frame[i])!=BSP_CAN_OK) { return false; }
+            DM_Motor_EncodeMIT(&g_motor_can_config[i],cmd,&next->frame[i])!=BSP_CAN_OK) { return false; }
     }
-    *out=next;return true;
+    *out=*next;return true;
+}
+static void active_profile(FiveMIT_Axis active[5])
+{
+    memcpy(active,g_five_mit_hw,sizeof(FiveMIT_Axis)*5);
+    for (unsigned i=0;i<5;++i) { active[i].model_max_nm=g_five_mit_tracking[i].max_nm; }
+}
+bool FiveMIT_SampleFeedback(const FiveMIT_Plan *p,double elapsed,const FiveMIT_State *x,
+                            const float support_g[5],FiveMIT_Output *out)
+{
+    FiveMIT_Output next;FiveMIT_Axis active[5];active_profile(active);
+    if (!FiveMIT_Sample(p,elapsed,x,active,&next)) { return false; }
+    unsigned mask=0;
+    for (unsigned i=0;i<5;++i) {
+        if (p->cruise_ramp_s>0 && p->end_deg[i]!=p->start_deg[i]) { mask|=1U<<i; }
+    }
+    return feedback(&next,elapsed,x,support_g,mask,out);
+}
+bool FiveMIT_SampleReferenceFeedback(const FiveMIT_Reference *r,double elapsed,
+    const FiveMIT_State *x,const float support_g[5],FiveMIT_Output *out)
+{
+    FiveMIT_Output next;FiveMIT_Axis active[5];active_profile(active);
+    if (!sample_reference(r,x,active,&next)) { return false; }
+    return feedback(&next,elapsed,x,support_g,0,out);
 }

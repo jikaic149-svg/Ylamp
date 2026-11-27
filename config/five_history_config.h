@@ -1,13 +1,15 @@
 #ifndef YLAMP_FIVE_HISTORY_CONFIG_H
 #define YLAMP_FIVE_HISTORY_CONFIG_H
-/* Board02 W25Q64 journal: 8KiB immediately BEFORE the original IMU-bias
- * sectors 0x7fe000/0x7ff000. Never erase those or any other user's data.
+/* Board02 W25Q64: the five-axis journal owns only 0x7fc000–0x7fdfff.
+ * Do not access or erase any other sectors from this module.
  * A nonempty, unrecognised initial partition is reported, not formatted. */
 #define FIVE_HISTORY_BASE 0x007fc000U
 #define FIVE_HISTORY_BYTES 8192U
-/* Per-axis displacement from the last VERIFIED committed checkpoint.
- * Any axis triggers one five-axis record; small steps accumulate.
- * These are recording thresholds, NOT motion or cold-start gates. */
+/* Encoder phase zero is [0,2*pi): a change of the continuous turn N always
+ * triggers a five-axis checkpoint, without waiting for a displacement.
+ * Keep this extra per-axis displacement checkpoint <180 degrees so startup's
+ * nearest-saved-angle restoration does not become ambiguous during a turn.
+ * These are supplemental recording thresholds, NOT motion or cold-start gates. */
 #define FIVE_HISTORY_STEP_DEG {150.f,150.f,150.f,150.f,150.f}
 /* User-marked CURRENT J4 circle: phase in [0,360), N=-1.
  * Seed only on first acquisition without a compatible saved checkpoint,

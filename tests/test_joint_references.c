@@ -70,6 +70,8 @@ int main(void)
     assert(fabsf(after - before) < 0.001f);
     assert(isnan(JointCoordinates_Reference(NAN, 0, 1)));
     assert(isnan(JointCoordinates_Reference(0, 1, -1)));
+    const float raw = 3.11f, anchor = -3.17f;
+    assert(fabsf(raw + JointCoordinates_Offset(raw, anchor) - anchor) < .01f);
     assert(MOTOR_CAN_JOINT_COUNT == 5U);
     puts("Joint references: five measured windows / calibrated multiturn J1 PASS");
     return 0;

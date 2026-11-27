@@ -4,8 +4,17 @@
 
 ## 当前版本
 
-- **F447阻抗阶段已工程接受并上传origin/main**：主体提交`5cfe0aed1dd466f9496c936c745388f8ac666621`归档30个代码/参数/测试/MuJoCo模型工具/记录文件，普通快进推送并ls-remote核验一致；上传回执另存同分支文档，最新tip见git log。35/35C、47/47Python和F447镜像门禁再过，不重复回正测试或虚构全域精度通过。build/原始数据/固件备份保留本地，未改控制逻辑/参数/连板运动，后续联动仍为建议，见[进度](process.md)与[日档](history/2026-11-24/process.md)。
-- **F447让步版已烧录，写后及独立运行完整回读通过**：[当前固件](build/v12-impedance-yield-20261124/ylamp_v12_five_axis.bin)172228B/SHA `F4471B4FDE0ABD91151BF8B11FDDFACC278D0AB9DCF6E354873AC9A8B72A0C44`，UID/旧859D verify/1MiB备份/两份全回读均过，一次必要SYSRESETREQ后running，不再追问托稳。77048～77080ms三份IMPEDANCE/31/31/31/fault0/limited2，J2预计PD正常让步非故障；test0/j3_read_used=false，DHCSR前后0x01010001/CFSR-HFSR0。本代理未cold/read-j3/ACK/使能/失能/运动或抢COM；Kp/G/原总预算/中心/KEY不变，PD[1,1,.4,.3,.25]Nm及分轴Kd已生效。[40例仿真](build/v12-impedance-yield-20261124/return_check_02.json)不当实机保证，双侧1°/2°与手力仍待手测，见[进度](process.md)和[日档](history/2026-11-24/process.md)。
+- **当前实板：3830 相对起点张望版，已部署并完整回读。** 已删除固定首点 ±3° 条件；健康 `DRAG` 下按 KEY 捕获本次五轴当前位置，32 点按 `q_key + (q_template - q_template_first)` 整体平移，沿原 Ruckig/主动输出与原行程、速度、加速度、jerk、预算及故障检查执行。正常结束/再次 KEY 取消后仍进入 `IDLE`，`IDLE` 按 KEY 回 `DRAG`，USB 断开不取消本地播放。W25Q64 原 32 点未重写，已跨本次必要复位重新加载、逐字节核验，sequence1/flags3/errors0。最新[部署回执](build/v12-lookaround-relative-arm-20261127/deployment_01/result.json)为新 boot `DEGRADED/27/27/0/fault1`、旧 J3 count0，未自动取 J3/ACK/启控或播放；烧录前 B214 的健康 DRAG 和固定窗口阻断仅为历史。实体 KEY 播放、跟踪和物理断电重启尚未验收，详见 [process.md](process.md)。
+
+- **新增普通Move／Ruckig摩擦前馈候选7CCF，尚未烧录**：用户明确“那你加上摩擦前馈”后，公共主动反馈复用现有总F一次，参考速度定方向、零速/持姿F0，Speed不重复叠加；G/M/C、各模式增益、预算、KEY/手拖和退出不改。[候选](build/v12-active-friction-20261125/ylamp_v12_five_axis.bin)276588B/SHA `7CCFA50B329320ED7A5344DF7CBE4B6AB03E1A04136256A7C266B338712800DB`，35/35C、58项Python及ARM/主动F镜像门禁通过。[MuJoCo复现](build/v12-stutter-20261125/candidate01/report.json)9情景+2例1ms步长检查，以滑动F作干摩擦代理、同real01参考/生产软件PD，隔离G误差时J2/J3同编码平台268/236→10/8ms；代理不是实测静摩擦，不能宣称真机已解决。现板最后证实仍下面8A7D、接口断开后运行/供电未知，本轮无COM/SWD/刷写/恢复/运动；[对照图](build/v12-stutter-20261125/candidate01/comparison.png)及[日档](history/2026-11-25/process.md)。
+- **当前8A7D已烧录、原J3/ACK各一次恢复并完成首轮Ruckig实测**：[结果](build/v12-ruckig-waypoints-20261125/real01/results.json)14状态/16.4s，含末保持至交G17.957s后回健康DRAG；非准备含保持RMS[1.296,.796,1.459,.931,.614]°、采样峰值[1.963,1.674,2.693,1.644,1.199]°、末误差[+1.345,+.411,−.697,+1.452,−.480]°，不作全程≤2°或手感验收。15828反馈/152状态无fault/limited，最后596548ms健康DRAG/31/31/31/J3count149314；之后COM36及ST-Link均无法打开/未枚举，硬件当前状态未知，不把断开当固件崩溃，也未取得测试后栈/独立SWD复读。不自动重刷/再次唤醒/播放/调参，见[进度](process.md)与[日档](history/2026-11-25/process.md)。
+- **五轴Ruckig已接入并部署，拖拽/阻抗/主动仍独立**：[新规划模式](Mode/five_trajectory.cpp)使用本地Ruckig0.19.6、五轴同步、16组q/v/a通过状态、有限v/a/jerk，整段上传/预计算后500Hz直接采样；中间点不强制停下，启动捕获实测q/v（a未知置0）、末v/a0，实际段时长按2ms量化并回读。[固件](build/v12-ruckig-waypoints-20261125/ylamp_v12_five_axis.bin)276588B/SHA `8A7D6FE2E4D2E905AFC4245BFB7D1100BB786D52D38D77F143A44C3BEA90A63E`，35/35C、41项Python/ARM门禁及21组物理/增益/预算表核对通过；写前备份、写后及运行/运动前全镜像回读通过。主机append RTT1.861～2.038ms、commit1.811ms不是MCU WCET；同编码观测仍有停滞迹象，不因换库宣称卡顿消除/全局路径最优。G/F/M/C/软件力控/主动增益/KEY/拖拽/预算/原退出不改，普通Move/Ruckig仍未新增Speed专用F。
+- **前版7243连续实测已归档，非本次8A7D结果**：[旧固件](build/v12-continuous-interpolation-20261125/ylamp_v12_five_axis.bin)179452B/SHA `7243F6993167462E0814CBB3D03676A2B17DC1C839E8FEA762BC71FD7FEC2412`，UID/旧7B32/1MiB备份/三次完整应用回读过。27节点一次装载/板端500Hz C2参考16.4s，含保持至交G17.938s后回DRAG；[实测](build/v12-continuous-interpolation-20261125/continuous_real01/results.json)末目标−实际[+1.607,+.083,−.652,+1.189,−.633]°、J3采样峰值2.734°，用户仍否定卡顿/灵活性；36/36C、38项相关Python、ARM80步/门禁及8201点插值核对不作手感验收。该历史boot最后546856ms健康DRAG及J3/ACK已用不覆盖当前新boot，原数据/源快照保留。
+- **real03真机9段及独立统计复核归档，非顶部7B32效果**：[实测结果](build/v12-happy-motion-20261124/real03/results.json)非准备窗口最大|误差|J1～J5[2.569,2.002,2.512,3.923,1.204]°，末保持目标−实际均值[+2.569,+.083,−.702,+.257,−.832]°。23999反馈/163状态、9份真实MCU计划、56请求全ACK、无故障/限幅/坏帧/不完整；有27快照缺口，动作内最大源观测间隔32ms，不作连续峰值/无超调证明。独立参考/CSV重建差≤5.69e−14°，23:06那个D4DC boot运行后为健康DRAG、当次参数未改；不覆盖顶部7B32本boot的新恢复状态或证明新Kp效果。J4此前停点仍偏2.7～3.9°，不能用末态+.26°当全程合格。此次为含段间CAD等待的慢速分段实测，非连续5.2s预览精确复刻；原real03不可重放，旧[未启动失败](build/v12-happy-motion-20261124/real02/results.json)保留，见[日档](history/2026-11-24/process.md)。
+- **D4DC冻结；MuJoCo第二版已按要求放大回应摆幅2倍**：[最新视频](build/v12-happy-preview-20261124/v2_amplitude2x_01/ylamp_happy_v2.mp4)只放大J2/J3/J5两次回应，首波参考增量4/6.4/5.4°；转向/抬头/停顿、5.2s时长、80/120ms身体跟随、起终姿不变，不重加首版被否定的左右往返。新窗口标注x2.0，R重播；2601物理采样无警告/越界/SDF接触/仿真夹限，156帧全解码，J5实测仿真首波增量比约2.000006。[工具](tools/preview_mujoco_happy.py)新增`--amplitude 2`（仅回应倍率，1为原v2），新目录输出、不覆盖旧版；[XML](build/v12-happy-preview-20261124/v2_amplitude2x_01/ylamp_happy_v2.xml)/状态须配套播放器，渲染是500Hz物理审计状态回放。仅参数化原生MIT PD+接受G+名义M*a+C预览，非MCU主动/KEY让步完整复刻，未验证真实非线性摩擦/时延/电流环/线束，未训练/未驱动真机；用户增加摆幅请求不当情绪表达验收。[D4DC](build/v12-history-zero-cross-20261124/ylamp_v12_five_axis.bin)及G/F/名义M/C/手感/范围/退出不改，新δJ留档未部署；该仿真轮未读/驱动硬件，后续实板状态以首条为准。详见[进度](process.md)与[日档](history/2026-11-24/process.md)。
+- **烧录后旧boot历史归档，非顶部当前状态**：当时J4 raw−187.171895°按原启动合法分支回选为连续/存档+172.828115°（历史N0、raw→reference偏移+1圈），不是主机强改存档或机械圈数验收；READY|LOADED/seq57/writes1/errors0/saved31/restored27、1282ms提交，J3当时缺反馈。之后新boot五轴已正常，当前J4 raw/连续+170.975945°、offset0，本轮测试后history seq63/writes6/errors0。旧约350.71°分支变化也满足原150°条件，不能当新过零独立实测通过；旧seq55/56来源及掉电物理验证仍保留，见[日档](history/2026-11-24/process.md)。
+- **F447阻抗阶段已工程接受并上传origin/main**：主体提交`5cfe0aed1dd466f9496c936c745388f8ac666621`归档30个代码/参数/测试/MuJoCo模型工具/记录文件，回执`60b50aabe2d145cee59b147d8ce8e59a0e548e56`亦推送；普通快进并ls-remote核验一致。35/35C、47/47Python和F447镜像门禁再过，不重复回正测试或虚构全域精度通过。build/原始数据/固件备份保留本地；新加速度任务的预检不自动提交推送，不改已接受手感，见[进度](process.md)与[日档](history/2026-11-24/process.md)。
+- **前版F447让步版部署归档，参数由D4DC原样继承**：[旧固件](build/v12-impedance-yield-20261124/ylamp_v12_five_axis.bin)172228B/SHA `F4471B4FDE0ABD91151BF8B11FDDFACC278D0AB9DCF6E354873AC9A8B72A0C44`，当时UID/旧859D verify/1MiB备份/两份全回读均过，77048～77080ms三份健康IMPEDANCE/31/31/31/fault0/limited2，J2预计PD正常让步。该旧boot状态不覆盖顶部D4DC新测健康DRAG；用户已手测工程接受其手感，PD[1,1,.4,.3,.25]Nm及分轴Kd由新固件逐字节保留。原40例仿真/备份/诊断不改，不重复验收或自动恢复，见[日档](history/2026-11-24/process.md)。
 - **前版859D部署/核验已归档，非当前镜像；明确烧录不再问托稳的约定保留**：[旧固件](build/v12-impedance-soft-20261124/ylamp_v12_five_axis.bin)172100B/SHA `859D78208BE90CEF2E8318E8851D535D8BEF1AA6A0974601F4057EE4D28F8B04`，当时35/35C、47/47Python及79步ARM/门禁、UID/旧6307 verify/1MiB备份及全回读通过，三份39868～39900ms为那个boot健康IMPEDANCE/31/31/31/fault0/limited0。该版只降Kp30%、Kd/总预算不改，后续用户仍硬反馈已由上条F447独立PD/分轴阻尼承接；旧记录不作当前状态/恢复许可/精度验收。
 - **前版6307远程原生阻抗/静态核验已归档，非当前镜像**：[旧固件](build/v12-impedance-test-20261124/ylamp_v12_five_axis.bin)172108B/SHA `6307C01FCA08C3EDB7509CEBDECC404AB20A787292B7CB77F03A687C258AD70E`。当时UID/旧D366 verify/1MiB备份及全回读通过，那个boot原取J3/ACK各一次已用；35/35C、46/46Python、79步ARM/门禁、19原表保护通过。原v1为1s坡/2s停×4=12s、自动入口2°非KEY手动角度门槛；当前859D已继承v2且软化。30s/60s手托静态及TX非零增益、有限CAD预检、末584074ms健康DRAG均是旧记录，不作新镜像精度验收或当前模式，也不自动续跑旧±1°计划。详见[进度](process.md)和[11-24日档](history/2026-11-24/process.md)。
 - **前版D366与其旧只读检测已归档，并非当前镜像**：[旧固件](build/v12-support-budget150-20261123/ylamp_v12_five_axis.bin)170476B/SHA `D36642ED087B191832D354C16C375F7420185A898A7473CB3C74E15FAD5BBAE7`。当时UID/旧ADFC verify/1MiB备份及回读通过、旧J3/ACK各一次后健康DRAG；859478ms六份只读DRAG/TX全零增益只表示旧boot未触发KEY。该版无远程入口的问题现由上条6307新增入口承接，不再要求现场KEY才能采集；原数据/SHA/恢复记录保留。其G[.6,4.5,2.7,1.2,.6]/KEY[1.5,4.5,2.7,1.2,.6]/拖拽[1,4.5,2.7,1.2,.6]Nm和Kp/Kd全由6307继承；旧“无远程接口/待重新烧录/必须KEY”不覆盖当前状态，见[11-23日档](history/2026-11-23/process.md)。
@@ -59,20 +68,68 @@
 | [Device/](Device/) | 电机协议、BMI088、YummyIMU及遥测设备层 |
 | [Model/](Model/) | 五轴几何、工作区及名义动力学 |
 | [Mode/](Mode/) | 五轴轨迹、重力/阻抗支撑及独立手动拖动模式 |
-| [Task/](Task/) | 唯一控制所有者 `FiveControl`、发送及USB接口 |
+| [Task/](Task/) | 单轮运行编排、五轴控制、发送、位置存档、标定与 USB |
 | [Algorithm/](Algorithm/) | 项目既有算法；不能将旧双轴公式直接当五轴结果 |
 | [config/](config/) | 电机映射、软件零点、CAD偏置、行程及补偿配置 |
 | [tests/](tests/) | HAL替身行为测试及离线数值回归 |
 | [tools/](tools/) | 上位机、离线辨识、图形/几何复核和镜像门禁 |
 | [cmake/](cmake/) / [CMakeLists.txt](CMakeLists.txt) | 原生主机及GNU ARM构建 |
+| [simulation/](simulation/) | 可复用的 MuJoCo 模型；仿真运行产物仍在 `build/` |
 | [history/](history/) | 原文按日归档，及保留的 `mit_20261107/` 早期材料 |
 | `build/` | 构建、实测、拟合、烧前备份混合存储；不能整体当缓存清理 |
+| [../output/](../output/) | 独立交付、离线截图和导出文件，不作为固件构建目录 |
 
-`result.json`是已忽略的无关切片导出，不是固件或测试结果；本轮保留原位。不改工作区的CAD、URDF、分享包和工具状态目录。
+整机机械基准为 [Ylamp-V1.2/](../Ylamp-V1.2/)，[V1.1/](../Ylamp-V1.1/) 仅作旧版参考；[URDF 包](<../Ylamp-URDF-package(1)/>)与 [PCB/](../PCB/) 各自保留。孤立的[切片元数据](../output/slicer-result.json)不参与固件构建或实测；旧 [F405 CMake 配置产物](build/f405-board-test-20261115/)仅留存，不作为可续用的构建目录。
+
+### 运行任务
+
+[App/rtos.c](App/rtos.c) 只创建一个应用线程 `YlampControl`，每 1 ms 调用
+[control_step.c](Task/control_step.c) 中的 `Ylamp_ControlStep()`；五轴控制按自己的 2 ms 门控运行。
+另有 FreeRTOS 内核自动创建的空闲线程，没有独立的 IMU、存档或 USB 线程。
+
+| `Task/` 模块 | 职责 |
+| --- | --- |
+| [control_step.c](Task/control_step.c) | 一轮内依次处理五轴、按键、两路 IMU、标定、USB 和必要的指示灯更新。 |
+| [five_control.c](Task/five_control.c) / [five_mit_send.c](Task/five_mit_send.c) | 管理反馈、模式、故障和五轴输出；发送模块负责提交主动运动命令。 |
+| [five_history.c](Task/five_history.c) | 维护连续角和圈号，在五轴输出后推进位置存档。 |
+| [joint_calibration.c](Task/joint_calibration.c) | 标定观测、IMU 采集开关和标记。 |
+| [motor_usb.c](Task/motor_usb.c) / [motor_telemetry.c](Task/motor_telemetry.c) | USB 命令、回复及观测；后者仅保留当前协议使用的 CRC。 |
+
+### 五轴控制模式
+
+| 可选模式 | 状态 | 实现职责 |
+| --- | --- | --- |
+| 纯重力支撑 | `IDLE` | [five_support.c](Mode/five_support.c) 只输出重力补偿力矩；不保持位置，不叠加拖动助力或阻尼。 |
+| 手动拖动 | `DRAG` | [five_drag.c](Mode/five_drag.c) 在重力支撑上加入 J1/J2 拖动助力和阻尼。 |
+| 阻抗保持 | `IMPEDANCE` | [five_support.c](Mode/five_support.c) 保持进入时的姿态；阻抗测试是其子流程。 |
+| 主动运动 | `MOTION` → `POSITION` | [five_mit.c](Mode/five_mit.c) 算控制输出，[five_trajectory.cpp](Mode/five_trajectory.cpp) 处理 Ruckig 多点轨迹。普通 Move、单轴 Speed 和多点轨迹共用主动运动生命周期；`POSITION` 表示轨迹时间结束后继续保持终点，不是独立模式或到位证明。 |
+
+[FiveControl](Task/five_control.c) 统一处理模式切换、反馈检查和输出提交。`WAIT` 是等待状态；故障时维持 `DEGRADED`，撤销主动输出，只按原故障策略保留可提交的重力支撑。显式 `ACK` 通过原检查后才回 `DRAG`。
+
+板载 RGB 每 500 ms 显示当前状态：蓝＝等待，绿＝纯重力，青＝手动拖动，黄＝阻抗，白＝普通主动运动，橙＝轨迹结束后保持端点，红＝故障（优先显示）。按 KEY 后，左右张望真正进入播放才替换为紫色；只准备轨迹或检查拒绝时不亮紫色。正常结束或健康期间取消后回到纯重力绿灯。
+
+### W25Q64 左右张望预设
+
+[lookaround.json](config/lookaround.json) 是从原始 30 Hz CSV 首个 8 秒周期每 8 帧取样的 32 点模板（含静止入场点与减速收尾点），保留原摆幅、1.5 倍时长与名义 16 秒，不只是对旧 10 点重复细分。新相对起点版在 KEY 接受时捕获当前五轴软件角 `q_key`，逐点使用 `q_target = q_key + (q_template - q_template_first)`，首点和末点目标均为本次捕获点；v/a 和相对毫秒不变。原模板角只表示动作形状，不再要求手动摆到 `[131,-1,19,116,14]°` 附近，首点 ±3° 检查已从新源码删除。每次触发重新捕获，准备和播放期间原点不跟随反馈漂移。原 32 点线格式/FNV 不变，无须因此重写 W25Q64。
+
+与 USB 主动运动共用同一个 `trajectory_start()`、`FiveTrajectory`、Ruckig 五轴同步、逐轴行程/v/a/jerk 检查及 `FiveMIT_SendReference` 输出。平移后的每个点和段内极值仍须通过原检查，不裁剪越界目标、不扩大机械范围；输入实测 q/v 规划首段，不增加全轴静止门槛。中间点保留速度和加速度，不逐点停稳；段时长仍是下限。正常结束/KEY 取消/USB 本地所有权/故障交接不变；“末点回起点”是规划目标，不是实际精确到位保证。各版部署状态见顶部和 `process.md`。
+
+[LookaroundStore](Task/lookaround_store.c) 独占 `0x7fa000～0x7fbfff` 两个 4 KiB 槽，位置历史 `0x7fc000～0x7fdfff` 不动。64 B 版本/坐标签名/序号/长度/CRC32/FNV/提交头和每点 64 B 显式小端数据；先写正文并完整读回、再提交并完整读回，重启选择最新有效槽。非空陌生槽不擦除。无有效预设时 KEY 拒绝播放，不用内置旧点兜底。开机在电机供电前只读加载；播放前分拍预计算，运行时只采样 RAM 中的 Ruckig 缓存。32 段规划状态放 CPU 专用 AXI SRAM，不引入 heap、线程、另一条 CAN 输出或自动恢复。
+
+工具 [lookaround_preset.py](tools/lookaround_preset.py) 的 `save` 仅上传与保存，绝不启动运动；必须提供全分区烧前备份及完整读回的新路径：
+
+```text
+python tools/lookaround_preset.py status --port COM36
+python tools/lookaround_preset.py save --port COM36 --preset config/lookaround.json --backup build/.../preset_before.bin --readback build/.../preset_after.bin
+```
+
+原 USB 会话/CRC/序号/500 ms 时效保留；新能力 `op16/field246=0x594c5001`。`0x1c/0x1d/0x1e` 的 BEGIN/POINT/SAVE 复用运动三种布局，但使用独立 preset_id，绝不调用运动 START；`0x1f` 只读状态，`0x20` 只读此 8 KiB 分区，保存 ACK 丢失仅查询、不重发。响应 `0x9c/0x9f` 为 40 B，`0xa0` 为 244 B。USB 运动批量能力升级 `0x594c4202`，状态 244 B 可带 32 个 knot_ms；Python 仍可读取旧 `0x594c4201` 的 180 B 状态。J3 继续用旧 MIT 命令应答取数，存储命令不取 J3、不使能或 ACK。
+
+`five_control.py --port COM36 idle` 选择 `IDLE`，对应原 op16 field7，状态编码 `1` 不变；旧记录的 `GRAVITY` 是同一输出。该命令可以取消当前动作或保持，不会使能、失能或清错。旧双轴模式与临时 J3 反向试验已移除；单次旧 J3 反馈获取未改。
 
 ## 五轴公式与坐标
 
-权威参数为 [joint_references.def](config/joint_references.def)、[five_coordinates.h](config/five_coordinates.h)、[five_mit.c](config/five_mit.c)。原始反馈不归零；当前5221沿用 [five_history.c](Task/five_history.c)连续参考：`q_reference = phase_[0,2π) + 2π*N`，raw保留用于诊断，零点/CAD不变，原生MIT目标直接用驱动raw而非连续参考。当前J4按用户“不减1圈”取N0，raw/连续及存档均+181.860699°，不是永久锁圈；本次J2 raw约−219.389°到连续+140.611°须加360°，这个raw映射整数+1不能混作历史N2（仍0）。启动历史恢复后按合法范围重选的通用优先级问题尚未重构，不能宣称任何存档分支都会无条件保留；运行中不把真实越界折回窗口。
+权威参数为 [joint_references.def](config/joint_references.def)、[five_coordinates.h](config/five_coordinates.h)、[five_mit.c](config/five_mit.c)。原始反馈不归零；沿用 [five_history.c](Task/five_history.c)连续参考：`q_reference = phase_[0,2π) + 2π*N`，raw保留用于诊断，零点/CAD不变，原生MIT目标直接用驱动raw而非连续参考。历史5221阶段J4按用户“不减1圈”取N0，raw/连续及存档均+181.860699°，不是永久锁圈；当时J2 raw约−219.389°到连续+140.611°须加360°，这个raw映射整数+1不能混作历史N2（仍0）。后续F447的seq56负存档与候选部署状态以前述顶部/当前进度为准，不沿用该旧快照。启动历史恢复后按合法范围重选的通用优先级问题本轮未改，不能宣称任何存档分支都会无条件保留；运行中不把真实越界折回窗口。
 
 ```text
 theta_i = raw_reference_rad[i] - zero_rad[i]
@@ -89,7 +146,9 @@ J3此式为原完整`1.18*G_CAD3−.01*cos(theta3)`乘一次1.0825531721890982�
 
 ## 上位机与控制边界
 
-五轴历史：配置见 [five_history_config.h](config/five_history_config.h)。首次获得某轴有效位置即触发，之后任一轴相对最近成功记录变化默认150°时保存五轴快照；30°默认已取消，150°是当前可调实现值而非用户指定。参考板外部W25Q64仅使用`0x7fc000～0x7fdfff`，不动原IMU的`0x7fe000/0x7ff000`或MCU程序Flash。顺序追加64B记录、CRC与末尾提交标记、回读确认后才更新“已保存”；写中断电保留旧有效记录，后台旧扇区擦除可挂起以优先写新记录，不在控制环等待擦写完成。首次发现陌生非空分区不自动格式化。无芯片/存储故障有独立诊断，不自动使能或锁死电机；首条实机提交回读已过，但不承诺最大写入延迟或所有掉电场景。
+五轴历史：配置见 [five_history_config.h](config/five_history_config.h)。首次获得某轴有效位置即触发；新源码按用户要求在编码器单圈相位跨0°/360°、连续圈号`floor(q_reference/2π)`变化时提交五轴快照，不必走满150°。原150°只作为辅助检查点保留，使原“最近已保存角”上电恢复不因同圈内走过180°而含糊；op16 field18的step仍表示该辅助距离，并非过零门槛。使用连续参考判断，因此原始驱动角仅整圈重编号不触发；软件关节零位也不等于编码器零点。五轴存档只使用板载 W25Q64 的 `0x7fc000～0x7fdfff`，不访问其他扇区，也不写 MCU 程序 Flash。保留64B记录/原版本与配置签名、CRC/提交标记/回读确认、后台擦除挂起及非阻塞写入，兼容原存档；检测到过零即进入原异步提交流程，不声称检测瞬间Flash已落盘，写途中断电仍依原完整记录恢复。首次发现陌生非空分区不自动格式化，无存储异常自动使能/锁死策略；新增触发目前尚未部署实测，不承诺所有掉电场景。
+
+IMU 不参与正常五轴控制；Ylamp 没有运行时 IMU 校准数据的 Flash 读写。标定系数是编译常量，临时标记只在 RAM。
 
 当前版可用`python code/tools/five_control.py --port COM36 history`读取连续角、单圈相位、圈号、已保存位置与存储标志（使用原控制SESSION，不在已有轨迹期间另开）。普通USB raw遥测/CSV含义不变；它们不是连续角GUI，主动采样需用`--continuous-reference`。内部Flash链接区仍1MiB，历史使用板外芯片。最新ready/sequence5/errors0/saved31/restored31/writes_this_boot1，J4 N0、连续及存档+146.490510°；本轮未额外重启做断电保持实验，不把写后读回当所有掉电场景通过。
 
@@ -98,11 +157,14 @@ J3此式为原完整`1.18*G_CAD3−.01*cos(theta3)`乘一次1.0825531721890982�
 | [five_control.py](tools/five_control.py) | 五轴控制会话、状态、显式旧协议J3入口和采样协议 |
 | [j3_pitch_monitor.py](tools/j3_pitch_monitor.py) / [.cmd](tools/j3_pitch_monitor.cmd) | 统一五轴反馈＋BMI088/Yummy双Pitch，两个对照图、一个CSV；开始/暂停只采集，不启停电机，不再支持--joint切换 |
 | [usb_monitor.py](tools/usb_monitor.py) | USB普通五轴快照和公共解码/组包；原专用FD适配器工具已移除 |
+| [check_v12_image.py](tools/check_v12_image.py) / [v12_flash_checked.tcl](tools/v12_flash_checked.tcl) / [v12_read_board.tcl](tools/v12_read_board.tcl) | 镜像门禁、受检查的烧录流程和板端回读；构建或测试不调用烧录入口 |
 | [five_gravity_sweep.py](tools/five_gravity_sweep.py) | 显式主动采样，同步记录全部五轴实际姿态 |
 | [five_global_friction_scan.py](tools/five_global_friction_scan.py) | 冻结5D788的全角度单受载批次；连续参考、原速度PI、逐腿实际计时，默认不启控/清错 |
 | [fit_pitch_zero.py](tools/fit_pitch_zero.py) | 统一CSV默认分别拟合J2/BMI与J3/Yummy，按源计数去重；兼容历史单轴CSV |
 | [five_gravity_residual_report.py](tools/five_gravity_residual_report.py) | 既有数据的离线重力/摩擦分析，不授权部署 |
-| [urdf_collision/](tools/urdf_collision/) | CAD/仿真/工作区验证工具，不能代替实物或碰撞验收 |
+| [urdf_collision/](tools/urdf_collision/) | 碰撞检查在 PC 端离线运行：[网格相交](tools/urdf_collision/check.mjs)、[轨迹采样复查](tools/urdf_collision/workspace_geometry.py)。当前固件只检查逐轴行程，不执行几何碰撞检查。 |
+
+旧双轴在线采集入口 `dm_identify.py` 已移除。[dm_fit_identification.py](tools/dm_fit_identification.py) 和旧参数仅用于历史数据，不是五轴工具；[dm_monitor.py](tools/dm_monitor.py) 和 `dm_serial.py` 仍被当前五轴工具引用，继续保留。
 
 已结项的首次 J1/J2 加速度采样和旧姿态专项复核不再提供当前入口。原始记录和离线拟合仍保留；历史脚本需用当时的源码与镜像复现，不作为当前固件的操作步骤。
 
@@ -110,18 +172,35 @@ J3是旧协议，失能静默不等于通信坏；仅走唯一所有者的显式
 
 冷启动没有五轴角度区间准入：ColdStart、KEY、旧J3取数及ACK使用`observe(false)`，纯G也不检查记录行程。`joint_references.def`的上下限同时用于坐标分支与主动轨迹检查，不是冷启动窗口；J4的−180°～350°为用户给定原始编码器运动行程。主动Move/Speed的`observe(true)`及目标1°余量与冷启动是不同条件，不能以“删除冷启动区间”名义一并删除零点、坐标换算或主动行程。新请求尚未明确取消主动运动行程。
 
-轻拖动入口：`five_control.py --port COM36 --seconds 120 --log <新JSONL路径> drag`，120秒内保留该控制会话，正常结束显式交回G；不要另开控制会话。op16的scope0/field251查询能力`0x594C4401`，field15/value`0x44524147`显式进入，phase新增DRAG=7，原phase取值及field7退出保持。客户端先核能力，不对旧固件盲发入口；不会自行使能或清故障。C1D0及BC90两轮300秒试用均已正常结束，参数仍保存在固件中，退G不删除拖动模型。J1手感比例不是新摩擦辨识系数，更不是J1/J2重力修正；无测力的人手拖动数据不能直接当无接触G标签。
+历史 C1D0/BC90 轻拖动：`five_control.py --port COM36 --seconds 120 --log <新JSONL路径> drag` 保留该控制会话，正常结束显式交回纯重力（当前命名为 `IDLE`）；不要另开控制会话。op16的scope0/field251查询能力`0x594C4401`，field15/value`0x44524147`显式进入，DRAG=7，field7退出保持。客户端先核能力，不对旧固件盲发入口；不会自行使能或清故障。C1D0及BC90两轮300秒试用均已正常结束，退出不删除拖动模型。J1手感比例不是新摩擦辨识系数，更不是J1/J2重力修正；无测力的人手拖动数据不能直接当无接触G标签。
 
 统一观测版本为 `0x594C5002`，模式0正常/1开始/2暂停，旧3/4拒绝；100Hz目标、40ms独立新鲜阈值，213字节一帧（206字节payload），保留每路源时间/计数，不声称硬同步。新J4版本实采800帧/100Hz，五轴和Yummy全部新鲜，BMI预热后286帧新鲜，暂停静默通过；这是通信/静态观测验收，不是物理零点或重力模型验证。本次未启动/关闭旧GUI，COM36已正常取得；主动采样时由单一工具独占。CSV沿用 `build/j3-pitch-capture/five_pitch_*.csv`。
 
 主动采样期间不要另开COM36状态/控制会话：会话交接可能取消轨迹。`POSITION`只表示轨迹计时结束并继续反馈保持，不是实际到位证明。删除小角度/Move静止门槛的源码已随本次镜像部署，但没有新增运动验收；行程、力矩、失联及温度处理仍保留。
+
+### 多点运动 USB 批量协议（源码候选）
+
+连接后用旧 `op16/scope0/field247` 查询能力 `0x594C4201`；旧板明确回复不支持时才改走旧入口。新旧入口共用原轨迹校验、Ruckig 和 2 ms 输出环。主机先暂存、验证末条 ACK 的点数及整轨迹 FNV-1a 校验值，再单独显式启动；上传本身不启动。每路点从 16 次请求降为 1 次；14 点的路点上传从 224 次降为 14 次，不含建会话、开始暂存和启动。
+
+沿用原帧头、CRC16 和 8 字节会话。表中长度为 payload，不含 7 字节帧开销；整数和 IEEE 754 binary32 均小端。每个请求以 `session[8], id:u32` 开头，前三种再带 `tick_ms:u32`（近期板时）。
+
+| 请求 | 紧随公共字段的内容 | 回包 |
+|---|---|---|
+| `0x18` BEGIN · 17 B | `count:u8`（1–16）；请求 ID 成为计划 ID | `0x98` ACK · 24 B |
+| `0x19` POINT · 85 B | `plan_id:u32, index:u8`（从 0 开始），再跟 `at_ms:u32, q[5], v[5], a[5]`；单位 ms、软件度、rad/s、rad/s² | `0x98` ACK · 24 B |
+| `0x1A` START · 24 B | `plan_id:u32, checksum:u32`；仅允许启动本会话中同 ID、点数完整、校验值一致的计划 | `0x99` RESULT · 180 B |
+| `0x1B` QUERY · 12 B | 无；查询使用独立 ID，不改变写命令序号 | `0x9A` STATE · 180 B |
+
+回包均回显会话、请求 ID 和返回码。ACK 带已存点数、目标点数、轨迹标志、计划 ID 和累计校验值；RESULT/STATE 共用布局，带控制阶段、掩码、故障、板时、重力、轨迹标志与点数、计划/启动 ID、校验值、实际起点 q/v 和生效路点时刻。它们在同一次应用线程轮询中生成，不等于各轴 CAN 源同一时刻采样；启动回包也不证明控制环已经发出首帧。
+
+一条逻辑帧可以跨 USB 分包和应用轮询，上位机仍逐条等回包。仅当启动请求已完整写入、但等不到回包时，客户端用原会话只查一次是否仍在执行同一计划/启动 ID/校验值；否则报告未确认，不重发或重连。原退出策略和镜像门禁不变；[实测脚本](tools/five_continuous_motion.py) 的既有镜像及回读绑定没有切换到这个未部署的候选。
 
 ## 构建与验证
 
 在 `code/` 运行；需要CMake 3.22+、Ninja和可运行的本机GCC。Windows须保证编译器及其运行库在PATH。Python数值测试需要NumPy，硬件工具另需串口依赖；本轮不安装依赖。
 
 ```powershell
-cmake -S . -B build/host -G Ninja -DBSP_HOST_TEST=ON -DYLAMP_J3_REVERSE_TEST=ON
+cmake -S . -B build/host -G Ninja -DBSP_HOST_TEST=ON
 cmake --build build/host
 ctest --test-dir build/host --output-on-failure
 python -B -m unittest discover -s tests -p "test_five*.py"
@@ -135,7 +214,7 @@ python -B -m unittest discover -s tests -p "test_five*.py"
 python tools/check_v12_image.py <候选ELF> <同版BIN>
 ```
 
-GNU ARM工具须可用；含临时反向测试的构建加 `--j3-reverse-test` 核对相应链路。结构门禁通过不代表获准烧录、使能或运动；仍需核对UID、现场出力/承托、烧前备份、全镜像写后回读与实物验收。
+GNU ARM工具须可用。结构门禁通过不代表获准烧录、使能或运动；仍需核对UID、现场出力/承托、烧前备份、全镜像写后回读与实物验收。
 
 ## 实测与构建产物
 
@@ -143,7 +222,7 @@ GNU ARM工具须可用；含临时反向测试的构建加 `--j3-reverse-test` �
 
 | 本地位置（均在 `build/`） | 归属 |
 |---|---|
-| `v12-impedance-test-20261124/` | 当前6307 ELF/BIN、完整备份/回读；两轮手托静态阻抗与实际TX核验、五轴只读有限预检，尚无自动往返运动数据 |
+| `v12-impedance-test-20261124/` | 历史6307 ELF/BIN、完整备份/回读；当时两轮手托静态阻抗与实际TX核验、五轴只读有限预检 |
 | `j2-pitch-capture/` / `j3-pitch-capture/` | 原始手扫CSV；J2旧Roll误选文件保留但不用于Pitch标定 |
 | `pitch-zero-ls-20261119_01/fit.json` | J2/J3零点拟合、条件置信区间及假设 |
 | `v12-gravity-identify-tracking-20261119/j2_sweep_05.jsonl` | J2双向健康窗口及回扫故障，序列无完整end |
@@ -151,7 +230,7 @@ GNU ARM工具须可用；含临时反向测试的构建加 `--j3-reverse-test` �
 | `v12-no-motion-rest-gate-20261119/gravity_residual_02.json` | 探索性共享势能拟合；不能按文件名当已部署模型 |
 | `v12-no-motion-rest-gate-20261119/gravity_sine_quality_20261120_01.json` | 条件正弦质量及幅相区间，不是正确概率 |
 | `v12-j2-gravity-candidate-20261120/` | 之前未烧录J2候选，保留作对照 |
-| `v12-usb-unified-20261120/` | 当前已部署2AA07A27…ELF/BIN；`deploy_20261121_01/`含烧前备份和普通运行中验收，3C728955…旧镜像仍留原目录 |
+| `v12-usb-unified-20261120/` | 历史2AA07A27…ELF/BIN；`deploy_20261121_01/`含烧前备份和普通运行中验收，3C728955…旧镜像仍留原目录 |
 
 不可重建的CSV/JSONL、用户确认、标定结果、板端回读和烧前备份均保持原位。是否清理可重建的CMake/目标文件，须另行明确范围，不能用目录名或体积推断可删除。
 
@@ -159,9 +238,9 @@ GNU ARM工具须可用；含临时反向测试的构建加 `--j3-reverse-test` �
 
 ## 历史索引
 
-以下为原 `process.md` 的330条记录：按标题明确日期归档，保留原时区、正文及同日原顺序，不按修改时间猜日期。旧相对路径仍以 `code/` 为基准。最新有效状态只看 [process.md](process.md)。
+早期 `process.md` 的330条记录按原标题日期归档，保留时区、正文和同日顺序；此后按日追加。旧快照中的相对路径仍以 `code/` 为基准，最新有效状态只看 [process.md](process.md)。
 
-| 日期 | 迁入原条目数 | 原文 |
+| 日期（主机 UTC+08） | 迁入条目数或后续主题 | 原文 |
 |---|---:|---|
 | 2026-11-08 | 78 | [process.md](history/2026-11-08/process.md) |
 | 2026-11-09 | 40 | [process.md](history/2026-11-09/process.md) |
@@ -177,7 +256,8 @@ GNU ARM工具须可用；含临时反向测试的构建加 `--j3-reverse-test` �
 | 2026-11-21 | 新增部署记录 | [process.md](history/2026-11-21/process.md) |
 | 2026-11-22 | 摩擦候选部署/五轴支撑验收 | [process.md](history/2026-11-22/process.md) |
 | 2026-11-23 | 补偿结项/原生阻抗/仿真与预算部署 | [process.md](history/2026-11-23/process.md) |
-| 2026-11-24 | 远程原生阻抗试验入口、6307部署与手托静态核验 | [process.md](history/2026-11-24/process.md)，纽约仍为11-23 |
+| 2026-11-24 | 远程阻抗、过零保存、加速度验证与分段动作 | [process.md](history/2026-11-24/process.md) |
+| 2026-11-25 | 7243/8A7D 部署与轨迹实测、7CCF 候选、整理前进度原文 | [process.md](history/2026-11-25/process.md)，对应纽约 11-24 |
 
 整理前3298行README全文也保存在 [2026-11-20日档](history/2026-11-20/process.md) 的原文快照区；这是本次归档时间，不是把旧章节重新标成今天。原文SHA-256及保全核对记录一并保留，旧流程只用于历史查证。
 

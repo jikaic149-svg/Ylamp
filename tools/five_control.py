@@ -9,23 +9,60 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from dm_serial import encode, SESSION, SESSION_ACK, RELIABLE_REQUEST, RELIABLE_RESPONSE
+from dm_serial import TRAJ_BEGIN, TRAJ_POINT, TRAJ_START, MOTION_QUERY, TRAJ_ACK, TRAJ_RESULT, MOTION_STATE
 from usb_monitor import Collector, Stream, serial_port
 
-PHASE = ("WAIT", "GRAVITY", "MOTION", "POSITION", "DEGRADED", "IMPEDANCE", "REVERSE_J3", "DRAG")
+PHASE = ("WAIT", "IDLE", "MOTION", "POSITION", "DEGRADED", "IMPEDANCE", "REVERSE_J3", "DRAG")
+PURE_GRAVITY_PHASES = ("IDLE", "GRAVITY")  # Also accept the phase in archived captures.
 EXPECTED = [(i, 2 if i <= 2 else 1, int(i == 3), i, 0x10+i) for i in range(1, 6)]
 CONTROL_VERSION = 0x594c3501
 CRUISE_VERSION = 0x594c5601
 DRAG_VERSION = 0x594c4402
 HISTORY_VERSION = 0x594c4801
 IMPEDANCE_TEST_VERSION = 0x594c5402
+TRAJECTORY_VERSION = 0x594c5302
+MOTION_BUNDLE_VERSION = 0x594c4202
+INVALID_ARG = 1
+
+
+class RPCRejected(RuntimeError):
+    def __init__(self, action, rc):
+        super().__init__(f"Board rejected {action}: rc={rc}")
+        self.rc = rc
+
+
+class ReplyTimeout(TimeoutError):
+    """Entire request written, but no matching response observed."""
+
+
+def decode_motion(reply):
+    rc, phase, fresh, enabled, submitted, limited, flags, count, expected = reply[12:21]
+    if rc:
+        raise RPCRejected("bundled motion", rc)
+    if (len(reply) not in (180,244) or phase >= len(PHASE) or flags not in (0, 1, 2) or
+            not count <= expected <= (len(reply)-116)//4):
+        raise ValueError("Invalid bundled motion state")
+    tick, fault, age, plan_id, start_id, checksum, start, duration = struct.unpack_from("<8I", reply, 24)
+    active = flags == 2
+    state = dict(phase=PHASE[phase], fresh=fresh, enabled=enabled, submitted=submitted,
+                 limited=limited, fault=fault, tick_ms=tick,
+                 gravity_age_ms=None if age == 0xffffffff else age,
+                 model_gravity_nm=None if age == 0xffffffff else list(struct.unpack_from("<5f", reply, 56)))
+    path = dict(plan_id=plan_id, start_id=start_id, checksum=checksum,
+                count=count, expected=expected, active=active, uploading=flags == 1,
+                start_ms=start, duration_ms=duration,
+                origin_deg=list(struct.unpack_from("<5f", reply, 76)) if active else None,
+                origin_velocity_rad_s=list(struct.unpack_from("<5f", reply, 96)) if active else None,
+                knot_ms=list(struct.unpack_from(f"<{count}I", reply, 116)) if active else None)
+    return state, path
 
 
 def gravity_output_confirmed(state):
-    return state["phase"] == "GRAVITY" and idle_output_confirmed(state)
+    return state["phase"] in PURE_GRAVITY_PHASES and idle_output_confirmed(state)
 
 
 def idle_output_confirmed(state):
-    return (state["phase"] in ("GRAVITY", "DRAG") and
+    return (state["phase"] in (*PURE_GRAVITY_PHASES, "DRAG") and
             state["fresh"] == state["enabled"] == state["submitted"] == 31
             and not state["fault"] and not state["limited"] and state["gravity_age_ms"] is not None
             and 0 <= state["gravity_age_ms"] <= 100)
@@ -35,6 +72,7 @@ class Board:
     def __init__(self, port):
         self.port, self.stream, self.collector = port, Stream(), Collector()
         self.session, self.ident = secrets.token_bytes(8), 0
+        self.query_ident, self.motion_bundle, self._trajectory_plan = 0, False, None
         self.latest = self.at = None
         self.on_feedback = self.last_counts = None
 
@@ -71,7 +109,7 @@ class Board:
             for k, p in self.pump():
                 if k == expected and p.startswith(prefix):
                     return p
-        raise TimeoutError("Board reply absent; outcome unknown, no replay")
+        raise ReplyTimeout("Board reply absent; outcome unknown, no replay")
 
     def connect(self):
         deadline = time.monotonic() + 2
@@ -82,8 +120,17 @@ class Board:
         self.exchange(SESSION, self.session, SESSION_ACK, self.session)
         if self.rpc(255) != CONTROL_VERSION:
             raise ValueError("Wrong five-axis control version")
+        try:
+            version = self.rpc(247)
+        except RPCRejected as exc:
+            if exc.rc != INVALID_ARG:
+                raise
+        else:
+            if version not in (0x594c4201, MOTION_BUNDLE_VERSION):
+                raise ValueError("Unknown bundled motion capability")
+            self.motion_bundle = True
 
-    def rpc(self, field, scope=0, value=0, op=16):
+    def write_prefix(self):
         # RPC responses can split/starve a five-frame telemetry snapshot.
         # Read to completion within the existing I/O budget; never transmit
         # with an old timestamp or replay a request.
@@ -93,15 +140,20 @@ class Board:
                 raise TimeoutError("Stale board time; no request sent")
             self.pump()
         self.ident += 1
-        token = (self.ident - 1) % 255 + 1
         prefix = self.session + struct.pack("<I", self.ident)
-        frame = prefix + struct.pack("<IBBBBI", self.latest["tick_ms"], token, op, scope, field, value)
+        return prefix + struct.pack("<I", self.latest["tick_ms"])
+
+    def rpc(self, field, scope=0, value=0, op=16):
+        header = self.write_prefix()
+        token = (self.ident - 1) % 255 + 1
+        prefix = header[:12]
+        frame = header + struct.pack("<BBBBI", token, op, scope, field, value)
         reply = self.exchange(RELIABLE_REQUEST, frame, RELIABLE_RESPONSE, prefix)
         seq, rc, sc, f, val = struct.unpack_from("<BBBBI", reply, 12)
         if (seq, sc, f) != (token, scope, field):
             raise ValueError("Reply mismatch")
         if rc:
-            raise RuntimeError(f"Board rejected op={op} scope={scope} field={field}: rc={rc}")
+            raise RPCRejected(f"op={op} scope={scope} field={field}", rc)
         return val
 
     def scalar(self, field, joint, op=16):
@@ -128,6 +180,9 @@ class Board:
         self.rpc(13, value=milliseconds)
 
     def status(self):
+        if self.motion_bundle:
+            state, _ = self.motion_query()
+            return dict(state, telemetry=self.latest)
         flags = self.rpc(0)
         phase, fresh, enabled, submitted = flags.to_bytes(4, "little")
         fault, age, limited = self.rpc(1), self.rpc(2), self.rpc(3)
@@ -147,6 +202,101 @@ class Board:
         if self.rpc(249) != IMPEDANCE_TEST_VERSION:
             raise ValueError("Firmware has no matching native-impedance test capability")
         self.rpc(22, value=0x494d4954)
+
+    def trajectory_upload(self, points):
+        """Stage all q/v/a knots, verify count/hash; never starts or retries."""
+        from five_trajectory import FIELDS, pack_point, normalize_points, trajectory_hash
+        points = normalize_points(points)  # Validate EVERYTHING before any I/O.
+        if self.motion_bundle:
+            self._trajectory_plan = None
+            checksum = trajectory_hash(points)
+            header = self.write_prefix()
+            plan_id = self.ident
+            self.trajectory_ack(TRAJ_BEGIN, header, bytes((len(points),)), plan_id, 0, len(points))
+            for index, point in enumerate(points):
+                body = struct.pack("<IB", plan_id, index) + pack_point(point)
+                stored = self.trajectory_ack(TRAJ_POINT, self.write_prefix(), body,
+                                             plan_id, index+1, len(points))
+            if stored != checksum:
+                raise ValueError("Complete trajectory upload/hash unconfirmed; no commit")
+            self._trajectory_plan = plan_id, checksum
+            return points
+        if self.rpc(248) != TRAJECTORY_VERSION:
+            raise ValueError("Firmware has no matching preloaded five-axis Ruckig trajectory")
+        self.rpc(34, value=len(points))
+        for count, point in enumerate(points, 1):
+            for derivative, name in enumerate(FIELDS):
+                for joint, value in enumerate(point[name], 1):
+                    self.rpc(30+derivative, scope=joint,
+                             value=struct.unpack("<I", struct.pack("<f", value))[0])
+            if self.rpc(33, value=point["at_ms"]) != count:
+                raise ValueError("Stored knot count differs; no commit")
+        status = self.trajectory_status()
+        if (status["count"] != len(points) or status["expected"] != len(points) or
+                not status["uploading"] or status["active"] or
+                status["checksum"] != trajectory_hash(points)):
+            raise ValueError("Complete trajectory upload/hash unconfirmed; no commit")
+        return points
+
+    def trajectory_ack(self, kind, header, body, plan_id, count, expected):
+        reply = self.exchange(kind, header + body, TRAJ_ACK, header[:12])
+        rc, stored, total, flags, accepted_plan, checksum = struct.unpack_from("<4B2I", reply, 12)
+        if rc:
+            raise RPCRejected("trajectory upload", rc)
+        if (stored, total, flags, accepted_plan) != (count, expected, 1, plan_id):
+            raise ValueError("Stored trajectory identity/count differs; no commit")
+        return checksum
+
+    def motion_query(self):
+        # Distinct reply type and ID namespace. Safe even with a missing write ID.
+        self.query_ident += 1
+        prefix = self.session + struct.pack("<I", self.query_ident)
+        return decode_motion(self.exchange(MOTION_QUERY, prefix, MOTION_STATE, prefix))
+
+    def trajectory_start(self):
+        """One explicit commit; no enable/clear/reset/retry."""
+        if self.motion_bundle:
+            if self._trajectory_plan is None:
+                raise ValueError("No verified bundled plan to start")
+            plan_id, checksum = self._trajectory_plan
+            header = self.write_prefix()
+            start_id = self.ident
+            self._trajectory_plan = None
+            try:
+                reply = self.exchange(TRAJ_START, header + struct.pack("<II", plan_id, checksum),
+                                      TRAJ_RESULT, header[:12])
+            except ReplyTimeout:
+                # Check the exact accepted start while this plan still owns the path.
+                # No reconnect, sequence repair or second write.
+                try:
+                    _, path = self.motion_query()
+                except (ReplyTimeout, RPCRejected) as exc:
+                    raise TimeoutError("Trajectory start outcome unknown; no replay") from exc
+            else:
+                _, path = decode_motion(reply)
+            if (not path["active"] or path["uploading"] or
+                    (path["plan_id"], path["start_id"], path["checksum"]) != (plan_id, start_id, checksum)):
+                raise RuntimeError("Trajectory start outcome unconfirmed; no replay")
+            return path
+        self.rpc(35, value=0x53504c4e)
+        status = self.trajectory_status()
+        if not status["active"] or status["uploading"]:
+            raise RuntimeError("Trajectory commit outcome unconfirmed; no replay")
+        return status
+
+    def trajectory_status(self):
+        if self.motion_bundle:
+            return self.motion_query()[1]
+        flags = self.rpc(36)
+        active = bool(flags & (1 << 17))
+        return dict(count=flags & 255, expected=(flags >> 8) & 255,
+                    uploading=bool(flags & (1 << 16)), active=active,
+                    start_ms=self.rpc(37), duration_ms=self.rpc(38), checksum=self.rpc(39),
+                    origin_deg=[self.scalar(40, j) for j in range(1, 6)] if active else None,
+                    origin_velocity_rad_s=[self.scalar(42,j) for j in range(1,6)]
+                        if active else None,
+                    knot_ms=[self.rpc(41,scope=k) for k in range(1,(flags & 255)+1)]
+                        if active else None)
 
     def impedance_test(self, joint, offset_deg):
         """One target-timed native cycle; return duration, never retry/enable."""
@@ -199,6 +349,8 @@ class Board:
 
     def observe_transition(self, previous):
         # RPC acceptance and the control tick that publishes the phase are asynchronous.
+        if any(phase in previous for phase in PURE_GRAVITY_PHASES):
+            previous = (*previous, *PURE_GRAVITY_PHASES)
         deadline = time.monotonic() + .1
         state = self.status()
         while (state["phase"] in previous and not state["fault"] and not state["limited"]
@@ -216,11 +368,8 @@ def main():
                    help="mark ONLY an independently verified run with no external contact/support load")
     p.add_argument("--seconds", type=float, default=1, help="capture duration after request")
     sub = p.add_subparsers(dest="action", required=True)
-    for name in ("status", "gravity", "acknowledge", "drag", "history"):
+    for name in ("status", "idle", "acknowledge", "drag", "history"):
         sub.add_parser(name)
-    reverse = sub.add_parser("reverse-j3", help="optional supported 600 ms direction comparison, no enable")
-    reverse.add_argument("--supported", action="store_true", required=True,
-                         help="operator is continuously supporting the arm for this short comparison")
     cold = sub.add_parser("cold", help="supported cold commissioning only")
     cold.add_argument("--supported-all-off", action="store_true", required=True,
                       help="operator confirms arm is unloaded on independent support and all drives are known OFF")
@@ -233,13 +382,11 @@ def main():
     a = p.parse_args()
     if not math.isfinite(a.seconds) or not 0 <= a.seconds <= 300:
         p.error("--seconds: 0..300")
-    if a.action == "reverse-j3" and (not a.log or a.seconds < 1):
-        p.error("reverse-j3 requires --log and --seconds >= 1")
     if a.action == "read-j3" and (not a.log or a.seconds < 1):
         p.error("read-j3 requires --log and --seconds >= 1")
     if a.action == "move" and (not all(map(math.isfinite, a.degrees)) or not 100 <= a.ms <= 120000):
         p.error("invalid trajectory")
-    if a.free_space and (not a.log or a.action not in ("status", "gravity", "move")):
+    if a.free_space and (not a.log or a.action not in ("status", "idle", "move")):
         p.error("--free-space needs --log and a measurement run")
     with a.log.open("x", encoding="utf8") if a.log else nullcontext(None) as log:
         def note(**obj):
@@ -263,7 +410,7 @@ def main():
                 if initial["phase"] != "WAIT" or initial["enabled"] or initial["fault"]:
                     raise ValueError("Not a cold start")
                 b.rpc(9, value=0x434f4c44)
-            elif a.action == "gravity":
+            elif a.action == "idle":
                 b.rpc(7)
             elif a.action == "acknowledge":
                 b.rpc(8)
@@ -279,14 +426,8 @@ def main():
                 if b.rpc(253) != 0x594c4a01:
                     raise ValueError("No matching legacy-J3 acquisition capability")
                 b.rpc(11, scope=3, value=0x4a335244)  # Explicit once; ACK is not feedback.
-            elif a.action == "reverse-j3":
-                if not gravity_output_confirmed(initial):
-                    raise ValueError("Reverse comparison needs healthy five-axis pure gravity first")
-                if b.rpc(254) != 0x594c3301:
-                    raise ValueError("No matching J3 comparison capability")
-                b.rpc(10, scope=3, value=0x4a335256)  # Exactly once, never replay/extend.
             elif a.action == "move":
-                if initial["phase"] not in ("GRAVITY", "DRAG", "POSITION") or initial["fault"] or initial["limited"]:
+                if initial["phase"] not in (*PURE_GRAVITY_PHASES, "DRAG", "POSITION") or initial["fault"] or initial["limited"]:
                     raise ValueError("All axes must already have healthy support")
                 if initial["phase"] == "DRAG" and b.rpc(251) != DRAG_VERSION:
                     raise ValueError("Firmware has no persistent manual-idle capability")
@@ -295,14 +436,19 @@ def main():
             if history is not None:
                 note(stage="history", **history)
             note(stage="rpc_accepted", action=a.action)
-            if a.action == "gravity":
-                print("Gravity/trajectory-cancel request ACK; verifying actual output.", flush=True)
+            if a.action == "idle":
+                print("IDLE request ACK; verifying pure-gravity output.", flush=True)
             deadline = time.monotonic() + a.seconds + (a.ms/1000 if a.action == "move" else 0)
-            state = b.observe_transition(("GRAVITY", "POSITION")) if a.action in ("move", "drag") else b.status()
-            reverse_seen = False
+            if a.action == "idle":
+                state = b.observe_transition(("DRAG", "MOTION", "POSITION", "IMPEDANCE"))
+                if initial["phase"] == "DRAG" and gravity_output_confirmed(state):
+                    note(stage="test_gravity", **state)
+            elif a.action in ("move", "drag"):
+                state = b.observe_transition(("IDLE", "POSITION"))
+            else:
+                state = b.status()
             while True:
                 note(stage="sample", **state)
-                reverse_seen |= state["phase"] == "REVERSE_J3"
                 if a.action == "move" and (state["fault"] or state["enabled"] != 31 or state["fresh"] != 31
                                            or state["phase"] not in ("MOTION", "POSITION")):
                     raise RuntimeError("Five-axis move interrupted; see capture")
@@ -334,7 +480,7 @@ def main():
                     raise RuntimeError("Five-axis gravity handover unconfirmed; no retry")
                 if initial["phase"] == "DRAG":
                     b.drag()
-                    state = b.observe_transition(("GRAVITY",))
+                    state = b.observe_transition(("IDLE",))
                     note(stage="manual_handover", **state)
                     if state["phase"] != "DRAG" or not idle_output_confirmed(state):
                         raise RuntimeError("Manual-idle handover unconfirmed; no retry")
@@ -343,10 +489,10 @@ def main():
             if history is not None:
                 state["history"] = b.history()
             print(json.dumps(state, allow_nan=False))
-            if a.action == "reverse-j3" and (not reverse_seen or not gravity_output_confirmed(state)):
-                raise SystemExit("J3 comparison or return to original gravity unconfirmed; no retry.")
-            if a.action in ("gravity", "cold") and not gravity_output_confirmed(state):
-                raise SystemExit("Five-axis gravity output NOT confirmed at end of capture; request not repeated.")
+            if a.action == "idle" and not gravity_output_confirmed(state):
+                raise SystemExit("Five-axis IDLE output NOT confirmed; request not repeated.")
+            if a.action == "cold" and not idle_output_confirmed(state):
+                raise SystemExit("Five-axis support NOT confirmed; request not repeated.")
             if a.action == "read-j3" and not (
                     state["fresh"] == state["enabled"] == state["submitted"] == 31 and
                     state["telemetry"]["joints"][2]["received_count"] > 0 and

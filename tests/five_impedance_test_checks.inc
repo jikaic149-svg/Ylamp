@@ -47,7 +47,7 @@ static void test_remote_impedance(void)
     for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
     FiveControl_Tick(test_tick+=2);
     const FiveControl_Status *s=FiveControl_StatusNow();
-    assert(s->phase==FIVE_GRAVITY && !s->fault);
+    assert(s->phase==FIVE_IDLE && !s->fault);
     test_ipsr=1;assert(FiveControl_Impedance()==BSP_CAN_NOT_READY);test_ipsr=0;
     assert(FiveControl_ImpedanceTest(4,1)==BSP_CAN_NOT_READY);
     assert(FiveControl_Impedance()==BSP_CAN_OK);

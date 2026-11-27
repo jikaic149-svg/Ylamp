@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 
 from dm_monitor import JOINT_REFERENCES
-from five_control import EXPECTED
+from five_control import EXPECTED, PURE_GRAVITY_PHASES
 
 
 def assess(pose, line):
@@ -43,7 +43,7 @@ def audit(capture, library):
     if not samples:
         raise ValueError("No controller sample")
     sample = samples[-1]
-    if (sample["phase"] != "GRAVITY" or sample["fault"] or sample["limited"] or
+    if (sample["phase"] not in PURE_GRAVITY_PHASES or sample["fault"] or sample["limited"] or
             any(sample[key] != 31 for key in ("fresh", "enabled", "submitted"))):
         raise ValueError("Capture did not finish with healthy five-axis gravity")
     joints = sample["telemetry"]["joints"]

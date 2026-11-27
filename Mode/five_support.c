@@ -26,9 +26,6 @@ void FiveSupport_Gravity(FiveSupport_State *mode)
     if (mode) {
         mode->impedance=false;
         mode->test_joint=0;
-#ifdef YLAMP_J3_REVERSE_TEST
-        mode->reverse_j3=false;
-#endif
     }
 }
 bool FiveSupport_EnterImpedance(FiveSupport_State *mode,const FiveMIT_State *state)
@@ -95,31 +92,6 @@ void FiveSupport_TestTick(FiveSupport_State *mode,uint32_t now)
     const double offset=leg==0 ? s : leg==2 ? -s : 0;
     mode->anchor_raw_rad[axis]=(float)(mode->test_center_raw_rad+mode->test_offset_rad*offset);
 }
-#ifdef YLAMP_J3_REVERSE_TEST
-bool FiveSupport_EnterReverseJ3(FiveSupport_State *mode,uint32_t now,float gravity_j3_nm)
-{
-    if (!mode || mode->impedance || mode->reverse_j3 || !isfinite(gravity_j3_nm) ||
-        fabsf(gravity_j3_nm)>g_five_j3_reverse.max_nm) { return false; }
-    mode->reverse_started_ms=now;
-    mode->reverse_j3=true;
-    return true;
-}
-void FiveSupport_ApplyReverseJ3(FiveSupport_State *mode,uint32_t now,float torque_nm[FIVE_AXES])
-{
-    if (!mode || !torque_nm || !mode->reverse_j3) { return; }
-    const uint32_t elapsed=now-mode->reverse_started_ms;
-    const FiveSupport_ReverseConfig *cfg=&g_five_j3_reverse;
-    if (mode->impedance || elapsed>=cfg->total_ms || !isfinite(torque_nm[2]) ||
-        fabsf(torque_nm[2])>cfg->max_nm) {
-        mode->reverse_j3=false;
-        return;
-    }
-    const uint32_t edge=elapsed<cfg->total_ms-elapsed ? elapsed : cfg->total_ms-elapsed;
-    const float t=edge<cfg->ramp_ms ? (float)edge/cfg->ramp_ms : 1.f;
-    const float blend=t*t*t*(10.f+t*(-15.f+6.f*t));
-    torque_nm[2]*=1.f-2.f*blend;
-}
-#endif
 bool FiveSupport_Sample(const FiveSupport_State *mode,const FiveMIT_State *state,
                         const float gravity_nm[FIVE_AXES],
                         DM_Motor_MIT_Command_t command[FIVE_AXES],unsigned *limited)

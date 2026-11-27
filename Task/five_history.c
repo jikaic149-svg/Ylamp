@@ -10,7 +10,7 @@
 #define COMMIT 0x434f4d54U
 enum { RECORD=64, SLOTS=W25Q64_SECTOR/RECORD };
 _Static_assert(FIVE_HISTORY_BYTES==2*W25Q64_SECTOR,"two-sector journal");
-_Static_assert(FIVE_HISTORY_BASE+FIVE_HISTORY_BYTES==0x7fe000U,"preserve IMU bias");
+_Static_assert(FIVE_HISTORY_BASE+FIVE_HISTORY_BYTES==0x7fe000U,"five-axis journal end address");
 static struct {
     FiveHistory_Status s;
     struct { float reference,velocity,offset;uint32_t count,at;bool seen; } axis[5];
@@ -123,7 +123,7 @@ void FiveHistory_Init(void)
     h.s.flags|=FIVE_HISTORY_READY;
 }
 #ifdef YLAMP_HOST_FIXTURES
-void FiveHistory_ResetForTest(void) { memset(&h,0,sizeof h); }
+void FiveHistory_ResetForTest(void) { memset(&h,0,sizeof h);W25Q64_ResetLockForTest(); }
 #endif
 
 float FiveHistory_Reference(unsigned i,const DM_Motor_Feedback_t *f)
@@ -197,6 +197,11 @@ static bool due(unsigned mask)
 {
     for (unsigned i=0;i<5;++i) {
         if ((mask&(1U<<i)) && (!(h.s.saved_mask&(1U<<i)) ||
+            /* A real encoder phase-zero crossing changes the continuous N.
+             * Save even a sub-degree crossing; a raw +/-2*pi renumbering
+             * corrected by Reference() does not change N or cause a write. */
+            floorf(h.axis[i].reference/JOINT_TURN_RAD)!=
+                floorf(h.s.saved_rad[i]/JOINT_TURN_RAD) ||
             fabsf(h.axis[i].reference-h.s.saved_rad[i])>=h.s.step_deg[i]*RAD)) { return true; }
     }
     return false;
@@ -212,7 +217,7 @@ static void make_record(uint32_t now,unsigned mask)
     put32(h.image+40,now);put32(h.image+56,crc(h.image,56));
     put32(h.image+60,COMMIT);
 }
-void FiveHistory_Run(uint32_t now)
+static void run(uint32_t now)
 {
     if (!(h.s.flags&FIVE_HISTORY_READY)) { return; }
     uint8_t sr1=0,sr2=0;
@@ -288,4 +293,10 @@ void FiveHistory_Run(uint32_t now)
         if (!W25Q64_Erase(address(h.erase_sector,0))) { failure(FIVE_HISTORY_IO_ERROR);return; }
         h.erase_phase=1;h.erase_at=now;h.s.flags|=FIVE_HISTORY_ERASING;
     }
+}
+void FiveHistory_Run(uint32_t now)
+{
+    if (!(h.s.flags&FIVE_HISTORY_READY) || !W25Q64_TryLock(W25Q64_HISTORY)) { return; }
+    run(now);
+    if (!h.write_phase && !h.erase_phase) { W25Q64_Unlock(W25Q64_HISTORY); }
 }

@@ -317,20 +317,24 @@ static void test_five_mit(void)
     }
     FiveMIT_Output saved=batch;
     memset(x.velocity_rad_s,0,sizeof x.velocity_rad_s);
-    float cq[5],support_g[5],nominal_g[5];const float cv[5]={0};
+    float cq[5],support_g[5],nominal_g[5],bending[5];const float cv[5]={0};
     for (unsigned i=0;i<5;++i) {
         cq[i]=(float)((x.software_deg[i]+g_five_mit_hw[i].cad_offset_deg)*.0174532925199433);
     }
     assert(FiveDynamics_Inverse(cq,cv,cv,nominal_g));
+    assert(FiveDynamics_GravityLoad(cq,nominal_g,bending));
     assert(FiveSupport_GravityModel(cq,(float)(x.software_deg[2]*.0174532925199433),support_g));
     FiveMIT_Output controlled,open_loop;
     assert(FiveMIT_Sample(&p,.1,&x,g_five_mit_hw,&open_loop));
     assert(FiveMIT_SampleFeedback(&p,.1,&x,support_g,&controlled));
     for (unsigned i=0;i<5;++i) {
         const DM_Motor_MIT_Command_t *cmd=&controlled.motor[i];
+        float friction;
+        assert(FiveMIT_SpeedFrictionTorque(i,cmd->velocity_rad_s,
+            nominal_g[i],bending[i],&friction));
         float expected=open_loop.motor[i].torque_ff_nm+support_g[i]-nominal_g[i]+
             g_five_mit_tracking[i].kp*(cmd->position_rad-x.raw_rad[i])+
-            g_five_mit_tracking[i].kd*cmd->velocity_rad_s;
+            g_five_mit_tracking[i].kd*cmd->velocity_rad_s+friction;
         assert(cmd->kp==0 && cmd->kd==0 && fabsf(cmd->torque_ff_nm-expected)<1e-6f);
         assert(g_five_mit_tracking[i].max_nm>=g_five_mit_hw[i].model_max_nm &&
                g_five_mit_tracking[i].max_nm<g_motor_can_config[i].tmax);
@@ -618,11 +622,13 @@ static void assert_gravity_frames(const FiveControl_Status *s,unsigned mask)
 static void test_smooth_control(void)
 {
     assert(FIVE_PERIOD_MS==2U);
-    assert(g_five_mit_tracking[2].kp==5 && g_five_mit_tracking[2].kd==.5f);
-    assert(g_five_mit_tracking[3].kp==3 && g_five_mit_tracking[3].kd==.3f);
+    const float active_kp[5]={30,30,5,6,10};
+    const float active_kd[5]={1,1.5f,.5f,.3f,.5f};
     const float doubled_active_caps[5]={4,10,3.6f,1.6f,.8f};
     const float relaxed_support_caps[5]={.6f,4.5f,2.7f,1.2f,.6f};
     for (unsigned i=0;i<5;++i) {
+        assert(g_five_mit_tracking[i].kp==active_kp[i]);
+        assert(g_five_mit_tracking[i].kd==active_kd[i]);
         assert(g_five_mit_tracking[i].max_nm==doubled_active_caps[i]);
         assert(g_five_mit_hw[i].model_max_nm==relaxed_support_caps[i]);
     }
@@ -642,12 +648,12 @@ static void test_smooth_control(void)
         assert(can_tx_calls==sent+(ms%2==0 ? 5U : 0U));
     }
     assert(s->ticks==500 && can_tx_calls-initial_tx==2500);
-    assert(s->phase==FIVE_GRAVITY && !s->fault && s->submitted==31);
+    assert(s->phase==FIVE_IDLE && !s->fault && s->submitted==31);
     assert_gravity_frames(s,31);
 
     FiveMIT_State x={0};
     double from[5],to[5];
-    float q[5],g[5],nominal[5];const float zero[5]={0};
+    float q[5],g[5],nominal[5],bending[5];const float zero[5]={0};
     for (unsigned i=0;i<5;++i) {
         from[i]=(s->reference_rad[i]-g_joint_reference_config[i].zero_rad)/.01745329251994329577;
         to[i]=from[i];
@@ -657,6 +663,7 @@ static void test_smooth_control(void)
     to[1]+=.2;
     FiveMIT_Plan plan;assert(FiveMIT_Prepare(&plan,from,to,1));
     assert(FiveDynamics_Inverse(q,zero,zero,nominal));
+    assert(FiveDynamics_GravityLoad(q,nominal,bending));
     assert(FiveSupport_GravityModel(q,(float)(from[2]*.01745329251994329577),g));
     FiveMIT_Output active,bare;
     assert(FiveMIT_SampleFeedback(&plan,0,&x,g,&active));
@@ -673,7 +680,10 @@ static void test_smooth_control(void)
             const DM_Motor_MIT_Command_t *cmd=&active.motor[i];
             const float pd=g_five_mit_tracking[i].kp*(cmd->position_rad-x.raw_rad[i])+
                 g_five_mit_tracking[i].kd*(cmd->velocity_rad_s-x.velocity_rad_s[i]);
-            const float expected=bare.motor[i].torque_ff_nm+g[i]-nominal[i]+blends[k]*pd;
+            float friction;
+            assert(FiveMIT_SpeedFrictionTorque(i,cmd->velocity_rad_s,
+                nominal[i],bending[i],&friction));
+            const float expected=bare.motor[i].torque_ff_nm+g[i]-nominal[i]+blends[k]*pd+friction;
             assert(fabsf(cmd->torque_ff_nm-expected)<2e-6f && cmd->kp==0 && cmd->kd==0);
             assert(cmd->position_rad==bare.motor[i].position_rad &&
                    cmd->velocity_rad_s==bare.motor[i].velocity_rad_s);
@@ -691,8 +701,8 @@ static void test_smooth_control(void)
     for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
     FiveControl_Tick(test_tick+=2);
     assert(s->phase==FIVE_MOTION && !s->fault && s->submitted==31);
-    FiveControl_Gravity();FiveControl_Tick(test_tick+=2);
-    assert(s->phase==FIVE_GRAVITY);assert_gravity_frames(s,31);
+    FiveControl_Idle();FiveControl_Tick(test_tick+=2);
+    assert(s->phase==FIVE_IDLE);assert_gravity_frames(s,31);
     assert(FiveControl_Speed(0,.08f,5000,1000)==BSP_CAN_INVALID_ARG);
     assert(FiveControl_Speed(6,.08f,5000,1000)==BSP_CAN_INVALID_ARG);
     assert(FiveControl_Speed(1,NAN,5000,1000)==BSP_CAN_INVALID_ARG);
@@ -712,8 +722,8 @@ static void test_smooth_control(void)
             FiveControl_Tick(test_tick+=2);
             assert(s->phase==FIVE_MOTION && !s->fault && s->submitted==31);
             assert(FiveControl_Speed(axis+1,.08f,5000,1000)==BSP_CAN_NOT_READY);
-            FiveControl_Gravity();FiveControl_Tick(test_tick+=2);
-            assert(s->phase==FIVE_GRAVITY && !s->fault);
+            FiveControl_Idle();FiveControl_Tick(test_tick+=2);
+            assert(s->phase==FIVE_IDLE && !s->fault);
             assert_gravity_frames(s,31);
         }
     }
@@ -748,7 +758,7 @@ static void test_j3_read(const char *variant)
     BSP_CAN_Frame_t expected;
     assert(DM_Motor_EncodeMIT(&g_motor_can_config[2],&neutral,&expected)==BSP_CAN_OK);
     assert(motor_mit_calls[3]==1 && !memcmp(motor_last_mit[3],expected.data,8));
-    if (!strcmp(variant,"cancel")) { FiveControl_Gravity(); }
+    if (!strcmp(variant,"cancel")) { FiveControl_Idle(); }
     if (!strcmp(variant,"tx")) { can_tx_result=HAL_ERROR; }
     for (unsigned elapsed=5;elapsed<=FIVE_ENABLE_TIMEOUT_MS+25;elapsed+=5) {
         for (unsigned i=0;i<5;++i) { if (i!=2) { plant_sample(i,1); } }
@@ -787,9 +797,9 @@ static BSP_CAN_Status_t key_level(bool pressed,unsigned state,const float raw[5]
     for (unsigned k=0;k<5;++k) {
         for (unsigned i=0;i<5;++i) { plant_sample_at(i,state,raw[i]); }
         FiveControl_Tick(test_tick+=5);
-        if (BSP_KEY_Scan(test_tick)==BSP_KEY_EVENT_PRESSED) {
-            ++events; result=FiveControl_KeyPress();
-        }
+        const bool event=BSP_KEY_Scan(test_tick)==BSP_KEY_EVENT_PRESSED;
+        const BSP_CAN_Status_t rc=LookaroundTask_Run(event);
+        if (event) { ++events; result=rc; }
     }
     assert(events<=1);
     return result;
@@ -815,7 +825,7 @@ static void test_key_modes(void)
     assert_gravity_frames(s,31);
     for (unsigned i=1;i<=5;++i) { assert(motor_enable_calls[i]==1 && !motor_disable_calls[i]); }
     (void)key_level(false,1,raw);
-    assert(key_level(true,1,raw)==BSP_CAN_OK);
+    assert(FiveControl_Impedance()==BSP_CAN_OK); /* Remote impedance remains available. */
     float anchor[5];
     for (unsigned i=0;i<5;++i) {
         anchor[i]=s->feedback[i].position_rad;
@@ -843,7 +853,7 @@ static void test_key_modes(void)
     (void)key_level(true,1,raw);
     assert(s->phase==FIVE_DRAG && !s->fault); assert_gravity_frames(s,31);
     (void)key_level(false,1,raw);
-    assert(key_level(true,1,raw)==BSP_CAN_OK); /* Re-enter at the new pose, not the old center. */
+    assert(FiveControl_Impedance()==BSP_CAN_OK); /* Re-enter at the new pose, not the old center. */
     FiveControl_Tick(test_tick+=5);
     assert(s->phase==FIVE_IMPEDANCE && !s->fault);
     FiveMIT_State at={0}; FiveSupport_State mode={0};
@@ -871,7 +881,7 @@ static void test_key_modes(void)
     (void)key_level(false,1,raw);
     assert(s->phase==FIVE_DRAG); assert_gravity_frames(s,31);
     for (unsigned i=1;i<=5;++i) { assert(motor_enable_calls[i]==1 && !motor_disable_calls[i]); }
-    puts("PASS: KEY explicit cold/drag/impedance/drag, fixed entry center, held key and fault handover");
+    puts("PASS: KEY explicit cold/exit, held key, remote impedance and fault handover");
 }
 static void test_motion_admission(void)
 {
@@ -884,9 +894,9 @@ static void test_motion_admission(void)
     live_workspace_pose(target);
     /* The retained zero and the measured +179-degree raw branch are both
      * inside the new travel. Neither needs a turn shift or a small-angle gate. */
-    assert(s->phase==FIVE_GRAVITY && !s->fault && s->submitted==31);
+    assert(s->phase==FIVE_IDLE && !s->fault && s->submitted==31);
     assert(FiveControl_Move(target,4000)==BSP_CAN_OK);
-    FiveControl_Gravity();
+    FiveControl_Idle();
     for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
     plant_sample_at(3,1,179.1285411727544f*.01745329252f);
     FiveControl_Tick(test_tick+=5);
@@ -896,7 +906,7 @@ static void test_motion_admission(void)
         target[i]=(s->reference_rad[i]-g_joint_reference_config[i].zero_rad)/.01745329251994329577;
     }
     assert(FiveControl_Move(target,2000)==BSP_CAN_OK); /* No nonzero-J1/small-J4 gate. */
-    FiveControl_Gravity(); /* Cancel in the host fixture; never send a physical target. */
+    FiveControl_Idle(); /* Cancel in the host fixture; never send a physical target. */
     float raw[5];
     for (unsigned i=0;i<5;++i) { raw[i]=s->feedback[i].position_rad; }
     /* A moving test joint OR a moving companion must not veto the next
@@ -916,7 +926,7 @@ static void test_motion_admission(void)
             assert(FiveControl_Move(target,2000)==BSP_CAN_OK);
             FiveControl_Tick(test_tick+=5);
             assert(s->phase==FIVE_MOTION && !s->fault && s->submitted==31);
-            FiveControl_Gravity();
+            FiveControl_Idle();
         }
     }
     for (unsigned i=0;i<5;++i) { plant_sample_at_speed(i,1,raw[i],0x800); }
@@ -929,7 +939,7 @@ static void test_motion_admission(void)
     plant_sample_at(3,1,g_joint_reference_config[3].observed_upper_rad+.01745329252f);
     FiveControl_Tick(test_tick+=5);
     assert(FiveControl_Move(target,2000)==BSP_CAN_NOT_READY);
-    assert(s->phase==FIVE_GRAVITY && !s->fault && s->submitted==31);
+    assert(s->phase==FIVE_IDLE && !s->fault && s->submitted==31);
     /* A one-code endpoint discrepancy can only depart inward; no range fault
      * is hidden for a genuinely out-of-range target or further excursion. */
     plant_sample_at(3,1,179.1285411727544f*.01745329252f);
@@ -942,7 +952,7 @@ static void test_motion_admission(void)
     assert(FiveControl_Move(target,8000)==BSP_CAN_OK);
     FiveControl_Tick(test_tick+=5);
     assert(s->phase==FIVE_MOTION && !s->fault && s->submitted==31);
-    FiveControl_Gravity();
+    FiveControl_Idle();
     for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
     plant_sample_at(3,1,179.1285411727544f*.01745329252f);
     FiveControl_Tick(test_tick+=5);
@@ -960,81 +970,6 @@ static void test_motion_admission(void)
     for (unsigned i=1;i<=5;++i) { assert(!motor_enable_calls[i] && !motor_disable_calls[i]); }
     puts("PASS: motion admission without small-angle/rest gates, all five signed velocities, raw travel retained");
 }
-#ifdef YLAMP_J3_REVERSE_TEST
-static void test_j3_reverse(void)
-{
-    assert(g_five_j3_reverse.total_ms==600 && g_five_j3_reverse.ramp_ms==100 &&
-           g_five_j3_reverse.max_nm==.5f);
-    FiveSupport_State mode={0};
-    float g[5]={.01f,.3f,.4f,.02f,-.06f}, torque[5];
-    assert(!FiveSupport_EnterReverseJ3(&mode,0,NAN));
-    assert(!FiveSupport_EnterReverseJ3(&mode,0,.5001f));
-    assert(FiveSupport_EnterReverseJ3(&mode,UINT32_MAX-50U,g[2]));
-    memcpy(torque,g,sizeof g);
-    FiveSupport_ApplyReverseJ3(&mode,49U,torque); /* 100 ms across tick wrap. */
-    assert(mode.reverse_j3 && torque[2]==-g[2]);
-    for (unsigned i=0;i<5;++i) { if (i!=2) { assert(torque[i]==g[i]); } }
-    memcpy(torque,g,sizeof g);
-    FiveSupport_ApplyReverseJ3(&mode,549U,torque);
-    assert(!mode.reverse_j3 && !memcmp(torque,g,sizeof g));
-    assert(FiveSupport_EnterReverseJ3(&mode,0,g[2]));
-    memcpy(torque,g,sizeof g);torque[2]=.5001f;
-    FiveSupport_ApplyReverseJ3(&mode,100U,torque);
-    assert(!mode.reverse_j3 && torque[2]==.5001f); /* Original G, not a clipped reverse. */
-
-    DM_Motor_t *m[5];five_setup(m);
-    assert(FiveControl_Init(m,test_tick));
-    assert(FiveControl_ReverseJ3()==BSP_CAN_NOT_READY);
-    /* Keep J3 support inside the unchanged reverse-test envelope. */
-    const float raw[5]={-.923361659f,2.486647606f,.530982900f,3.704699993f,-1.008049369f};
-    for (unsigned i=0;i<5;++i) { plant_sample_at(i,1,raw[i]); }
-    FiveControl_Tick(test_tick+=5);
-    const FiveControl_Status *s=FiveControl_StatusNow();
-    assert(s->phase==FIVE_GRAVITY && !s->fault && fabsf(s->gravity_nm[2])<.5f);
-    test_ipsr=1;assert(FiveControl_ReverseJ3()==BSP_CAN_NOT_READY);test_ipsr=0;
-    assert(FiveControl_KeyPress()==BSP_CAN_OK);
-    FiveControl_Tick(test_tick+=5);
-    assert(FiveControl_ReverseJ3()==BSP_CAN_NOT_READY); /* No manual drag in a comparison. */
-    FiveControl_Gravity();
-    assert(FiveControl_ReverseJ3()==BSP_CAN_OK);
-    assert(FiveControl_Drag()==BSP_CAN_NOT_READY); /* Before the phase-publishing tick too. */
-    const double target[5]={0};
-    assert(FiveControl_Move(target,2000)==BSP_CAN_NOT_READY);
-    /* No USB servicing at all: the control owner must end the trial itself. */
-    for (unsigned elapsed=5;elapsed<=600;elapsed+=5) {
-        test_tick+=5;
-        for (unsigned i=0;i<5;++i) { plant_sample_at(i,1,raw[i]); }
-        FiveControl_Tick(test_tick);
-        assert(!s->fault && s->submitted==31);
-        assert_gravity_frames(s,31U & ~4U);
-        if (elapsed<600) { assert(s->phase==FIVE_REVERSE_J3); }
-        if (elapsed==300) { assert(FiveControl_ReverseJ3()==BSP_CAN_NOT_READY); }
-        if ((elapsed>=100 && elapsed<=500) || elapsed==50 || elapsed==550) {
-            const DM_Motor_MIT_Command_t cmd={
-                .torque_ff_nm=(elapsed==50 || elapsed==550) ? 0.f : -s->gravity_nm[2]};
-            BSP_CAN_Frame_t expected;
-            assert(DM_Motor_EncodeMIT(&g_motor_can_config[2],&cmd,&expected)==BSP_CAN_OK);
-            assert(!memcmp(motor_last_mit[3],expected.data,8));
-        }
-    }
-    assert(s->phase==FIVE_GRAVITY);assert_gravity_frames(s,31);
-    assert(FiveControl_ReverseJ3()==BSP_CAN_OK);
-    for (unsigned i=0;i<5;++i) { plant_sample_at(i,1,raw[i]); }
-    FiveControl_Tick(test_tick+=5);
-    assert(FiveControl_KeyPress()==BSP_CAN_OK);
-    FiveControl_Tick(test_tick+=5);
-    assert(s->phase==FIVE_DRAG);assert_gravity_frames(s,31);
-    FiveControl_Gravity();
-    assert(FiveControl_ReverseJ3()==BSP_CAN_OK);
-    can_io[1].free_slots=0;
-    FiveControl_Tick(test_tick+=5);
-    assert(s->phase==FIVE_DEGRADED && (s->fault & FIVE_TX) && s->submitted==0x1c);
-    assert_gravity_frames(s,0x1c);
-    assert(FiveControl_ReverseJ3()==BSP_CAN_NOT_READY);
-    for (unsigned i=1;i<=5;++i) { assert(!motor_enable_calls[i] && !motor_disable_calls[i]); }
-    puts("PASS: J3-only reverse frames, zero PD, ramps, local expiry/wrap, no extension/enable, KEY/fault exit");
-}
-#endif
 static void test_control(void)
 {
     DM_Motor_t *m[5]; five_setup(m);
@@ -1042,7 +977,7 @@ static void test_control(void)
     for (unsigned i=0;i<5;++i) { plant_sample(i,1); }
     FiveControl_Tick(test_tick+=5);
     const FiveControl_Status *s=FiveControl_StatusNow();
-    assert(s->gravity_valid && s->phase==FIVE_GRAVITY && s->fresh==31 && s->submitted==31);
+    assert(s->gravity_valid && s->phase==FIVE_IDLE && s->fresh==31 && s->submitted==31);
     assert(fabsf(s->gravity_nm[1])+fabsf(s->gravity_nm[2])>.1f);
     /* Real packet equality, even after moving away from the initial pose
      * and reversing measured velocity. PD hidden inside torque_ff must fail. */
@@ -1054,7 +989,7 @@ static void test_control(void)
                                   pass ? 0x7c0 : 0x840);
         }
         FiveControl_Tick(test_tick+=5);
-        assert(s->phase==FIVE_GRAVITY && !s->fault && !s->limited && s->submitted==31);
+        assert(s->phase==FIVE_IDLE && !s->fault && !s->limited && s->submitted==31);
         assert(fabsf(initial_g2-s->gravity_nm[1])>.01f);
         float q[5],nominal[5],residual[5]; const float zero[5]={0};
         for (unsigned i=0;i<5;++i) {
@@ -1091,7 +1026,7 @@ static void test_control(void)
             plant_sample_at(i,1,raw);
         }
         FiveControl_Tick(test_tick+=5);
-        assert(s->phase==FIVE_GRAVITY && !s->fault && !s->limited && s->submitted==31);
+        assert(s->phase==FIVE_IDLE && !s->fault && !s->limited && s->submitted==31);
         float q[5],nominal[5],residual[5];const float zero[5]={0};
         for (unsigned i=0;i<5;++i) {
             q[i]=s->reference_rad[i]-g_joint_reference_config[i].zero_rad+
@@ -1117,7 +1052,7 @@ static void test_control(void)
     double goal[5]={1,0,0,0,0};live_workspace_pose(goal);
     assert(FiveControl_Move(goal,2000)==BSP_CAN_NOT_READY); /* Actual J4 feedback outside raw range. */
     FiveControl_Tick(test_tick+=5);
-    assert(s->phase==FIVE_GRAVITY && s->submitted==31);
+    assert(s->phase==FIVE_IDLE && s->submitted==31);
     can_io[1].free_slots=0; FiveControl_Tick(test_tick+=5);
     assert(s->phase==FIVE_DEGRADED && (s->fault & FIVE_TX) && s->submitted==0x1c);
     can_io[1].free_slots=8;
@@ -1157,7 +1092,7 @@ static void test_cold(bool silent)
     FiveControl_Tick(test_tick+=5); assert(s->gravity_valid && s->submitted==31);
     FiveControl_Tick(test_tick+=5);
     for(unsigned i=1;i<=5;++i) { assert(motor_enable_calls[i]==1 && !motor_disable_calls[i]); }
-    assert(s->phase!=FIVE_GRAVITY);
+    assert(s->phase!=FIVE_IDLE);
     for(unsigned i=0;i<5;++i) { plant_sample_at(i,1,raw[i]); }
     FiveControl_Tick(test_tick+=5);
     assert(s->fault==0 && s->phase==FIVE_DRAG && s->enabled==31 && s->submitted==31);

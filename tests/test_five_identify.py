@@ -613,6 +613,8 @@ class FiveAxisTest(unittest.TestCase):
         ready = dict(phase="GRAVITY", fresh=31, enabled=31, submitted=31,
                      gravity_age_ms=5, limited=0, fault=0)
         self.assertTrue(gravity_output_confirmed(ready))
+        self.assertTrue(gravity_output_confirmed(dict(ready, phase="IDLE")))
+        self.assertFalse(gravity_output_confirmed(dict(ready, phase="DRAG")))
         for change in (dict(phase="WAIT"), dict(enabled=27), dict(submitted=0), dict(fresh=27),
                        dict(limited=1), dict(fault=1), dict(gravity_age_ms=None)):
             self.assertFalse(gravity_output_confirmed(dict(ready, **change)))

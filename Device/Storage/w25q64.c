@@ -1,6 +1,18 @@
 #include "w25q64.h"
 #include "bsp_ospi.h"
 
+static unsigned owner;
+bool W25Q64_TryLock(W25Q64_Owner requested)
+{
+    if (requested!=W25Q64_HISTORY && requested!=W25Q64_LOOKAROUND) { return false; }
+    if (owner && owner!=(unsigned)requested) { return false; }
+    owner=requested;return true;
+}
+void W25Q64_Unlock(W25Q64_Owner requested)
+{ if (owner==(unsigned)requested) { owner=0; } }
+#ifdef YLAMP_HOST_FIXTURES
+void W25Q64_ResetLockForTest(void) { owner=0; }
+#endif
 bool W25Q64_Status(uint8_t *sr1,uint8_t *sr2)
 {
     return sr1 && sr2 &&

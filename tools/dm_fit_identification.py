@@ -18,10 +18,11 @@ from pathlib import Path
 
 import numpy as np
 
+LEGACY_PARAMS = Path(__file__).resolve().with_name("legacy_dual_axis_params.txt")
+
 
 def nominal_parameters():
-    source = (Path(__file__).resolve().parents[1] / "config/robot_model.c").read_text(
-        encoding="utf-8")
+    source = LEGACY_PARAMS.read_text(encoding="utf-8")
     names = ("a0", "a_cos2", "a_sin2", "b_cos", "b_sin", "d")
     return {name: float(re.search(r"\."+name+r"\s*=\s*([-+\deE.]+)f", source)[1])
             for name in names}
@@ -362,8 +363,7 @@ def impulse_inertia_check(train_paths, validation_paths, model):
 
 
 def deployed_coefficients():
-    source = (Path(__file__).resolve().parents[1]/"config/robot_model.c").read_text(
-        encoding="utf-8")
+    source = LEGACY_PARAMS.read_text(encoding="utf-8")
     number = r"([-+\deE.]+)f"
     extra = re.search(r"\.extra_inertia_kg_m2\s*=\s*\{([^}]+)\}", source)[1]
     return dict(

@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from dm_monitor import JOINT_REFERENCES
-from five_control import CONTROL_VERSION, EXPECTED
+from five_control import CONTROL_VERSION, EXPECTED, PURE_GRAVITY_PHASES
 from five_gravity_fit import gravity_basis, nominal_parameters, solve
 from five_identify import HW, MASK, NOMINAL, REFS, ROOT, align_feedback, regressors, scaled_lstsq
 
@@ -22,7 +22,7 @@ FRICTION_COLUMNS = [1, 2, 3, 4, 6, 7, 8, 9]
 
 
 def healthy(record):
-    return (record.get("phase") in ("GRAVITY", "MOTION", "POSITION")
+    return (record.get("phase") in (*PURE_GRAVITY_PHASES, "MOTION", "POSITION")
             and not record.get("fault") and not record.get("limited")
             and all(record.get(k) == 31 for k in ("fresh", "enabled", "submitted"))
             and record.get("gravity_age_ms") is not None
@@ -81,7 +81,7 @@ def read_analysis_run(path):
     report = dict(file=str(path), sha256=digest.hexdigest(), session=meta["session"],
                   analysis_only=True, deploy=False,
                   sequence_completed=bool(end and handover and healthy(handover)
-                                          and handover["phase"] == "GRAVITY"),
+                                          and handover["phase"] in PURE_GRAVITY_PHASES),
                   free_space_confirmed=meta.get("free_space") is True,
                   issues=[], waypoints=waypoints)
     note = path.with_suffix(".operator_confirmation.json")

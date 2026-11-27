@@ -22,7 +22,9 @@ const FiveMIT_Axis g_five_mit_hw[FIVE_AXES] = {
     {0,0, 0,0,.02f, 1.2f,0},
     {0,0, 0,0,.02f, .6f,0}
 };
-/* Active identification only: software kp [Nm/rad], kd [Nm*s/rad], total Nm.
+/* Active trajectories only: software kp [Nm/rad], kd [Nm*s/rad], total Nm.
+ * User-approved J1/J4 position tuning, 2026-11-24: kp 20->30 and 3->6.
+ * Drag and KEY impedance use their own profiles below; their gains stay put.
  * User explicitly doubled all five active total budgets after the J5 .6 rad/s
  * return hit .4 Nm, 2026-11-22. This changes ceilings, not commanded gains or
  * friction amplitude. That earlier change was active-only; the later shared
@@ -30,7 +32,7 @@ const FiveMIT_Axis g_five_mit_hw[FIVE_AXES] = {
  * These are commissioning limits, not a validated mechanism rating.
  * MIT actuator gains stay zero and the whole batch is rejected above max_nm. */
 const FiveMIT_Tracking g_five_mit_tracking[FIVE_AXES] = {
-    {20,1,4}, {30,1.5f,10}, {5,.5f,3.6f}, {3,.3f,1.6f}, {10,.5f,.8f}
+    {30,1,4}, {30,1.5f,10}, {5,.5f,3.6f}, {6,.3f,1.6f}, {10,.5f,.8f}
 };
 /* Axis-specific candidate after speed_smooth_validation_01:
  * P [Nm*s/rad], I [Nm/rad]. Keep the improved J2 tune; restore baseline
@@ -51,8 +53,10 @@ const FiveMIT_SpeedPI g_five_speed_pi[FIVE_AXES] = {
  * Replaces the old base/fast/high chain, never adds a second total F.
  * Retain low-speed amplitude freezing at .08; freeze above .8. These are
  * model extrapolation bounds, NOT commanded-speed or motion-admission gates.
- * Same callers: moving cruise axes and existing partial J1/J2 manual drag.
- * Ordinary Move/held axes/pure G/PI/drag fractions/budgets stay unchanged.
+ * 2026-11-25 user explicitly requested F on ordinary Move/Ruckig too:
+ * all active references use this same map ONCE; zero v_ref stays zero F.
+ * Existing partial J1/J2 manual drag, pure G/KEY, PI, drag fractions and
+ * budgets stay unchanged. No newly identified coefficients or static kick.
  * Coverage and J1 local tail limitations remain; this is not global acceptance. */
 const FiveMIT_SpeedFriction g_five_speed_friction[FIVE_AXES] = {
     {-.3529545390540462f,-.1094118938571156f,.256320566976014f,.016621367861598263f},
@@ -90,7 +94,7 @@ const float g_five_drag_filter_s = .015f;
 const float g_five_drag_ramp_s = .2f;
 /* User-requested smoothing candidate: ease active PD in with the same
  * quintic used by the trajectory. G/dynamics and fault handover are not
- * filtered/delayed. J3/J4 gains reuse the lower manual-hold baseline;
+ * filtered/delayed. Active gains are independent of KEY/manual hold;
  * this is an initial tuning candidate, not a hardware stability result. */
 const float g_five_tracking_ramp_s = .1f;
 /* User-authorized J2 support candidate, 2026-11-20; NOT hardware validated.
@@ -161,11 +165,6 @@ const float g_five_impedance_pd_max_nm[FIVE_AXES] = {1.f,1.f,.4f,.3f,.25f};
  * on every joint/pose. Physical return speed is not bounded by the outward ramp.
  * No new manual KEY restriction, gain/force increase or fault/exit change. */
 const FiveSupport_TestConfig g_five_impedance_test = {4000U,2000U,60.f};
-#ifdef YLAMP_J3_REVERSE_TEST
-/* Supported comparison only: total/ramp [ms], absolute J3 torque [N*m].
- * Outside this envelope leave the original five-axis gravity unchanged. */
-const FiveSupport_ReverseConfig g_five_j3_reverse = {600U,100U,.5f};
-#endif
 #ifdef YLAMP_HOST_FIXTURES
 /* Simulation only. kp [Nm/rad], kd [Nm*s/rad], Fc [Nm], B [Nm*s/rad],
  * smoothing speed [rad/s], scene total torque [Nm], baseline CAD zero [deg].

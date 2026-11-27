@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from five_control import CONTROL_VERSION, EXPECTED
+from five_control import CONTROL_VERSION, EXPECTED, PURE_GRAVITY_PHASES
 from five_identify import HW, NOMINAL, REFS, ROOT, SCENE, regressors
 from five_gravity_residual_report import support_gravity
 
@@ -115,7 +115,7 @@ def load_legs(path, pose, grid_ms=10, verified_start_tick_ms=None, *,
                 final = r
             if stage == "end":
                 end = r
-    if not header or not end or not final or final["phase"] != "GRAVITY":
+    if not header or not end or not final or final["phase"] not in PURE_GRAVITY_PHASES:
         raise ValueError("Incomplete capture")
     if end["malformed"] or end["incomplete"]:
         raise ValueError("Malformed/incomplete telemetry")
